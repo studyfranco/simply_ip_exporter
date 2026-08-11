@@ -183,4 +183,125 @@ mod tests {
         assert_eq!(parse_target_address("192.168.1.0/24").unwrap().to_string(), "192.168.1.0/24");
         assert!(parse_target_address("not-an-ip").is_none());
     }
+
+    // ── Concurrent access ────────────────────────────────────────────────────
+    //
+    // `IpCache` is shared, via `Arc<RwLock<...>>`, between every public feed request and the
+    // background sync worker — exactly the shape where a deadlock or a torn read would be a
+    // production incident rather than a test failure. `tokio::sync::RwLock` behind a clean async
+    // API (no method holds a guard across a call back into `self`) makes a *self*-deadlock
+    // essentially impossible by construction; what these tests actually exercise is that heavy,
+    // real *parallelism* (`flavor = "multi_thread"`, so tasks genuinely run on different OS
+    // threads, not just interleaved cooperatively on one) neither hangs nor corrupts state, and
+    // that the `tokio::time::timeout` wrapper would catch it if a future change broke that.
+
+    fn record_with_updated_at(addr: &str, minute: u32) -> VaultRecord {
+        VaultRecord {
+            target_address: addr.to_owned(),
+            updated_at: NaiveDateTime::parse_from_str("2026-08-11T10:00:00", "%Y-%m-%dT%H:%M:%S")
+                .unwrap()
+                + chrono::Duration::minutes(minute as i64),
+            is_deleted: false,
+        }
+    }
+
+    /// Many writer tasks (full syncs, differential syncs, evictions) and many more reader tasks
+    /// (snapshot, `full_sync_due`, `last_synced_at`) all hammer a small, shared set of endpoint ids
+    /// concurrently across real OS threads. Bounded by an explicit timeout so a regression that
+    /// reintroduced a deadlock fails fast and loudly rather than hanging the test suite forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn high_concurrency_mixed_read_write_does_not_deadlock_or_panic() {
+        let cache = IpCache::new();
+        let endpoint_ids: Vec<Uuid> = (0..8).map(|_| Uuid::new_v4()).collect();
+
+        let mut tasks = tokio::task::JoinSet::new();
+
+        for w in 0..20u32 {
+            let cache = cache.clone();
+            let ids = endpoint_ids.clone();
+            tasks.spawn(async move {
+                for i in 0..200u32 {
+                    let id = ids[((w * 200 + i) as usize) % ids.len()];
+                    match i % 10 {
+                        0 => cache.evict(id).await,
+                        n if n % 2 == 0 => {
+                            cache.apply_full(id, &[record_with_updated_at("10.0.0.1/32", i)]).await
+                        }
+                        _ => cache.apply_diff(id, &[record_with_updated_at("10.0.0.2/32", i)]).await,
+                    }
+                }
+            });
+        }
+
+        for r in 0..50u32 {
+            let cache = cache.clone();
+            let ids = endpoint_ids.clone();
+            tasks.spawn(async move {
+                for i in 0..200u32 {
+                    let id = ids[((r * 200 + i) as usize) % ids.len()];
+                    let _ = cache.snapshot(id).await;
+                    let _ = cache.full_sync_due(id, std::time::Duration::from_secs(1)).await;
+                    let _ = cache.last_synced_at(id).await;
+                }
+            });
+        }
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while let Some(result) = tasks.join_next().await {
+                result.expect("no writer or reader task panicked");
+            }
+        })
+        .await;
+        assert!(outcome.is_ok(), "concurrent cache access deadlocked: did not finish within 30s");
+
+        // The cache must still be fully usable afterward — a poisoned or corrupted lock would
+        // hang or panic here too.
+        for id in &endpoint_ids {
+            let snap = cache.snapshot(*id).await;
+            assert!(snap.len() <= 2, "each endpoint only ever received two distinct addresses");
+        }
+    }
+
+    /// Complementary to the mixed stress test above: confirms writes to one endpoint never leak
+    /// into another's snapshot even under heavy concurrent pressure — a `HashMap<Uuid,
+    /// EndpointCache>` behind one shared lock makes cross-contamination structurally impossible,
+    /// but "impossible by construction" is exactly the kind of claim worth actually running.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_writes_to_distinct_endpoints_never_cross_contaminate() {
+        let cache = IpCache::new();
+        let endpoint_ids: Vec<Uuid> = (0..100).map(|_| Uuid::new_v4()).collect();
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for (i, id) in endpoint_ids.iter().copied().enumerate() {
+            let cache = cache.clone();
+            let addr = format!("10.{}.{}.1/32", i / 256, i % 256);
+            tasks.spawn(async move {
+                for _ in 0..50 {
+                    cache.apply_full(id, &[VaultRecord {
+                        target_address: addr.clone(),
+                        updated_at: chrono::Utc::now().naive_utc(),
+                        is_deleted: false,
+                    }]).await;
+                }
+                (id, addr)
+            });
+        }
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let mut expected = std::collections::HashMap::new();
+            while let Some(result) = tasks.join_next().await {
+                let (id, addr) = result.expect("no task panicked");
+                expected.insert(id, addr);
+            }
+            expected
+        })
+        .await
+        .expect("concurrent per-endpoint writes deadlocked: did not finish within 30s");
+
+        for (id, addr) in outcome {
+            let snap = cache.snapshot(id).await;
+            assert_eq!(snap.len(), 1, "endpoint {id} must hold exactly its own one address");
+            assert_eq!(snap[0].to_string(), addr, "endpoint {id} must not see another endpoint's write");
+        }
+    }
 }

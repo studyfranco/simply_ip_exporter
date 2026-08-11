@@ -100,9 +100,10 @@ so any path not matched by `/health`, `/ready`, `/feed/v1/*`, or `/api/*` resolv
 | :--- | :--- |
 | `tests/integration.rs` | End-to-end-in-process tests driving the real Axum router (via `tower::ServiceExt::oneshot`) against an in-memory SQLite database: health/readiness probes, unsigned/signed/replayed/stale-timestamp admin API requests, Master-vs-Daughter RBAC on both `api_keys` and `endpoints`, and the full feed pipeline (aggregation, RFC1918 filtering, ETag/304 including the "conditional revalidation bypasses the throttle" property, 429 rate limiting, `bound_ips` enforcement, unknown-token `404`). |
 | `tests/common/mod.rs` | Shared fixtures: `setup_test_db` (migrated in-memory SQLite), `test_state` (plaintext-cipher `AppState`), `insert_key` (seeds an `api_keys` row and returns its plaintext credentials), and the `CANONICAL_V1` request-signing helpers (`signed_request`/`signed_request_at`/`with_connect_info`) that every integration test builds its requests through. |
+| `tests/source_hygiene.rs` | Static source-hygiene checks nothing else in the build enforces, per `AGENT.MD`: `no_raw_sql_outside_db_rs_and_migrations` and `no_unwrap_or_expect_in_production_code` (both file-scanning checks over `src/`, cut off at each file's `#[cfg(test)] mod tests` boundary — `every_source_file_places_its_test_module_last` independently verifies that boundary-detection heuristic itself), plus `app_js_has_no_syntax_errors` (an `oxc_parser`-based real ECMAScript parse of `static/app.js`) and `every_dom_id_referenced_in_app_js_exists_in_index_html` (cross-checks every `el('...')` lookup against `static/index.html`'s `id=` attributes). Each check ships with a companion test proving it actually rejects the defect it exists to catch. |
 
 Unit tests live beside the code they test, in `#[cfg(test)] mod tests` blocks within the `src/`
-files listed above (52 of them, at last count) rather than in a separate directory — see each
+files listed above (79 of them, at last count) rather than in a separate directory — see each
 file's own `tests` module for its specific coverage.
 
 ## `scripts/` — operational tooling
@@ -110,6 +111,7 @@ file's own `tests` module for its specific coverage.
 | File | Responsibility |
 | :--- | :--- |
 | `scripts/test_e2e.sh` | Standalone, executable Bash E2E suite. Builds `simply_ip_vault` (from `example/`) and this crate, boots both against throwaway SQLite databases with deterministic `INITIAL_MASTER_KEY`/`INITIAL_MASTER_SIGNING_SECRET` bootstrap, provisions Vault (groups, a scoped read-only key, seeded public/RFC1918/bogon addresses), configures an exporter endpoint via a signed admin API call, and asserts the full public-feed pipeline — `text/plain` output, `ipnet` aggregation, RFC1918/bogon filtering, `ETag`/`304`, `429` rate limiting (and that a matching conditional request bypasses it), and resilience to Vault being killed mid-run — before tearing everything down. Requires `curl`, `jq`, `cargo`, `openssl`, and the `example/simply_ip_vault` reference checkout. |
+| `scripts/verify_convergence.sh` | Standalone, executable Bash wrapper around `tests/source_hygiene.rs`. Builds the test binary once, then runs each hygiene check individually by name so a failure is reported as a named, described convention violation rather than an undifferentiated `cargo test` failure list. |
 
 ## `example/` — reference implementations (not part of this crate)
 

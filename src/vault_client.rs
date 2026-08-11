@@ -1,10 +1,22 @@
 //! Outbound `simply_ip_vault` API client: `CANONICAL_V1` HMAC-signed `GET /api/ips` requests for
 //! the hybrid differential/full sync protocol.
 
+use std::time::Duration;
+
 use chrono::NaiveDateTime;
 use serde::Deserialize;
 
 use crate::crypto::{canonical_v1_payload, compute_signature};
+
+/// Hard ceiling on how long one sync request may take, covering connect, send, and receive.
+///
+/// Without this, a Vault that accepts a TCP connection and then never answers (a black-holed
+/// route, a misbehaving proxy in front of it) would hang the request forever — `reqwest::Client`
+/// has no default timeout. The background sync worker awaits one endpoint's fetch at a time
+/// (`sync::sync_all_endpoints`), so an indefinitely hanging request would silently stall every
+/// other endpoint's sync ticks behind it rather than surfacing as the fast, logged failure the
+/// "keep serving the cache" resilience contract expects.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// One record as returned by Vault's `GET /api/ips` contract.
 #[derive(Debug, Clone, Deserialize)]
@@ -42,14 +54,17 @@ pub struct VaultClient {
 }
 
 impl VaultClient {
-    /// Builds a client from the runtime configuration, or `None` if Vault sync is not configured.
+    /// Builds a client from the runtime configuration, or `None` if Vault sync is not configured
+    /// or the underlying HTTP client cannot be built (a TLS backend failure — not reachable in
+    /// practice with the `rustls` feature this crate compiles, but reported rather than unwrapped).
     pub fn from_config(config: &crate::config::RuntimeConfig) -> Option<Self> {
         let (base_url, api_key, signing_secret) = (
             config.vault_base_url.clone()?,
             config.vault_api_key.clone()?,
             config.vault_signing_secret.clone()?,
         );
-        Some(Self { http: reqwest::Client::new(), base_url, api_key, signing_secret })
+        let http = reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build().ok()?;
+        Some(Self { http, base_url, api_key, signing_secret })
     }
 
     /// Fetches IP records for `groups`. When `since` is set, performs a differential query
@@ -135,5 +150,121 @@ mod tests {
             ..crate::config::RuntimeConfig::default()
         };
         assert!(VaultClient::from_config(&config).is_some());
+    }
+
+    // ── The Vault error spectrum: HTTP-status mapping and connection failure ───
+
+    fn client_at(base_url: String) -> VaultClient {
+        let config = crate::config::RuntimeConfig {
+            vault_base_url: Some(base_url),
+            vault_api_key: Some("key".to_owned()),
+            vault_signing_secret: Some("secret".to_owned()),
+            ..crate::config::RuntimeConfig::default()
+        };
+        VaultClient::from_config(&config).expect("fully configured")
+    }
+
+    /// Boots a throwaway HTTP server on an OS-assigned loopback port that answers every request
+    /// with a fixed status and JSON body, and returns its base URL alongside the task handle.
+    async fn spawn_mock_vault(
+        status: axum::http::StatusCode,
+        body: serde_json::Value,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{Router, routing::get};
+
+        let app = Router::new().route(
+            "/api/ips",
+            get(move || {
+                let body = body.clone();
+                async move { (status, axum::Json(body)) }
+            }),
+        );
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback bind always succeeds");
+        let addr = listener.local_addr().expect("a bound listener has a local address");
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[tokio::test]
+    async fn a_401_from_vault_is_reported_as_a_status_error_naming_401() {
+        let (url, _server) =
+            spawn_mock_vault(axum::http::StatusCode::UNAUTHORIZED, serde_json::json!({"error": "bad key"}))
+                .await;
+        let client = client_at(url);
+        let err = client.fetch_ips("g1", None).await.expect_err("401 must not be Ok");
+        assert!(matches!(err, VaultError::Status(s) if s == reqwest::StatusCode::UNAUTHORIZED));
+    }
+
+    #[tokio::test]
+    async fn a_403_from_vault_is_reported_as_a_status_error_naming_403() {
+        let (url, _server) = spawn_mock_vault(
+            axum::http::StatusCode::FORBIDDEN,
+            serde_json::json!({"error": "client ip not allowed"}),
+        )
+        .await;
+        let client = client_at(url);
+        let err = client.fetch_ips("g1", None).await.expect_err("403 must not be Ok");
+        assert!(matches!(err, VaultError::Status(s) if s == reqwest::StatusCode::FORBIDDEN));
+    }
+
+    #[tokio::test]
+    async fn a_500_from_vault_is_reported_as_a_status_error() {
+        let (url, _server) = spawn_mock_vault(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({"error": "internal"}),
+        )
+        .await;
+        let client = client_at(url);
+        let err = client.fetch_ips("g1", None).await.expect_err("500 must not be Ok");
+        assert!(matches!(err, VaultError::Status(s) if s == reqwest::StatusCode::INTERNAL_SERVER_ERROR));
+    }
+
+    #[tokio::test]
+    async fn a_malformed_json_body_on_an_otherwise_successful_response_is_a_request_error() {
+        // Valid 200, but a body shaped nothing like `Vec<VaultApiRecord>` — the deserialization
+        // failure surfaces as VaultError::Request via the `#[from] reqwest::Error` conversion.
+        let (url, _server) =
+            spawn_mock_vault(axum::http::StatusCode::OK, serde_json::json!({"not": "a list"})).await;
+        let client = client_at(url);
+        let err = client.fetch_ips("g1", None).await.expect_err("malformed body must not be Ok");
+        assert!(matches!(err, VaultError::Request(_)));
+    }
+
+    #[tokio::test]
+    async fn a_successful_response_with_valid_records_is_ok() {
+        let (url, _server) = spawn_mock_vault(
+            axum::http::StatusCode::OK,
+            serde_json::json!([
+                {"target_address": "8.8.8.8/32", "updated_at": "2026-08-11T10:00:00", "is_deleted": false}
+            ]),
+        )
+        .await;
+        let client = client_at(url);
+        let records = client.fetch_ips("g1", None).await.expect("a valid 200 body must parse");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].target_address, "8.8.8.8/32");
+    }
+
+    /// Total connection failure — nothing listening at all — is the other end of the spectrum
+    /// from an authenticated-but-rejected response, and must be distinguished as such: a `401`/
+    /// `403` means "the key is bad", a connection failure means "the network/host is unreachable".
+    /// Both keep the exporter serving its cache (see `sync::tests`), but they are different facts
+    /// an operator reading logs needs told apart.
+    #[tokio::test]
+    async fn a_refused_connection_is_a_request_error_not_a_status_error() {
+        // Bind to grab a genuinely free loopback port, then drop the listener immediately so nothing
+        // is listening on it by the time the client connects — a fast, deterministic way to
+        // reproduce ECONNREFUSED without depending on any specific unused port staying unused.
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback bind always succeeds");
+        let addr = listener.local_addr().expect("a bound listener has a local address");
+        drop(listener);
+
+        let client = client_at(format!("http://{addr}"));
+        let err = client.fetch_ips("g1", None).await.expect_err("a refused connection must not be Ok");
+        assert!(matches!(err, VaultError::Request(_)), "expected a request-level error, got {err:?}");
     }
 }

@@ -30,3 +30,10 @@ chacha20poly1305 = { version = "0.11", default-features = false, features = ["al
 tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
+# A real ECMAScript parser for tests/source_hygiene.rs's static/app.js syntax check. `static/` is
+# served straight off disk by `ServeDir` and is never compiled, so nothing else in the build can
+# see a syntax error in it. Pinned to an exact version with `=`, unlike every other dependency
+# here: `oxc` is pre-1.0, so its `0.x` releases carry breaking changes under a caret requirement.
+oxc_allocator = "=0.143.0"
+oxc_parser = "=0.143.0"
+oxc_span = "=0.143.0"

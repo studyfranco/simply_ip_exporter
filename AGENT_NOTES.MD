@@ -1,5 +1,125 @@
 # Agent Worklog — `simply_ip_exporter`
 
+## 2026-08-11 — Convergence checks, edge-case coverage, and a real memory-leak fix
+
+Given full autonomy to expand test coverage and fix anything it uncovered. Net result: 97 tests
+(up from 63), a new `scripts/verify_convergence.sh` gate, and two real bugs found and fixed — one
+a straightforward hygiene violation, one a genuine unbounded-memory-growth bug in the rate limiter
+that none of the existing tests (including the E2E suite) had a way to catch.
+
+### Source hygiene audit (Task 1) — two violations found and fixed
+
+A manual audit against `AGENT.MD`'s "zero raw SQL outside `src/db.rs`/migrations" and "zero
+`.unwrap()`/`.expect()` in production code" rules, done *before* writing the enforcement tooling
+(so the tooling could be built against a codebase already known to converge, rather than tuned to
+whatever happened to be there):
+
+- **`src/api/health.rs`'s readiness probe used a raw `"SELECT 1"`** via `Statement::from_string` —
+  a direct violation, missed in the original build. Replaced with `ApiKey::find().count(&db)`, an
+  ordinary SeaORM query that proves the connection and schema are both usable without depending on
+  the table holding any rows.
+- **`src/ipfilter.rs`'s static filter-list constructor used `.expect()`** to parse its hardcoded
+  CIDR literals. Technically unreachable in practice (the inputs are compile-time constants), but a
+  literal `.expect()` in production code all the same — a future typo in one of those strings would
+  panic the process at first use instead of failing to compile. Rewritten to parse leniently
+  (`.filter_map(|s| s.parse().ok())`), with a new test
+  (`every_filter_list_has_no_silently_dropped_entries`) asserting each list's length against its
+  literal count — this is what actually catches a typo now, by making it a visible test failure
+  instead of either a runtime panic or a silently-shrunk filter list.
+
+Both are the *only* violations in the whole `src/` tree; `tests/source_hygiene.rs` (below) now
+prevents either class from reappearing unnoticed.
+
+### `tests/source_hygiene.rs` + `scripts/verify_convergence.sh` (Task 1)
+
+Implemented as a Rust test suite rather than pure Bash, because two of the three checks need a real
+parser: **raw-SQL and `.unwrap()`/`.expect()` detection** are file scanners over `src/**/*.rs`, cut
+off at each file's `#[cfg(test)] mod tests` boundary (a *second*, independently-implemented boundary
+search backs this — `every_source_file_places_its_test_module_last` — because the first version of
+that heuristic had its own bug: it cut at the first `#[cfg(test)]` occurrence in the file, which is
+wrong for `src/ratelimit.rs` and `src/replay.rs`, both of which carry a small `#[cfg(test)] fn
+tracked(...)` test-only accessor *inside* their production `impl` block, ahead of the real `mod
+tests`. Caught immediately by the self-verification test itself before it ever reached the actual
+hygiene checks). **The frontend syntax check** uses `oxc_parser` (added as a pinned `=0.143.0`
+dev-dependency, matching the reference repos' convention) to genuinely parse `static/app.js` as
+ECMAScript, plus a new check with no reference-repo precedent: `every_dom_id_referenced_in_app_js_exists_in_index_html`,
+which extracts every `el('...')` lookup from `app.js` and asserts a matching `id="..."` exists in
+`index.html` — a mismatch there is a runtime `TypeError`, invisible to a syntax parser (syntax
+checking a file that references a nonexistent element parses cleanly; only executing it, or
+cross-referencing it against the HTML, would show anything wrong). Every check has a companion
+test proving it actually rejects the specific defect it exists to catch, not just an `is_ok()`
+that could be silently neutered later.
+
+`scripts/verify_convergence.sh` is a thin wrapper: builds the `source_hygiene` test binary once,
+then re-runs each named test individually so a failure reports *which* convention was violated
+rather than an undifferentiated `cargo test` failure list.
+
+### Bug: unbounded memory growth in `RateLimiter`'s eviction queue (Task 2 + 3)
+
+Found while designing the rate-limiter stress test the task asked for. `RateLimiter::check_and_record`
+pushed the requesting IP onto its eviction queue (`order: VecDeque<IpAddr>`) on **every** successful
+call — including when the IP was *already tracked* and merely being re-allowed because its 2-minute
+window had lapsed. The tracked-IP `HashMap` itself stayed correctly bounded (re-inserting an
+existing key doesn't grow a map), but nothing ever removed the corresponding stale `order` entries
+for a *reused* IP — eviction only fires once the map is genuinely at `MAX_TRACKED_IPS` capacity, which
+a single low-cardinality caller polling forever never triggers. A new test,
+`one_ip_polling_forever_past_its_window_does_not_grow_the_queue_without_bound`, simulated 10,000
+re-polls from one address (paused-clock, advancing past the window each time) and found `order` had
+grown to exactly 10,000 entries for that one IP — an unbounded allocation triggerable for free by
+any single well-behaved, indefinitely-long-lived client (a pfBlockerNG poller left running for
+months), not just by the flood-of-distinct-IPs scenario `AGENT.MD`'s "prevent memory exhaustion
+under IP spoofing" language was clearly written against.
+
+**Fix:** only push to `order` when the IP is genuinely new (`!next_allowed.contains_key(&ip)`
+checked before the insert). Documented tradeoff: `order` no longer perfectly reflects recency for a
+reused IP (its queue position stays at first-seen, not last-used), so eviction under sustained
+capacity pressure is closer to FIFO-by-first-sight than true LRU — acceptable, since the property
+this type actually has to guarantee is the bound itself, not perfect fairness. Locked in with three
+tests: the fixed defect (`order_len() == 1` after 10,000 re-polls, not 10,000), a positive-control
+flood test (50,000 distinct IPs still cap the map *and* the queue at exactly `MAX_TRACKED_IPS`), and
+an eviction-correctness test (the earliest-inserted IPs are genuinely forgotten, the newest are not).
+
+### Other new edge-case coverage (Task 2)
+
+- **IP filtering boundaries**: exact-edge tests for CGN (`100.64.0.0/10`), multicast
+  (`224.0.0.0/4`), and APIPA (`169.254.0.0/16`) — the address one step inside either boundary is
+  filtered, one step outside survives. IPv6 bogon/loopback filtering tested independently of IPv4.
+  Mixed IPv4+IPv6 feeds tested for cross-family contamination (an IPv4 bogon must never suppress an
+  IPv6 survivor or vice versa, and aggregation must never attempt to merge across families) — all
+  passed without any code change, confirming `ipnet::IpNet`'s per-family typing already made this
+  safe by construction. Also pinned the existing (and previously undocumented-by-test)
+  "any overlap drops the whole candidate" semantics of `overlaps_any` — a supernet only partially
+  overlapping a bogon sub-range is dropped in full, not narrowed.
+- **Vault error spectrum**: `VaultClient::fetch_ips` tested directly against a real mock Vault
+  (a throwaway `axum` server bound to an OS-assigned loopback port — no new dependency, `axum` is
+  already a main dependency) for 401, 403, 500, malformed-JSON-on-200, and total connection refusal
+  (bind-then-drop a listener, the fast/deterministic way to reproduce `ECONNREFUSED`). Higher-level
+  resilience tested in `sync.rs` against the same spectrum: `sync_endpoint` called with a
+  cache pre-populated from a prior successful sync must leave it byte-for-byte unchanged (and must
+  not falsely advance `endpoints.last_synced_at`) after 401/403/500/connection-failure, with a
+  positive-control test (a healthy Vault response) proving the negative tests aren't vacuous.
+  **Also added a 15s request timeout to `VaultClient`'s `reqwest::Client`** (there was none —
+  `reqwest::Client::new()` has no default): without it, a Vault that accepted a connection and then
+  never answered would hang the sync worker's single sequential await point indefinitely, silently
+  stalling every other endpoint's sync behind it, rather than failing fast into the same
+  "log a warning, keep serving the cache" path every other failure mode already takes.
+- **Concurrent cache access**: `IpCache` hammered by 20 writer + 50 reader `tokio` tasks (`flavor =
+  "multi_thread", worker_threads = 8`, so this is genuine OS-thread parallelism, not cooperative
+  interleaving) across a shared set of endpoint ids, wrapped in a 30s `tokio::time::timeout` so a
+  reintroduced deadlock fails the test suite fast instead of hanging it. A second test confirms
+  concurrent writes to 100 *distinct* endpoints never cross-contaminate. Both passed without any
+  code change — `tokio::sync::RwLock` behind a clean async API (no method holds a guard across a
+  call back into `self`) already made a self-deadlock structurally close to impossible; the value
+  of the tests is in pinning that property under real parallel load rather than merely asserting it
+  in a doc comment.
+
+### Verification performed
+
+- `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`: clean.
+- `cargo test`: 97 tests pass (79 unit + 11 integration + 7 source-hygiene), up from 63.
+- `./scripts/verify_convergence.sh`: 7/7 checks pass.
+- `./scripts/test_e2e.sh`: 37/37 checks pass, exit code 0.
+
 ## 2026-08-11 — Initial implementation
 
 Built the full crate from the empty scaffold (`Cargo.toml`, `Dockerfile`, `docker-compose.yml` were
