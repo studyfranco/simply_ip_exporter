@@ -1,0 +1,32 @@
+[package]
+name = "simply_ip_exporter"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+sea-orm = { version = "2", features = ["sqlx-sqlite", "runtime-tokio-rustls", "macros", "with-uuid", "with-chrono"] }
+sea-orm-migration = { version = "2", features = ["runtime-tokio-rustls", "sqlx-sqlite"] }
+ipnet = { version = "2", features = ["serde"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.11"
+hmac = "0.13"
+tower-http = { version = "0.7", features = ["fs", "trace"] }
+hex = "0.4"
+rand = "0.10"
+thiserror = "2"
+dotenvy = "0.15"
+log = "0.4"
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "getrandom"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"

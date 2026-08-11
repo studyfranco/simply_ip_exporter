@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>simply_ip_exporter</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <h1><span class="dot">●</span> simply_ip_exporter</h1>
+    <div id="header-actions" class="hidden row">
+      <span id="identity-name" class="dim"></span>
+      <span id="identity-badge" class="badge"></span>
+      <span class="dim mono" id="identity-prefix"></span>
+      <button id="logout-btn" class="secondary small">Log out</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="login-screen" class="card">
+      <h2>Sign in</h2>
+      <p class="dim">Enter a local admin API key and its signing secret. Every request is signed
+        client-side with HMAC-SHA256 (CANONICAL_V1) — the secret never leaves this page except as
+        part of a signature.</p>
+      <form id="login-form">
+        <label for="login-api-key">X-API-Key</label>
+        <input type="password" id="login-api-key" autocomplete="off" required />
+        <label for="login-signing-secret">Signing secret</label>
+        <input type="password" id="login-signing-secret" autocomplete="off" required />
+        <div class="row" style="margin-top:16px">
+          <button type="submit">Sign in</button>
+        </div>
+        <div id="login-error" class="error hidden"></div>
+      </form>
+    </section>
+
+    <div id="dashboard" class="hidden">
+      <section class="card" id="minted-key-box">
+        <h2>New credential — shown once</h2>
+        <label>API Key</label>
+        <div class="mono" id="minted-api-key"></div>
+        <label>Signing Secret</label>
+        <div class="mono" id="minted-signing-secret"></div>
+        <div class="row" style="margin-top:12px">
+          <button id="minted-key-dismiss" class="secondary small">I've saved these</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Endpoints</h2>
+        <table>
+          <thead>
+            <tr><th>Name / Groups</th><th>Feed URL</th><th>TTL</th><th>Filters</th><th>Last synced</th><th></th></tr>
+          </thead>
+          <tbody id="endpoints-body"></tbody>
+        </table>
+
+        <h2 style="margin-top:24px">New endpoint</h2>
+        <form id="endpoint-form">
+          <label for="ep-name">Name</label>
+          <input type="text" id="ep-name" required />
+          <label for="ep-description">Description</label>
+          <input type="text" id="ep-description" />
+          <label for="ep-groups">Vault groups (comma-separated)</label>
+          <input type="text" id="ep-groups" placeholder="fail2ban,sshd" required />
+          <label for="ep-ttl">TTL seconds</label>
+          <input type="number" id="ep-ttl" value="3600" min="1" />
+          <label for="ep-bound-ips">Bound IPs (comma-separated CIDR, optional)</label>
+          <input type="text" id="ep-bound-ips" placeholder="203.0.113.0/24" />
+          <div class="checkbox-row"><input type="checkbox" id="ep-filter-rfc1918" /><label for="ep-filter-rfc1918">Filter RFC 1918</label></div>
+          <div class="checkbox-row"><input type="checkbox" id="ep-filter-bogons" /><label for="ep-filter-bogons">Filter bogons</label></div>
+          <div class="checkbox-row"><input type="checkbox" id="ep-filter-loopback" /><label for="ep-filter-loopback">Filter loopback</label></div>
+          <div class="row" style="margin-top:16px"><button type="submit">Create endpoint</button></div>
+          <div id="endpoint-error" class="error hidden"></div>
+        </form>
+      </section>
+
+      <section class="card hidden" id="keys-card">
+        <h2>API Keys (Master only)</h2>
+        <table>
+          <thead><tr><th>Name / Prefix</th><th>Tier</th><th>Can manage keys</th><th></th></tr></thead>
+          <tbody id="keys-body"></tbody>
+        </table>
+
+        <h2 style="margin-top:24px">New Daughter key</h2>
+        <form id="key-form">
+          <label for="key-name">Name</label>
+          <input type="text" id="key-name" required />
+          <label for="key-bound-ips">Bound IPs (comma-separated CIDR, optional)</label>
+          <input type="text" id="key-bound-ips" />
+          <div class="checkbox-row"><input type="checkbox" id="key-can-manage-keys" /><label for="key-can-manage-keys">Can manage keys</label></div>
+          <div class="row" style="margin-top:16px"><button type="submit">Create key</button></div>
+          <div id="key-error" class="error hidden"></div>
+        </form>
+      </section>
+    </div>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

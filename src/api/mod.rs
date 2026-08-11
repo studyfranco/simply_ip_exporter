@@ -1,0 +1,18 @@
+//! Admin API handlers, mounted under `/api/*` behind [`crate::middleware::auth_middleware`], plus
+//! the unauthenticated health probes mounted outside it.
+
+/// `GET /api/auth/me`.
+pub mod auth;
+/// `GET /health`, `/ready` and their `z`-suffixed aliases.
+pub mod health;
+/// CRUD for `endpoints`.
+pub mod endpoints;
+/// CRUD for `api_keys`.
+pub mod keys;
+/// Shared key-minting/hashing helpers.
+pub mod support;
+
+pub use auth::get_me;
+pub use endpoints::{create_endpoint, delete_endpoint, list_endpoints, reassign_endpoint_owner, update_endpoint};
+pub use health::{health_check, readiness_check};
+pub use keys::{create_api_key, delete_api_key, list_api_keys, rotate_api_key, update_api_key};

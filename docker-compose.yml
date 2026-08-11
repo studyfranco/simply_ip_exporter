@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  simply-ip-exporter:
+    build: .
+    container_name: simply_ip_exporter
+    ports:
+      - "3002:3002"
+    environment:
+      - DATABASE_URL=sqlite://data/simply_ip_exporter.db?mode=rwc
+      - RUST_LOG=info
+      - BIND_HOST=0.0.0.0
+      - PORT=3002
+      # - EXPORTER_ENCRYPTION_KEY=
+      # - VAULT_BASE_URL=http://simply-ip-vault:3000
+      # - VAULT_API_KEY=
+      # - VAULT_SIGNING_SECRET=
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3002/ready"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
