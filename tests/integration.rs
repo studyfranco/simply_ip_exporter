@@ -232,13 +232,26 @@ async fn feed_aggregates_filters_etags_and_rate_limits() {
     // The RFC 1918 address is filtered out; only the public one survives.
     assert_eq!(text.trim(), "203.0.113.5/32");
 
-    // Second request from the same IP is rate-limited.
+    // Second request from the same IP, with no conditional header, is rate-limited.
     let throttled = app
         .clone()
         .oneshot(with_connect_info(Request::builder().uri(uri.as_str())).body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // A matching If-None-Match from that SAME throttled IP still gets 304, not 429: a conditional
+    // revalidation the caller already has an up-to-date copy for is free and bypasses the limiter.
+    let revalidate = app
+        .clone()
+        .oneshot(
+            with_connect_info(Request::builder().uri(uri.as_str()).header("If-None-Match", &etag))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(revalidate.status(), StatusCode::NOT_MODIFIED);
 
     // A fresh source IP is unaffected by the other IP's throttle, and honours If-None-Match.
     let conditional = app

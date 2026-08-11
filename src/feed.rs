@@ -1,8 +1,15 @@
 //! `GET /feed/v1/<token_secret>/list.txt` — the public, unauthenticated feed endpoint.
 //!
-//! Security here rests entirely on the secrecy of `token_secret`, not on HTTP headers. Requests
-//! are throttled per source IP before the database is even consulted, since this route has no
-//! credential to gate on and is reachable by anyone who can guess or leak a token.
+//! Security here rests entirely on the secrecy of `token_secret`, not on HTTP headers.
+//!
+//! The rate limiter gates the expensive path — serving a full `200` body — rather than every
+//! request indiscriminately. A conditional request whose `If-None-Match` matches the current
+//! ETag is answered `304` for free, with no rate-limit consumption at all: the caller has already
+//! proven it holds an up-to-date copy, computing the ETag is a cheap in-memory operation, and
+//! throttling that exchange would defeat the entire point of supporting ETags — a well-behaved
+//! poller (pfBlockerNG et al.) that dutifully revalidates would get needlessly `429`'d instead of
+//! the cheap `304` the mechanism exists to provide. Guessing an ETag to farm free responses is not
+//! a workable attack: an attacker without the current body cannot produce a matching digest.
 
 use axum::{
     extract::{ConnectInfo, Path, State},
@@ -27,15 +34,6 @@ pub async fn serve_feed(
 ) -> Result<Response, AppError> {
     let client_ip =
         resolve_client_ip(addr.ip(), &headers, state.config.trusted_proxies.networks());
-
-    if let Err(remaining) = state.rate_limiter.check_and_record(client_ip) {
-        return Ok((
-            StatusCode::TOO_MANY_REQUESTS,
-            [("Retry-After", remaining.as_secs().to_string())],
-            "Rate limit exceeded: at most one request per source IP every 2 minutes\n",
-        )
-            .into_response());
-    }
 
     let ep = Endpoint::find()
         .filter(endpoint::Column::TokenSecret.eq(token_secret))
@@ -71,6 +69,15 @@ pub async fn serve_feed(
         && inm.trim() == etag
     {
         return Ok((StatusCode::NOT_MODIFIED, [("ETag", etag)]).into_response());
+    }
+
+    if let Err(remaining) = state.rate_limiter.check_and_record(client_ip) {
+        return Ok((
+            StatusCode::TOO_MANY_REQUESTS,
+            [("Retry-After", remaining.as_secs().to_string())],
+            "Rate limit exceeded: at most one request per source IP every 2 minutes\n",
+        )
+            .into_response());
     }
 
     Ok((

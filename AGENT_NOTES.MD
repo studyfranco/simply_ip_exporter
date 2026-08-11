@@ -82,7 +82,66 @@ Master/Daughter model from `AGENT.MD`, not the vault's group-permission model.
 
 - No CI workflow (`.forgejo/workflows`, `.github/workflows`) — the reference repos have one each;
   none was requested or added here.
-- `scripts/test_e2e.sh` / `scripts/verify_convergence.sh` referenced in the validation checklist
-  were not present in this repo's scaffold and were not authored — `RBAC_MODEL.md`'s
-  `verify_convergence.sh` is specific to the vault/hook-executor pair being byte-identical, which
-  doesn't apply to this service.
+- `scripts/verify_convergence.sh` was not authored — `RBAC_MODEL.md`'s version of that script is
+  specific to the vault/hook-executor pair being byte-identical, which doesn't apply to this
+  service. `scripts/test_e2e.sh` itself now exists (see below).
+
+## 2026-08-11 — Documentation, `scripts/test_e2e.sh`, and a real bug it found
+
+Added `README.md`, `FILE_MAP.MD`, and a full live E2E suite (`scripts/test_e2e.sh`) that boots a
+real `simply_ip_vault` (built from `example/`) alongside `simply_ip_exporter` and drives the whole
+workflow — provisioning, sync, feed aggregation/filtering, ETag/304, rate limiting, and Vault-outage
+resilience — through 37 assertions. `./scripts/test_e2e.sh` passes end to end (exit 0, no stray
+processes or temp files left behind); see the script's own header comment for the full matrix.
+
+### A real bug the E2E script surfaced: rate limiter vs. ETag ordering
+
+Writing §5 of the test matrix (fetch ETag, repeat with `If-None-Match`, assert `304`) exposed that
+`feed::serve_feed` checked the rate limiter **before** computing the ETag. That meant *any* second
+request from the same source IP inside the 2-minute window got `429`, including one carrying a
+correct `If-None-Match` — a well-behaved poller that dutifully revalidates on every fetch (exactly
+what ETags exist to make cheap) would get throttled for doing so, making conditional GET support
+functionally useless against the very throttle it's supposed to coexist with. `AGENT.MD` specifies
+both features independently and says nothing about their interaction, so this wasn't a spec
+violation, but it was a design defect: it defeated the stated purpose of ETag support.
+
+**Fix:** reordered `feed::serve_feed` to look up the endpoint, check `bound_ips`, and compute the
+aggregated body + ETag *before* consulting the rate limiter. A request whose `If-None-Match`
+matches gets a free `304` with no rate-limit consumption at all — cheap (in-memory only, no extra
+DB work beyond the token lookup every request needs anyway), and not exploitable: an attacker
+without the current body cannot produce a matching digest, so this cannot be used to bypass
+throttling on the expensive path (a full `200` body). Only a request that does *not* match — no
+header, a stale one, or a guess — reaches the rate limiter, exactly as before. Locked in with a new
+integration-test assertion (`feed_aggregates_filters_etags_and_rate_limits`: a matching
+`If-None-Match` from an already-throttled IP still returns `304`, not `429`) and exercised live by
+§5 of the E2E script.
+
+### Other additions this session
+
+- `main.rs::bootstrap_master_key` now honors `INITIAL_MASTER_SIGNING_SECRET` (mirroring the
+  existing `INITIAL_MASTER_KEY` support), so `scripts/test_e2e.sh` can bootstrap both services
+  deterministically without scraping the one-time banner out of a buffered log — the same
+  convention `simply_ip_vault`'s own `scripts/test_e2e.sh` uses.
+- The E2E script's seed data deliberately does **not** reuse the `10.0.0.0/24`+`10.0.0.1/32` /
+  `203.0.113.5/32` examples that appear elsewhere as illustrations: `10.0.0.0/8` is itself RFC 1918
+  and `203.0.113.0/24` is IANA's TEST-NET-3 (a bogon by definition), so seeding either while the
+  test endpoint has `filter_rfc1918=true`/`filter_bogons=true` set — as the task specified — would
+  make the corresponding "survives filtering" assertions self-defeating against a spec-compliant
+  implementation. The script uses `8.8.8.0/24`+`8.8.8.1/32` for the aggregation fixture instead
+  (real public space, clear of every filter list) and keeps `192.168.1.50/32` (genuinely RFC 1918)
+  and `100.64.0.5/32` (CGN, a real bogon, and *not* "private" per `std::net::Ipv4Addr::is_private()`
+  so Vault's own `/ban` validation accepts it) as the two addresses each filter is meant to remove.
+- `simply_ip_vault`'s `/api/ban` refuses to store a private/link-local IPv4 address (by design —
+  "banning" one is meaningless). The script therefore registers `192.168.1.50/32` into a dedicated
+  **whitelist** group (`pfBlocker_Private_Test`) via `/api/white` instead, and grants the exporter's
+  Vault key `can_read` on both groups. `simply_ip_exporter` has no concept of Vault's ban/whitelist
+  distinction — it just aggregates whatever addresses live in the groups it's configured to read —
+  so this is a faithful test of the filtering behavior despite the source group's Vault-side type.
+
+### Verification performed
+
+- `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`: clean.
+- `cargo test`: 63 tests pass (52 unit + 11 integration — a new assertion was added to the
+  existing feed test rather than as a separate test function, so the count is unchanged).
+- `./scripts/test_e2e.sh`: 37/37 checks pass, exit code 0, confirmed no leftover processes or
+  temp files after a full run.

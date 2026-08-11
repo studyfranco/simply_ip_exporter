@@ -64,7 +64,19 @@ async fn bootstrap_master_key(
     let bound_ip = std::env::var("BOOTSTRAP_SUBNET").unwrap_or_else(|_| "0.0.0.0/0,::/0".to_owned());
     let prefix: String = plaintext_key.chars().take(8).collect();
     let now = chrono::Utc::now().naive_utc();
-    let signing_secret = crypto::generate_signing_secret();
+
+    // As with INITIAL_MASTER_KEY above: deterministic test/CI bootstrap only, so a script never
+    // has to scrape the signing secret back out of stdout.
+    let signing_secret = match std::env::var("INITIAL_MASTER_SIGNING_SECRET") {
+        Ok(fixed) if !fixed.is_empty() => {
+            tracing::warn!(
+                "INITIAL_MASTER_SIGNING_SECRET is set: using the provided value instead of \
+                 generating one. Intended for deterministic test/CI bootstrap only."
+            );
+            fixed
+        }
+        _ => crypto::generate_signing_secret(),
+    };
 
     let model = api_key::ActiveModel {
         id: Set(Uuid::new_v4()),
