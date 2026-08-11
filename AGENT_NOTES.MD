@@ -1,5 +1,77 @@
 # Agent Worklog — `simply_ip_exporter`
 
+## 2026-08-11 — Audit logging system
+
+Added `audit_logs` for parity with `simply_ip_vault`/`simply_hook_executor`: every mutating
+`/api/keys/*` and `/api/endpoints/*` action now writes an attributable audit trail entry.
+
+### Schema & entity
+
+`audit_logs` (`SCHEMA.MD` §3, migration `m20260101_000002_add_audit_logs`): `id`, `api_key_id`
+(`ON DELETE SET NULL`), `api_key_name`/`api_key_prefix` (denormalized `NOT NULL` snapshots — the
+only attribution that survives the acting key being deleted, since the FK itself gets nulled),
+`client_ip`, `action`, `target_resource` (a `kind:id (name)` reference, e.g. `endpoint:3f2a...
+(pfBlockerNG DMZ Feed)`), `details`, `timestamp`. Indexed on `action`, `timestamp`, and
+`api_key_id`.
+
+Unlike the reference `simply_ip_vault`, which reached `NOT NULL` attribution columns through two
+migrations (`m20230101` added them nullable; `m20260811_000010` corrected that later, after
+discovering nullable attribution meant a deleted key's actions became literally unattributed), this
+schema went straight to `NOT NULL` from its one migration — there was no legacy data to be
+compatible with, so there was no reason to repeat the intermediate step.
+
+### `create_audit_log` propagates failures rather than swallowing them
+
+`api::support::create_audit_log` is called with `.await?` at every call site, matching the vault's
+convention: a database error from the audit write fails the whole request, even though the
+mutation it followed already committed. This is deliberate, not an oversight — the alternative
+(log-and-continue) would let a caller receive `200 OK` for an action the audit trail silently
+failed to record, which defeats the entire purpose of having one. See the function's doc comment
+and `SCHEMA.MD` §3 for the full reasoning.
+
+### Handler integration
+
+Every mutating handler in `api/keys.rs` (`create_api_key`, `update_api_key`, `delete_api_key`,
+`rotate_api_key`) and `api/endpoints.rs` (`create_endpoint`, `update_endpoint`, `delete_endpoint`,
+`reassign_endpoint_owner`) now takes an additional `Extension(client_ip): Extension<ClientIp>`
+parameter (already inserted into request extensions by `auth_middleware` — nothing new needed
+there) and writes an audit entry after its mutation commits. `update_*` handlers track which
+payload fields were actually present and record them in `details` (`"changed: name, bound_ips"`)
+rather than dumping the whole resulting row. `delete_*` handlers capture the target's
+name/id **before** issuing the delete, since the row is gone by the time the audit write happens.
+
+`GET /api/audit-logs` (`api/audit.rs`) is Master-only — audit entries span every key and endpoint
+in the system, so a scoped Daughter key seeing them would be an RBAC leak regardless of what it
+owns — supports an exact `action` filter and pagination (`limit`, silently capped at 500 to bound
+query size; `offset`).
+
+### Frontend
+
+`static/index.html` gained a Master-only "Audit Logs" card (table + action-filter input + refresh
+button), consistent with the existing `keys-card` gating pattern (hidden by default, revealed by
+`app.js` only when `GET /api/auth/me` reports `is_master`). `static/app.js`'s `loadAuditLogs`
+follows the same `apiCall`/`escapeHtml` conventions as `loadKeys`/`loadEndpoints`. Verified via
+`tests/source_hygiene.rs` (`app_js_has_no_syntax_errors`,
+`every_dom_id_referenced_in_app_js_exists_in_index_html`) rather than only by eye.
+
+### Testing
+
+Five new integration tests in `tests/integration.rs`: key create/update/rotate/delete each write
+their expected `action` with correct `target_resource`/attribution; the same for all four endpoint
+mutations including owner reassignment; `GET /api/audit-logs` is `403` for a Daughter key; the
+`action` query filter narrows results correctly. All exercise the real router end-to-end (not the
+`create_audit_log` function in isolation), so they also prove the extension wiring (`ClientIp`
+actually reaching every handler that now needs it) is correct.
+
+### Verification performed
+
+- `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`: clean.
+- `cargo test`: 103 tests pass (80 unit + 16 integration + 7 source-hygiene), up from 97.
+- `./scripts/verify_convergence.sh`: 7/7 checks pass (including the frontend syntax/DOM-reference
+  checks against the new Audit Logs UI).
+- `./scripts/test_e2e.sh`: 37/37 checks pass — unaffected by this change (it exercises endpoint
+  CRUD and the feed pipeline, not the audit trail directly), confirming no regression.
+
 ## 2026-08-11 — Convergence checks, edge-case coverage, and a real memory-leak fix
 
 Given full autonomy to expand test coverage and fix anything it uncovered. Net result: 97 tests

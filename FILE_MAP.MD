@@ -16,7 +16,7 @@ then the frontend and test suites.
 | `docker-compose.yml` | Single-service compose file binding `3002:3002`, persisting `./data` (config DB only), with commented-out Vault-sync env vars as a template. |
 | `.gitignore` | Excludes `target/`, `*.db*`, `Cargo.lock`, `.claude/`, and `example/` (the reference checkouts are not part of this repo's history). |
 | `AGENT.MD` | Normative architectural/security ruleset this crate was built against. Read this before `SCHEMA.MD`. |
-| `SCHEMA.MD` | Authoritative SQLite schema for `api_keys`/`endpoints`, including the `master_marker` generated-column mechanism. |
+| `SCHEMA.MD` | Authoritative SQLite schema for `api_keys`/`endpoints`/`audit_logs`, including the `master_marker` generated-column mechanism. |
 | `RBAC_MODEL.md` | The fuller Master/Parent/Daughter RBAC spec shared by `simply_ip_vault`/`simply_hook_executor`. This crate implements a simpler two-tier subset — see `AGENT_NOTES.MD` for the deliberate deviation. |
 | `AGENT_NOTES.MD` | Running worklog: architectural decisions, deviations, and verification performed, updated after each significant change. |
 | `README.md` | User-facing documentation: architecture, quickstart, env var reference, pfBlockerNG integration, API/probe overview. |
@@ -49,10 +49,11 @@ then the frontend and test suites.
 
 | File | Responsibility |
 | :--- | :--- |
-| `src/entities/mod.rs` | Module declarations for the two entities below. |
-| `src/entities/prelude.rs` | `pub use` re-exports (`ApiKey`, `Endpoint`) for ergonomic `use crate::entities::prelude::*`. |
+| `src/entities/mod.rs` | Module declarations for the three entities below. |
+| `src/entities/prelude.rs` | `pub use` re-exports (`ApiKey`, `Endpoint`, `AuditLog`) for ergonomic `use crate::entities::prelude::*`. |
 | `src/entities/api_key.rs` | The `api_keys` table `Model`/`ActiveModel`/`Relation`. Deliberately has **no** `master_marker` field — that column is database-engine-generated and would reject any client-supplied value. |
 | `src/entities/endpoint.rs` | The `endpoints` table `Model`/`ActiveModel`/`Relation`, with a `belongs_to` FK to `api_key` (`ON DELETE SET NULL`). |
+| `src/entities/audit_log.rs` | The `audit_logs` table `Model`/`ActiveModel`/`Relation`: the audit trail for mutating `/api/keys/*`/`/api/endpoints/*` actions, with a `belongs_to` FK to `api_key` (`ON DELETE SET NULL` — deleting the acting key must never delete the history of what it did). |
 
 ## `src/migration/` — schema
 
@@ -60,6 +61,7 @@ then the frontend and test suites.
 | :--- | :--- |
 | `src/migration/mod.rs` | `Migrator` — the ordered `Vec<Box<dyn MigrationTrait>>` SeaORM runs at startup. |
 | `src/migration/m20260101_000001_initial_schema.rs` | The single initial migration: creates `api_keys` and `endpoints` per `SCHEMA.MD`, then adds `api_keys.master_marker` as a raw-SQL `GENERATED ALWAYS AS (CASE WHEN is_master THEN 1 ELSE NULL END) VIRTUAL` column under a unique index — the database-level half of the Master-uniqueness guarantee, done correctly from the start rather than as a later correction. |
+| `src/migration/m20260101_000002_add_audit_logs.rs` | Adds `audit_logs` per `SCHEMA.MD` §3: `api_key_id` `ON DELETE SET NULL`, `api_key_name`/`api_key_prefix`/`client_ip`/`action`/`timestamp` all `NOT NULL` from the start (no later correction needed, unlike the reference `simply_ip_vault`'s two-step history for the equivalent columns), plus indexes on `action`, `timestamp`, and `api_key_id`. |
 
 ## `src/` — in-memory cache, IP pipeline, and Vault sync
 
@@ -77,11 +79,12 @@ then the frontend and test suites.
 | File | Responsibility |
 | :--- | :--- |
 | `src/api/mod.rs` | Module declarations and `pub use` re-exports consumed by `lib.rs`'s route table. |
-| `src/api/support.rs` | Shared helpers: `generate_random_key`/`hash_key` (credential minting/lookup), `validate_bound_ips` (parses and validates a comma-separated CIDR/address list). |
+| `src/api/support.rs` | Shared helpers: `generate_random_key`/`hash_key` (credential minting/lookup), `validate_bound_ips` (parses and validates a comma-separated CIDR/address list), `describe_resource` (renders a `kind:id (name)` audit-log target reference), and `create_audit_log` (writes one `audit_logs` row; propagates a write failure rather than swallowing it, since the mutation it follows has already committed — see its doc comment). |
 | `src/api/auth.rs` | `GET /api/auth/me` — reports the caller's own identity and RBAC flags, so the SPA (and this README's curl example) can authenticate once and introspect what it's allowed to do. |
-| `src/api/keys.rs` | CRUD for `api_keys`, every route gated `require_master`: `create_api_key` (mints a Daughter key, returns its plaintext secret + signing secret exactly once), `list_api_keys`, `update_api_key` (name/`bound_ips`/`can_manage_keys` — `is_master` is not a field on the payload type, so it cannot be set through the API by construction), `delete_api_key` (refuses to delete the Master), `rotate_api_key` (refuses to rotate the Master). |
-| `src/api/endpoints.rs` | CRUD for `endpoints`. `create_endpoint` — any authenticated key may call it; the new row is owned by the caller. `list_endpoints` — Master sees every row, a Daughter sees only its own (`owner_key_id` filter). `update_endpoint`/`delete_endpoint` — gated by `may_manage` (Master or owner). `reassign_endpoint_owner` — Master only. |
-| `src/api/health.rs` | `health_check` (`GET /health`/`/healthz`, always `200`, no DB query) and `readiness_check` (`GET /ready`/`/readyz`, `200` only when a `SELECT 1` succeeds and `MasterPin::get()` is `Some`). Both mounted outside `auth_middleware` in `lib.rs`. |
+| `src/api/keys.rs` | CRUD for `api_keys`, every route gated `require_master`: `create_api_key` (mints a Daughter key, returns its plaintext secret + signing secret exactly once), `list_api_keys`, `update_api_key` (name/`bound_ips`/`can_manage_keys` — `is_master` is not a field on the payload type, so it cannot be set through the API by construction), `delete_api_key` (refuses to delete the Master), `rotate_api_key` (refuses to rotate the Master). Every mutating route writes a `KEY_CREATE`/`KEY_UPDATE`/`KEY_DELETE`/`KEY_ROTATE` audit entry after its write commits. |
+| `src/api/endpoints.rs` | CRUD for `endpoints`. `create_endpoint` — any authenticated key may call it; the new row is owned by the caller. `list_endpoints` — Master sees every row, a Daughter sees only its own (`owner_key_id` filter). `update_endpoint`/`delete_endpoint` — gated by `may_manage` (Master or owner). `reassign_endpoint_owner` — Master only. Every mutating route writes an `ENDPOINT_CREATE`/`ENDPOINT_UPDATE`/`ENDPOINT_DELETE`/`ENDPOINT_OWNER_REASSIGN` audit entry after its write commits. |
+| `src/api/audit.rs` | `GET /api/audit-logs` — lists the audit trail, most recent first, optionally filtered by exact `action` and paginated (`limit`, capped at 500; `offset`). Master-only: audit entries span every key and endpoint in the system, so a scoped Daughter key seeing them would be an RBAC leak regardless of what it owns. |
+| `src/api/health.rs` | `health_check` (`GET /health`/`/healthz`, always `200`, no DB query) and `readiness_check` (`GET /ready`/`/readyz`, `200` only when an `api_keys` count query succeeds — an ordinary SeaORM query, not raw SQL — and `MasterPin::get()` is `Some`). Both mounted outside `auth_middleware` in `lib.rs`. |
 
 ## `static/` — embedded admin dashboard SPA
 
@@ -90,20 +93,20 @@ so any path not matched by `/health`, `/ready`, `/feed/v1/*`, or `/api/*` resolv
 
 | File | Responsibility |
 | :--- | :--- |
-| `static/index.html` | Markup: a login screen (API key + signing secret fields) and a dashboard (identity badge, endpoints table + creation form, and a Master-only API keys table + creation form). |
-| `static/app.js` | All client logic. `PureCrypto` — a self-contained FIPS 180-4/RFC 2104 SHA-256/HMAC-SHA256 implementation used only when `crypto.subtle` is unavailable (any non-secure-context origin, i.e. plain HTTP/LAN, which `AGENT.MD` documents as a supported deployment shape). `hmacSign` — picks Web Crypto when available, the pure-JS fallback otherwise, and always returns `sha256=<hex>`. `Session` — holds the API key/signing secret in `sessionStorage`. `apiCall` — signs and sends every admin-API request, throwing on a non-2xx response. The remaining functions render/wire the login flow and the endpoints/keys CRUD tables (create, delete, rotate, copy-feed-URL-to-clipboard). |
+| `static/index.html` | Markup: a login screen (API key + signing secret fields) and a dashboard (identity badge, endpoints table + creation form, a Master-only API keys table + creation form, and a Master-only Audit Logs table with an action filter). |
+| `static/app.js` | All client logic. `PureCrypto` — a self-contained FIPS 180-4/RFC 2104 SHA-256/HMAC-SHA256 implementation used only when `crypto.subtle` is unavailable (any non-secure-context origin, i.e. plain HTTP/LAN, which `AGENT.MD` documents as a supported deployment shape). `hmacSign` — picks Web Crypto when available, the pure-JS fallback otherwise, and always returns `sha256=<hex>`. `Session` — holds the API key/signing secret in `sessionStorage`. `apiCall` — signs and sends every admin-API request, throwing on a non-2xx response. The remaining functions render/wire the login flow, the endpoints/keys CRUD tables (create, delete, rotate, copy-feed-URL-to-clipboard), and `loadAuditLogs` (fetches and renders `GET /api/audit-logs`, optionally filtered by action; shown and loaded only for a Master identity). |
 | `static/style.css` | Dark theme (CSS custom properties for the palette), matching the visual convention of `simply_ip_vault`/`simply_hook_executor`'s dashboards. No external fonts or frameworks. |
 
 ## `tests/` — automated test suites
 
 | File | Responsibility |
 | :--- | :--- |
-| `tests/integration.rs` | End-to-end-in-process tests driving the real Axum router (via `tower::ServiceExt::oneshot`) against an in-memory SQLite database: health/readiness probes, unsigned/signed/replayed/stale-timestamp admin API requests, Master-vs-Daughter RBAC on both `api_keys` and `endpoints`, and the full feed pipeline (aggregation, RFC1918 filtering, ETag/304 including the "conditional revalidation bypasses the throttle" property, 429 rate limiting, `bound_ips` enforcement, unknown-token `404`). |
+| `tests/integration.rs` | End-to-end-in-process tests driving the real Axum router (via `tower::ServiceExt::oneshot`) against an in-memory SQLite database: health/readiness probes, unsigned/signed/replayed/stale-timestamp admin API requests, Master-vs-Daughter RBAC on both `api_keys` and `endpoints`, the full feed pipeline (aggregation, RFC1918 filtering, ETag/304 including the "conditional revalidation bypasses the throttle" property, 429 rate limiting, `bound_ips` enforcement, unknown-token `404`), and audit logging (every key/endpoint mutation writes the expected entry with correct attribution, `GET /api/audit-logs` is Master-only, and its `action` filter narrows results). |
 | `tests/common/mod.rs` | Shared fixtures: `setup_test_db` (migrated in-memory SQLite), `test_state` (plaintext-cipher `AppState`), `insert_key` (seeds an `api_keys` row and returns its plaintext credentials), and the `CANONICAL_V1` request-signing helpers (`signed_request`/`signed_request_at`/`with_connect_info`) that every integration test builds its requests through. |
 | `tests/source_hygiene.rs` | Static source-hygiene checks nothing else in the build enforces, per `AGENT.MD`: `no_raw_sql_outside_db_rs_and_migrations` and `no_unwrap_or_expect_in_production_code` (both file-scanning checks over `src/`, cut off at each file's `#[cfg(test)] mod tests` boundary — `every_source_file_places_its_test_module_last` independently verifies that boundary-detection heuristic itself), plus `app_js_has_no_syntax_errors` (an `oxc_parser`-based real ECMAScript parse of `static/app.js`) and `every_dom_id_referenced_in_app_js_exists_in_index_html` (cross-checks every `el('...')` lookup against `static/index.html`'s `id=` attributes). Each check ships with a companion test proving it actually rejects the defect it exists to catch. |
 
 Unit tests live beside the code they test, in `#[cfg(test)] mod tests` blocks within the `src/`
-files listed above (79 of them, at last count) rather than in a separate directory — see each
+files listed above (80 of them, at last count) rather than in a separate directory — see each
 file's own `tests` module for its specific coverage.
 
 ## `scripts/` — operational tooling

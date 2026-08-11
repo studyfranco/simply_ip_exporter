@@ -13,9 +13,10 @@ use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, Quer
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::api::support::validate_bound_ips;
+use crate::api::support::{create_audit_log, describe_resource, validate_bound_ips};
 use crate::entities::{api_key, endpoint, prelude::Endpoint};
 use crate::error::AppError;
+use crate::middleware::ClientIp;
 use crate::state::AppState;
 
 fn generate_token_secret() -> String {
@@ -96,6 +97,7 @@ fn validate_groups(raw: &str) -> Result<(), AppError> {
 pub async fn create_endpoint(
     State(state): State<AppState>,
     Extension(caller): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
     Json(payload): Json<CreateEndpointPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     if payload.name.trim().is_empty() {
@@ -129,6 +131,17 @@ pub async fn create_endpoint(
         updated_at: Set(now),
     };
     let created = model.insert(&state.db).await?;
+
+    create_audit_log(
+        &state.db,
+        &caller,
+        client_ip.0,
+        "ENDPOINT_CREATE",
+        Some(describe_resource("endpoint", created.id, &created.name)),
+        Some(format!("vault_groups={}", created.vault_groups)),
+    )
+    .await?;
+
     Ok(Json(EndpointResponse::from(created)))
 }
 
@@ -167,6 +180,7 @@ pub struct UpdateEndpointPayload {
 pub async fn update_endpoint(
     State(state): State<AppState>,
     Extension(caller): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateEndpointPayload>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -178,24 +192,30 @@ pub async fn update_endpoint(
     }
 
     let mut active: endpoint::ActiveModel = existing.into();
+    let mut changed: Vec<&str> = Vec::new();
+
     if let Some(name) = payload.name {
         if name.trim().is_empty() {
             return Err(AppError::InvalidInput("name must not be empty".to_owned()));
         }
         active.name = Set(name);
+        changed.push("name");
     }
     if let Some(description) = payload.description {
         active.description = Set(if description.trim().is_empty() { None } else { Some(description) });
+        changed.push("description");
     }
     if let Some(vault_groups) = payload.vault_groups {
         validate_groups(&vault_groups)?;
         active.vault_groups = Set(vault_groups);
+        changed.push("vault_groups");
     }
     if let Some(ttl_seconds) = payload.ttl_seconds {
         if ttl_seconds <= 0 {
             return Err(AppError::InvalidInput("ttl_seconds must be positive".to_owned()));
         }
         active.ttl_seconds = Set(ttl_seconds);
+        changed.push("ttl_seconds");
     }
     if let Some(bound_ips) = payload.bound_ips {
         let trimmed = bound_ips.trim();
@@ -203,19 +223,34 @@ pub async fn update_endpoint(
             validate_bound_ips(trimmed).map_err(AppError::InvalidInput)?;
         }
         active.bound_ips = Set(if trimmed.is_empty() { None } else { Some(trimmed.to_owned()) });
+        changed.push("bound_ips");
     }
     if let Some(v) = payload.filter_rfc1918 {
         active.filter_rfc1918 = Set(v);
+        changed.push("filter_rfc1918");
     }
     if let Some(v) = payload.filter_bogons {
         active.filter_bogons = Set(v);
+        changed.push("filter_bogons");
     }
     if let Some(v) = payload.filter_loopback {
         active.filter_loopback = Set(v);
+        changed.push("filter_loopback");
     }
     active.updated_at = Set(Utc::now().naive_utc());
 
     let updated = active.update(&state.db).await?;
+
+    create_audit_log(
+        &state.db,
+        &caller,
+        client_ip.0,
+        "ENDPOINT_UPDATE",
+        Some(describe_resource("endpoint", updated.id, &updated.name)),
+        Some(format!("changed: {}", if changed.is_empty() { "(none)".to_owned() } else { changed.join(", ") })),
+    )
+    .await?;
+
     Ok(Json(EndpointResponse::from(updated)))
 }
 
@@ -223,6 +258,7 @@ pub async fn update_endpoint(
 pub async fn delete_endpoint(
     State(state): State<AppState>,
     Extension(caller): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     let existing = Endpoint::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
@@ -232,8 +268,15 @@ pub async fn delete_endpoint(
         ));
     }
 
+    // Captured before the row is gone, since the audit entry must describe what was deleted.
+    let target_resource = describe_resource("endpoint", existing.id, &existing.name);
+
     Endpoint::delete_by_id(id).exec(&state.db).await?;
     state.ip_cache.evict(id).await;
+
+    create_audit_log(&state.db, &caller, client_ip.0, "ENDPOINT_DELETE", Some(target_resource), None)
+        .await?;
+
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -241,6 +284,7 @@ pub async fn delete_endpoint(
 pub async fn reassign_endpoint_owner(
     State(state): State<AppState>,
     Extension(caller): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
     Path(id): Path<Uuid>,
     Json(payload): Json<ReassignOwnerPayload>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -256,10 +300,22 @@ pub async fn reassign_endpoint_owner(
             .ok_or(AppError::InvalidInput("owner_key_id does not name an existing key".to_owned()))?;
     }
 
+    let new_owner_id = payload.owner_key_id;
     let mut active: endpoint::ActiveModel = existing.into();
-    active.owner_key_id = Set(payload.owner_key_id);
+    active.owner_key_id = Set(new_owner_id);
     active.updated_at = Set(Utc::now().naive_utc());
     let updated = active.update(&state.db).await?;
+
+    create_audit_log(
+        &state.db,
+        &caller,
+        client_ip.0,
+        "ENDPOINT_OWNER_REASSIGN",
+        Some(describe_resource("endpoint", updated.id, &updated.name)),
+        Some(format!("owner_key_id -> {}", new_owner_id.map_or_else(|| "(none)".to_owned(), |id| id.to_string()))),
+    )
+    .await?;
+
     Ok(Json(EndpointResponse::from(updated)))
 }
 

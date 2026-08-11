@@ -164,8 +164,15 @@ async function tryLogin(apiKey, signingSecret) {
     el('dashboard').classList.remove('hidden');
     el('header-actions').classList.remove('hidden');
     renderIdentity();
-    await Promise.all([loadEndpoints(), me.is_master ? loadKeys() : Promise.resolve()]);
-    if (me.is_master) el('keys-card').classList.remove('hidden');
+    await Promise.all([
+      loadEndpoints(),
+      me.is_master ? loadKeys() : Promise.resolve(),
+      me.is_master ? loadAuditLogs() : Promise.resolve(),
+    ]);
+    if (me.is_master) {
+      el('keys-card').classList.remove('hidden');
+      el('audit-card').classList.remove('hidden');
+    }
   } catch (e) {
     Session.clear();
     showError('login-error', 'Authentication failed: ' + e.message);
@@ -298,6 +305,31 @@ async function createKey(event) {
   }
 }
 
+// ── Audit Logs (Master only) ────────────────────────────────────────────────
+async function loadAuditLogs() {
+  hideError('audit-error');
+  try {
+    const action = el('audit-action-filter').value.trim();
+    const path = '/api/audit-logs' + (action ? `?action=${encodeURIComponent(action)}` : '');
+    const logs = await apiCall('GET', path);
+    const tbody = el('audit-body');
+    tbody.innerHTML = '';
+    for (const entry of logs) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td class="dim">${escapeHtml(entry.timestamp)}</td>
+        <td><span class="mono">${escapeHtml(entry.action)}</span></td>
+        <td>${escapeHtml(entry.target_resource || '—')}</td>
+        <td>${escapeHtml(entry.api_key_name)}<div class="dim mono">${escapeHtml(entry.api_key_prefix)}…</div></td>
+        <td class="mono">${escapeHtml(entry.client_ip)}</td>
+        <td class="dim">${escapeHtml(entry.details || '—')}</td>`;
+      tbody.appendChild(tr);
+    }
+  } catch (e) {
+    showError('audit-error', e.message);
+  }
+}
+
 function escapeHtml(str) {
   const div = document.createElement('div');
   div.textContent = str == null ? '' : String(str);
@@ -315,6 +347,13 @@ document.addEventListener('DOMContentLoaded', () => {
   el('endpoint-form').addEventListener('submit', createEndpoint);
   el('key-form').addEventListener('submit', createKey);
   el('minted-key-dismiss').addEventListener('click', () => el('minted-key-box').classList.add('hidden'));
+  el('audit-refresh-btn').addEventListener('click', loadAuditLogs);
+  el('audit-action-filter').addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      loadAuditLogs();
+    }
+  });
 
   if (Session.isSet()) {
     tryLogin(Session.apiKey, Session.signingSecret);

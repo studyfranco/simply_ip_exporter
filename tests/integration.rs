@@ -316,3 +316,198 @@ async fn an_unknown_feed_token_is_404() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
+
+// ── Audit logging ────────────────────────────────────────────────────────────
+
+/// Fetches the full, unfiltered audit log as Master and returns it as a JSON array.
+async fn fetch_audit_logs(app: axum::Router, master: &common::SeededKey) -> Vec<serde_json::Value> {
+    let response = app.oneshot(signed_request("GET", "/api/audit-logs", master, "")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    body_json(response).await.as_array().unwrap().clone()
+}
+
+#[tokio::test]
+async fn creating_an_api_key_writes_an_audit_log_entry() {
+    let db = setup_test_db().await;
+    let master = insert_key(&db, true, true).await;
+    let state = test_state(&db).with_pinned_master(master.model.id);
+    let app = create_app(state);
+
+    let create = app
+        .clone()
+        .oneshot(signed_request("POST", "/api/keys", &master, r#"{"name":"Audited Key"}"#))
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::OK);
+    let created = body_json(create).await;
+    let key_id = created["id"].as_str().unwrap();
+
+    let logs = fetch_audit_logs(app, &master).await;
+    let entry = logs.iter().find(|l| l["action"] == "KEY_CREATE").expect("a KEY_CREATE entry exists");
+    assert!(entry["target_resource"].as_str().unwrap().contains(key_id));
+    assert!(entry["target_resource"].as_str().unwrap().contains("Audited Key"));
+    assert_eq!(entry["api_key_name"], master.model.name);
+    assert_eq!(entry["api_key_prefix"], master.model.prefix);
+    assert!(!entry["client_ip"].as_str().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn key_update_rotate_and_delete_each_write_their_own_audit_entry() {
+    let db = setup_test_db().await;
+    let master = insert_key(&db, true, true).await;
+    let state = test_state(&db).with_pinned_master(master.model.id);
+    let app = create_app(state);
+
+    let create = app
+        .clone()
+        .oneshot(signed_request("POST", "/api/keys", &master, r#"{"name":"Lifecycle Key"}"#))
+        .await
+        .unwrap();
+    let key_id = body_json(create).await["id"].as_str().unwrap().to_owned();
+
+    let update = app
+        .clone()
+        .oneshot(signed_request(
+            "PUT",
+            &format!("/api/keys/{key_id}"),
+            &master,
+            r#"{"name":"Renamed Key"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(update.status(), StatusCode::OK);
+
+    let rotate = app
+        .clone()
+        .oneshot(signed_request("POST", &format!("/api/keys/{key_id}/rotate"), &master, ""))
+        .await
+        .unwrap();
+    assert_eq!(rotate.status(), StatusCode::OK);
+
+    let delete = app
+        .clone()
+        .oneshot(signed_request("DELETE", &format!("/api/keys/{key_id}"), &master, ""))
+        .await
+        .unwrap();
+    assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+
+    let logs = fetch_audit_logs(app, &master).await;
+    for expected_action in ["KEY_CREATE", "KEY_UPDATE", "KEY_ROTATE", "KEY_DELETE"] {
+        assert!(
+            logs.iter().any(|l| l["action"] == expected_action
+                && l["target_resource"].as_str().is_some_and(|t| t.contains(&key_id))),
+            "expected an audit entry for {expected_action} against key {key_id}, got: {logs:#?}"
+        );
+    }
+
+    // KEY_UPDATE's details records which fields actually changed.
+    let update_entry = logs.iter().find(|l| l["action"] == "KEY_UPDATE").unwrap();
+    assert!(update_entry["details"].as_str().unwrap().contains("name"));
+}
+
+#[tokio::test]
+async fn endpoint_create_update_delete_and_owner_reassign_each_write_an_audit_entry() {
+    let db = setup_test_db().await;
+    let master = insert_key(&db, true, true).await;
+    let other = insert_key(&db, false, false).await;
+    let state = test_state(&db).with_pinned_master(master.model.id);
+    let app = create_app(state);
+
+    let create = app
+        .clone()
+        .oneshot(signed_request(
+            "POST",
+            "/api/endpoints",
+            &master,
+            r#"{"name":"Audited Feed","vault_groups":"g1"}"#,
+        ))
+        .await
+        .unwrap();
+    let ep_id = body_json(create).await["id"].as_str().unwrap().to_owned();
+
+    let update = app
+        .clone()
+        .oneshot(signed_request(
+            "PUT",
+            &format!("/api/endpoints/{ep_id}"),
+            &master,
+            r#"{"ttl_seconds":120}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(update.status(), StatusCode::OK);
+
+    let reassign = app
+        .clone()
+        .oneshot(signed_request(
+            "PUT",
+            &format!("/api/endpoints/{ep_id}/owner"),
+            &master,
+            &format!(r#"{{"owner_key_id":"{}"}}"#, other.model.id),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(reassign.status(), StatusCode::OK);
+
+    let delete = app
+        .clone()
+        .oneshot(signed_request("DELETE", &format!("/api/endpoints/{ep_id}"), &master, ""))
+        .await
+        .unwrap();
+    assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+
+    let logs = fetch_audit_logs(app, &master).await;
+    for expected_action in
+        ["ENDPOINT_CREATE", "ENDPOINT_UPDATE", "ENDPOINT_OWNER_REASSIGN", "ENDPOINT_DELETE"]
+    {
+        assert!(
+            logs.iter().any(|l| l["action"] == expected_action
+                && l["target_resource"].as_str().is_some_and(|t| t.contains(&ep_id))),
+            "expected an audit entry for {expected_action} against endpoint {ep_id}, got: {logs:#?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn audit_logs_are_readable_only_by_the_master_key() {
+    let db = setup_test_db().await;
+    let master = insert_key(&db, true, true).await;
+    let daughter = insert_key(&db, false, false).await;
+    let state = test_state(&db).with_pinned_master(master.model.id);
+    let app = create_app(state);
+
+    let response =
+        app.oneshot(signed_request("GET", "/api/audit-logs", &daughter, "")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn audit_log_action_filter_narrows_results() {
+    let db = setup_test_db().await;
+    let master = insert_key(&db, true, true).await;
+    let state = test_state(&db).with_pinned_master(master.model.id);
+    let app = create_app(state);
+
+    app.clone()
+        .oneshot(signed_request("POST", "/api/keys", &master, r#"{"name":"Filter Test Key"}"#))
+        .await
+        .unwrap();
+    app.clone()
+        .oneshot(signed_request(
+            "POST",
+            "/api/endpoints",
+            &master,
+            r#"{"name":"Filter Test Endpoint","vault_groups":"g1"}"#,
+        ))
+        .await
+        .unwrap();
+
+    let response = app
+        .oneshot(signed_request("GET", "/api/audit-logs?action=KEY_CREATE", &master, ""))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let logs = body_json(response).await.as_array().unwrap().clone();
+    assert!(!logs.is_empty());
+    assert!(logs.iter().all(|l| l["action"] == "KEY_CREATE"));
+}

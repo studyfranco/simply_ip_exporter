@@ -11,10 +11,11 @@ use sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::api::support::{generate_random_key, hash_key, validate_bound_ips};
+use crate::api::support::{create_audit_log, describe_resource, generate_random_key, hash_key, validate_bound_ips};
 use crate::crypto::generate_signing_secret;
 use crate::entities::{api_key, prelude::ApiKey};
 use crate::error::AppError;
+use crate::middleware::ClientIp;
 use crate::state::AppState;
 
 fn require_master(key: &api_key::Model) -> Result<(), AppError> {
@@ -81,6 +82,7 @@ pub struct CreateKeyPayload {
 pub async fn create_api_key(
     State(state): State<AppState>,
     Extension(caller): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
     Json(payload): Json<CreateKeyPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     require_master(&caller)?;
@@ -117,6 +119,16 @@ pub async fn create_api_key(
     };
     let created = model.insert(&state.db).await?;
 
+    create_audit_log(
+        &state.db,
+        &caller,
+        client_ip.0,
+        "KEY_CREATE",
+        Some(describe_resource("api_key", created.id, &created.name)),
+        Some(format!("can_manage_keys={}", created.can_manage_keys)),
+    )
+    .await?;
+
     Ok(Json(MintedKeyResponse {
         key: created.into(),
         api_key: plaintext_key,
@@ -146,6 +158,7 @@ pub struct UpdateKeyPayload {
 pub async fn update_api_key(
     State(state): State<AppState>,
     Extension(caller): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateKeyPayload>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -153,12 +166,14 @@ pub async fn update_api_key(
 
     let existing = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
     let mut active: api_key::ActiveModel = existing.into();
+    let mut changed: Vec<&str> = Vec::new();
 
     if let Some(name) = payload.name {
         if name.trim().is_empty() {
             return Err(AppError::InvalidInput("name must not be empty".to_owned()));
         }
         active.name = Set(name);
+        changed.push("name");
     }
     if let Some(bound_ips) = payload.bound_ips {
         let trimmed = bound_ips.trim();
@@ -166,13 +181,26 @@ pub async fn update_api_key(
             validate_bound_ips(trimmed).map_err(AppError::InvalidInput)?;
         }
         active.bound_ips = Set(if trimmed.is_empty() { None } else { Some(trimmed.to_owned()) });
+        changed.push("bound_ips");
     }
     if let Some(can_manage_keys) = payload.can_manage_keys {
         active.can_manage_keys = Set(can_manage_keys);
+        changed.push("can_manage_keys");
     }
     active.updated_at = Set(Utc::now().naive_utc());
 
     let updated = active.update(&state.db).await?;
+
+    create_audit_log(
+        &state.db,
+        &caller,
+        client_ip.0,
+        "KEY_UPDATE",
+        Some(describe_resource("api_key", updated.id, &updated.name)),
+        Some(format!("changed: {}", if changed.is_empty() { "(none)".to_owned() } else { changed.join(", ") })),
+    )
+    .await?;
+
     Ok(Json(KeyResponse::from(updated)))
 }
 
@@ -180,6 +208,7 @@ pub async fn update_api_key(
 pub async fn delete_api_key(
     State(state): State<AppState>,
     Extension(caller): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     require_master(&caller)?;
@@ -189,7 +218,13 @@ pub async fn delete_api_key(
         return Err(AppError::Forbidden("The Master key cannot be deleted through the API".to_owned()));
     }
 
+    // Captured before the row is gone, since the audit entry must describe what was deleted.
+    let target_resource = describe_resource("api_key", existing.id, &existing.name);
+
     ApiKey::delete_by_id(id).exec(&state.db).await?;
+
+    create_audit_log(&state.db, &caller, client_ip.0, "KEY_DELETE", Some(target_resource), None).await?;
+
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -197,6 +232,7 @@ pub async fn delete_api_key(
 pub async fn rotate_api_key(
     State(state): State<AppState>,
     Extension(caller): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     require_master(&caller)?;
@@ -221,6 +257,16 @@ pub async fn rotate_api_key(
     })?));
     active.updated_at = Set(Utc::now().naive_utc());
     let updated = active.update(&state.db).await?;
+
+    create_audit_log(
+        &state.db,
+        &caller,
+        client_ip.0,
+        "KEY_ROTATE",
+        Some(describe_resource("api_key", updated.id, &updated.name)),
+        Some("credentials rotated".to_owned()),
+    )
+    .await?;
 
     Ok(Json(MintedKeyResponse { key: updated.into(), api_key: plaintext_key, signing_secret }))
 }

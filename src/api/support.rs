@@ -1,7 +1,13 @@
-//! Shared helpers for minting and hashing local API keys.
+//! Shared helpers for minting and hashing local API keys, and for writing audit trail entries.
 
+use chrono::Utc;
 use rand::RngExt;
+use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection};
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
+
+use crate::entities::{api_key, audit_log};
+use crate::error::AppError;
 
 /// Generates a fresh 32-byte random API key, hex-encoded (`sie_<64 hex>` when displayed with its
 /// prefix, but the returned value is the bare secret).
@@ -24,6 +30,44 @@ pub fn validate_bound_ips(raw: &str) -> Result<(), String> {
             return Err(format!("Invalid CIDR or IP address in bound_ips: {entry:?}"));
         }
     }
+    Ok(())
+}
+
+/// Renders a stable `kind:id (name)` reference for an audit log's `target_resource`.
+pub fn describe_resource(kind: &str, id: Uuid, name: &str) -> String {
+    format!("{kind}:{id} ({name})")
+}
+
+/// Writes one audit trail entry. `key` and `client_ip` denormalize the acting key's name/prefix
+/// and the caller's resolved address into the row so it stays legible and attributable even after
+/// that key is later deleted (`audit_logs.api_key_id` is `ON DELETE SET NULL`; the name/prefix
+/// survive as a point-in-time snapshot rather than a live join).
+///
+/// Deliberately propagates a write failure via `?` rather than logging and swallowing it: the
+/// mutation this call follows has already committed, so a caller that ignored this error would
+/// report `200 OK` for an action the audit trail never recorded — the two are meant to be
+/// inseparable. A `500` here is the honest answer: something is wrong with the database, and the
+/// caller should know its request did not fully succeed.
+pub async fn create_audit_log(
+    db: &DatabaseConnection,
+    key: &api_key::Model,
+    client_ip: std::net::IpAddr,
+    action: &str,
+    target_resource: Option<String>,
+    details: Option<String>,
+) -> Result<(), AppError> {
+    let log = audit_log::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        api_key_id: Set(Some(key.id)),
+        api_key_name: Set(key.name.clone()),
+        api_key_prefix: Set(key.prefix.clone()),
+        client_ip: Set(client_ip.to_string()),
+        action: Set(action.to_owned()),
+        target_resource: Set(target_resource),
+        details: Set(details),
+        timestamp: Set(Utc::now().naive_utc()),
+    };
+    log.insert(db).await?;
     Ok(())
 }
 
@@ -52,5 +96,11 @@ mod tests {
         assert!(validate_bound_ips("10.0.0.0/8, ::1, 192.168.1.1").is_ok());
         assert!(validate_bound_ips("").is_ok());
         assert!(validate_bound_ips("not-an-ip").is_err());
+    }
+
+    #[test]
+    fn describe_resource_renders_kind_id_and_name() {
+        let id = Uuid::nil();
+        assert_eq!(describe_resource("api_key", id, "Daughter Key"), format!("api_key:{id} (Daughter Key)"));
     }
 }

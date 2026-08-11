@@ -25,8 +25,23 @@ This document defines the official database schema, SeaORM entity models, relati
 | can_manage_keys   |       | filter_rfc1918            |
 | parent_key_id     |       | filter_bogons             |
 | owner_key_id      |       | filter_loopback           |
-+-------------------+       | last_synced_at            |
-                            +---------------------------+
++---------+---------+       | last_synced_at            |
+          | 1                +---------------------------+
+          |
+          | M
++---------+---------+
+|     audit_logs    |
++--------------------+
+| id (UUID)          |
+| api_key_id (UUID)  |
+| api_key_name       |
+| api_key_prefix     |
+| client_ip          |
+| action             |
+| target_resource    |
+| details            |
+| timestamp          |
++--------------------+
 ```
 
 ---
@@ -82,10 +97,43 @@ Defines public feed routes exposed at `/feed/v1/<token_secret>/list.txt`.
 
 ---
 
+### 3. `audit_logs`
+The audit trail for every mutating `/api/keys/*` and `/api/endpoints/*` action. Written by
+`api::support::create_audit_log` immediately after each mutation commits; read exclusively via
+`GET /api/audit-logs`, restricted to the Master key (audit entries span every key and endpoint in
+the system, so a scoped Daughter key seeing them would be an RBAC leak regardless of what it owns).
+
+| Field | Type | Constraints | Description |
+| :--- | :--- | :--- | :--- |
+| `id` | UUID / String | PRIMARY KEY | Unique identifier for the audit log entry. |
+| `api_key_id` | UUID / String | NULLABLE, INDEXED (`idx_audit_logs_api_key_id`), FOREIGN KEY (`api_keys.id` ON DELETE SET NULL) | The key that performed the action. `NULL` once that key is later deleted — the row survives, only the live link is severed. |
+| `api_key_name` | String | NOT NULL | The acting key's name, denormalized at write time. Survives the key's deletion, unlike `api_key_id`. |
+| `api_key_prefix` | String | NOT NULL | The acting key's prefix, denormalized for the same reason as `api_key_name`. |
+| `client_ip` | String | NOT NULL | The caller's resolved client IP (see `middleware::ClientIp`), as text. |
+| `action` | String | NOT NULL, INDEXED (`idx_audit_logs_action`) | Operation type: `KEY_CREATE`, `KEY_UPDATE`, `KEY_DELETE`, `KEY_ROTATE`, `ENDPOINT_CREATE`, `ENDPOINT_UPDATE`, `ENDPOINT_DELETE`, `ENDPOINT_OWNER_REASSIGN`. |
+| `target_resource` | String | NULLABLE | The resource the action targeted, rendered as `kind:id (name)` (e.g. `endpoint:3f2a... (pfBlockerNG DMZ Feed)`). |
+| `details` | Text | NULLABLE | Additional context — which fields changed on an update, or a short human-readable summary. |
+| `timestamp` | DateTimeUtc | NOT NULL, INDEXED (`idx_audit_logs_timestamp`) | Log entry creation timestamp (UTC). |
+
+#### Attribution survives key deletion
+Unlike `endpoints.owner_key_id`, `audit_logs.api_key_id` losing its link on key deletion does not
+lose the *attribution* — `api_key_name`/`api_key_prefix` are point-in-time snapshots written once
+and never updated, so the audit trail stays legible ("Daughter Key XYZ created endpoint ABC") even
+long after that key no longer exists.
+
+#### Write failures are not swallowed
+`create_audit_log` propagates a database error rather than logging and continuing. The mutation it
+follows has already committed by the time it's called, so silently dropping an audit-write failure
+would report `200 OK` for an action the audit trail never recorded. The two are meant to be
+inseparable: if the audit write fails, the request fails too.
+
+---
+
 ## 🔗 SeaORM Entity Relations
 
 - **`ApiKey` -> `Endpoint`**: HasMany (`owner_key_id`)
 - **`ApiKey` -> `ApiKey` (Parent)**: BelongsTo (`parent_key_id`)
+- **`ApiKey` -> `AuditLog`**: HasMany (`api_key_id`)
 
 ---
 
@@ -94,10 +142,12 @@ Defines public feed routes exposed at `/feed/v1/<token_secret>/list.txt`.
 | Child Table | Column | Parent Table | On Delete |
 | :--- | :--- | :--- | :--- |
 | `endpoints` | `owner_key_id` | `api_keys.id` | **`SET NULL`** |
+| `audit_logs` | `api_key_id` | `api_keys.id` | **`SET NULL`** |
 
 ### Lineage & Ownership
 - `parent_key_id` on `api_keys` is deliberately unconstrained at the database level to prevent recursive CASCADE drops of whole key subtrees outside §6's pre-flight inventory.
 - Deleting an API key sets `endpoints.owner_key_id` to `NULL`, transferring lifecycle control over the endpoint route to Master alone.
+- Deleting an API key sets `audit_logs.api_key_id` to `NULL` too, but never deletes the audit rows themselves — `api_key_name`/`api_key_prefix` keep them attributable regardless.
 
 ---
 
@@ -108,6 +158,9 @@ Defines public feed routes exposed at `/feed/v1/<token_secret>/list.txt`.
 3. `api_keys.master_marker`: Unique marker index enforcing single Master invariant.
 4. `endpoints.token_secret`: Unique index for public URL feed resolution.
 5. `endpoints.owner_key_id`: Fast filtering of endpoints by key owner.
+6. `audit_logs.action`: Fast filtering by operation type on `GET /api/audit-logs?action=...`.
+7. `audit_logs.timestamp`: Fast ordering/pagination of the audit trail (most recent first).
+8. `audit_logs.api_key_id`: Fast lookup of a given key's audit history.
 
 ---
 

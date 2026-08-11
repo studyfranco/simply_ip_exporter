@@ -94,6 +94,24 @@
           <div id="key-error" class="error hidden"></div>
         </form>
       </section>
+
+      <section class="card hidden" id="audit-card">
+        <h2>Audit Logs (Master only)</h2>
+        <div class="row">
+          <div style="flex:1">
+            <label for="audit-action-filter">Filter by action</label>
+            <input type="text" id="audit-action-filter" placeholder="e.g. KEY_CREATE" />
+          </div>
+          <button id="audit-refresh-btn" class="secondary small" style="align-self:flex-end">Refresh</button>
+        </div>
+        <table>
+          <thead>
+            <tr><th>Time</th><th>Action</th><th>Target</th><th>Actor</th><th>Client IP</th><th>Details</th></tr>
+          </thead>
+          <tbody id="audit-body"></tbody>
+        </table>
+        <div id="audit-error" class="error hidden"></div>
+      </section>
     </div>
   </main>
 

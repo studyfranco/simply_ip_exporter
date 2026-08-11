@@ -54,6 +54,7 @@ pub fn create_app(state: AppState) -> Router {
         .route("/endpoints/{id}", put(api::update_endpoint))
         .route("/endpoints/{id}", delete(api::delete_endpoint))
         .route("/endpoints/{id}/owner", put(api::reassign_endpoint_owner))
+        .route("/audit-logs", get(api::list_audit_logs))
         .layer(axum::middleware::from_fn_with_state(state.clone(), middleware::auth_middleware));
 
     Router::new()

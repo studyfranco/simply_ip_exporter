@@ -177,6 +177,12 @@ Two tiers, per `AGENT.MD`:
 | `PUT /api/endpoints/{id}` | owner or Master | Update an endpoint's configuration. |
 | `DELETE /api/endpoints/{id}` | owner or Master | Delete an endpoint and evict its in-memory cache. |
 | `PUT /api/endpoints/{id}/owner` | Master | Reassign an endpoint's owner. |
+| `GET /api/audit-logs` | Master | List the audit trail (most recent first), optionally filtered by `action` and paginated (`limit`/`offset`). |
+
+Every mutating route above (`POST`/`PUT`/`DELETE` on `/api/keys/*` and `/api/endpoints/*`) writes
+an entry to `audit_logs` after its write commits — see `SCHEMA.MD` §3. The write is not
+best-effort: if it fails, the request fails too, since a `200 OK` for an action the audit trail
+never recorded would be worse than an honest `500`.
 
 An `endpoints` row's fields:
 
