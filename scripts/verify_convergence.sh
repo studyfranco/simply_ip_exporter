@@ -8,6 +8,12 @@
 #   3. static/app.js parses as valid JavaScript and every element id it looks up via el(...)
 #      actually exists in static/index.html.
 #
+# Before any of that, it synchronizes every peer repository checked out under example/ (see
+# AGENT.MD's "Peer Repository Synchronization" section) so a convergence/security comparison never
+# runs unknowingly against a stale checkout. That step is best-effort: offline runs, or a peer
+# whose remote is unreachable, log a warning and fall through to whatever is on disk rather than
+# failing the whole gate over a network hiccup.
+#
 # The actual analysis lives in tests/source_hygiene.rs (a real Rust file scanner plus an oxc-based
 # JS parser for the JS check — a shell script cannot reliably parse either). This script is the
 # single, memorable entry point `./scripts/verify_convergence.sh` the validation checklist expects,
@@ -24,12 +30,14 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 BOLD='\033[1m'
 RESET='\033[0m'
 
 ts() { date +"%H:%M:%S.%3N"; }
 log() { echo -e "$(ts) ${CYAN}[INFO]${RESET} $*" >&2; }
+warn() { echo -e "$(ts) ${YELLOW}[WARN]${RESET} $*" >&2; }
 err() { echo -e "$(ts) ${RED}[ERROR]${RESET} $*" >&2; }
 
 if ! command -v cargo >/dev/null 2>&1; then
@@ -38,6 +46,35 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 
 cd "$PROJECT_ROOT"
+
+# ── Peer repository synchronization ─────────────────────────────────────────
+#
+# See AGENT.MD's "Peer Repository Synchronization" section: analysis against a peer checked out
+# under example/ must reflect its current upstream HEAD, not whatever happened to be on disk from
+# whenever that checkout was last updated. `nullglob` makes the loop below a silent no-op when
+# example/ doesn't exist or holds no git checkouts, rather than iterating over a literal, unmatched
+# glob pattern.
+shopt -s nullglob
+PEER_GIT_DIRS=("$PROJECT_ROOT"/example/*/.git)
+shopt -u nullglob
+
+if [ "${#PEER_GIT_DIRS[@]}" -eq 0 ]; then
+    log "No peer repositories found under example/ — skipping sync."
+else
+    log "Synchronizing ${#PEER_GIT_DIRS[@]} peer repository/ies under example/ ..."
+    for git_dir in "${PEER_GIT_DIRS[@]}"; do
+        peer_dir="$(dirname "$git_dir")"
+        peer_name="$(basename "$peer_dir")"
+        # Bounded so an unreachable remote degrades to a warning within seconds rather than
+        # hanging the whole convergence gate on a stalled network connection.
+        if PULL_OUTPUT=$(timeout 15 git -C "$peer_dir" pull --quiet 2>&1); then
+            log "  $peer_name: synchronized"
+        else
+            warn "⚠️ Warning: Could not pull peer repository '$peer_name', continuing with local version..."
+            [ -n "$PULL_OUTPUT" ] && warn "  $(echo "$PULL_OUTPUT" | head -1)"
+        fi
+    done
+fi
 
 # Each check is run as its own named test, so a failure names exactly which convention was
 # violated (and where) rather than reporting one undifferentiated "tests failed".

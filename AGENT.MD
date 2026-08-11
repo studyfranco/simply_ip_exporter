@@ -13,6 +13,31 @@ Hello AI Agent! You are assisting with the development of `simply_ip_exporter`. 
 
 ---
 
+## 🔄 Peer Repository Synchronization
+
+`example/` holds live checkouts of the peer projects this service converges against
+(`simply_ip_vault`, `simply_hook_executor`), each its own git repository with a configured
+`origin`. Their working trees can go stale between sessions — a peer's `AGENT.MD`, `RBAC_MODEL.md`,
+or source may have moved on since the last checkout in this tree was made.
+
+**Mandatory:** before reading any file under `example/<peer_repo>/` for the purpose of an audit,
+structural/security comparison, or convergence analysis, run:
+
+```sh
+git -C example/<peer_repo> pull
+```
+
+for every peer repo you are about to consult. Skipping this and analyzing a stale checkout risks
+comparing against code the peer project has already changed, producing a "convergence" report that
+is convergent with the past rather than the present. This does not apply to routine work that
+merely *uses* `example/` as a pattern reference during normal feature implementation (as opposed to
+producing a comparison/audit artifact) — use judgment, but default to pulling first when in doubt.
+
+`scripts/verify_convergence.sh` automates this at the start of every run for any `example/*`
+directory that contains a `.git` — see that script for the graceful offline-mode fallback.
+
+---
+
 ## 🎯 Project Overview
 
 `simply_ip_exporter` is a high-performance DMZ proxy and IP list exposure daemon written in Rust. It periodically fetches, aggregates, cleans, and deduplicates IP records from a central `simply_ip_vault` instance and exposes plaintext (`text/plain`) feeds formatted for pfSense (`pfBlockerNG`) and external firewall alias list importers.
