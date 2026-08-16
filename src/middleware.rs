@@ -124,9 +124,31 @@ pub async fn auth_middleware(
     let secret = recover_signing_secret(&state, &key_record)?;
 
     let (parts, body) = req.into_parts();
-    let bytes = axum::body::to_bytes(body, MAX_SIGNED_BODY_BYTES)
-        .await
-        .map_err(|_| AppError::InvalidInput("Request body too large to verify".to_owned()))?;
+
+    // A declared `Content-Length` over the limit is rejected as `413` before any of the body is
+    // read — the correct status for "this body is too large", which `to_bytes`'s own limit below
+    // cannot express (it has no way to distinguish "too large" from any other read failure, so it
+    // is mapped to a generic `400`). This only covers requests carrying the header; a chunked body
+    // with no `Content-Length` still falls through to that fallback.
+    if let Some(declared) = parts
+        .headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok())
+        && declared > MAX_SIGNED_BODY_BYTES
+    {
+        return Err(AppError::BodyRejected(
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            "Request body exceeds the maximum allowed size".to_owned(),
+        ));
+    }
+
+    let bytes = axum::body::to_bytes(body, MAX_SIGNED_BODY_BYTES).await.map_err(|_| {
+        AppError::BodyRejected(
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            "Request body exceeds the maximum allowed size".to_owned(),
+        )
+    })?;
 
     let original_uri = parts
         .extensions

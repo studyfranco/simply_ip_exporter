@@ -37,6 +37,17 @@ pub enum AppError {
     #[error("Too Many Requests: {0}")]
     TooManyRequests(String),
 
+    /// A request body an extractor refused before any handler ran, carrying the extractor's own
+    /// status verbatim (see [`crate::extract::StrictJson`]).
+    ///
+    /// Exists so a malformed-body rejection can be normalized into this service's `{"error": ...}`
+    /// envelope without flattening an *unrelated* rejection into it too — the body-size limit
+    /// surfaces as the same underlying `JsonRejection` type, and collapsing it here would turn a
+    /// `413 Payload Too Large` into an indistinguishable `400`. The status is passed through
+    /// verbatim; only the response body's shape is normalized.
+    #[error("Request rejected: {1}")]
+    BodyRejected(StatusCode, String),
+
     /// Internal server error.
     #[error("Internal Server Error")]
     Internal,
@@ -55,6 +66,7 @@ impl IntoResponse for AppError {
             AppError::NotFound => (StatusCode::NOT_FOUND, "Resource not found".to_owned()),
             AppError::Conflict(msg) => (StatusCode::CONFLICT, msg),
             AppError::TooManyRequests(msg) => (StatusCode::TOO_MANY_REQUESTS, msg),
+            AppError::BodyRejected(status, msg) => (status, msg),
             AppError::Internal => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "An internal server error occurred".to_owned())
             }

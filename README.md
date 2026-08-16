@@ -248,12 +248,17 @@ orchestrators, load balancers) cannot compute an HMAC signature.
 ```sh
 cargo check --all-targets
 cargo clippy --all-targets -- -D warnings
-cargo test               # 52 unit tests + 11 integration tests (tests/integration.rs)
-./scripts/test_e2e.sh    # full live E2E against a real simply_ip_vault + simply_ip_exporter pair
+cargo test                     # 80 unit + 21 integration + 7 source-hygiene tests
+./scripts/verify_convergence.sh  # source hygiene: raw SQL, unwrap/expect, frontend syntax/DOM refs
+./scripts/test_e2e.sh          # full live E2E against a real simply_ip_vault + simply_ip_exporter pair
 ```
 
 `scripts/test_e2e.sh` builds and boots both services against throwaway SQLite databases with
-deterministic bootstrap keys, provisions Vault with a scoped read-only key and a mix of public,
-RFC 1918, and bogon addresses, configures an exporter endpoint, and asserts aggregation, filtering,
-ETag/304, rate limiting, and resilience to a Vault outage — 37 checks end to end. It needs the
-reference `example/simply_ip_vault` checkout, and `curl`/`jq`/`cargo`/`openssl` on `PATH`.
+deterministic bootstrap keys, provisions Vault, configures an exporter endpoint, and asserts —
+across 80 checks in 11 sections — the feed pipeline (aggregation, filtering, ETag/304, rate
+limiting), Vault soft-delete propagation via differential sync, hot-reload of endpoint config with
+no restart, `bound_ips` client-IP restriction, a full graceful-restart-with-encryption cycle
+(Master key, a Daughter key's encrypted secret, and the endpoint row all surviving a `SIGTERM` and
+restart against the same SQLite file), resilience to a Vault outage, and a full audit-log
+traversal. It needs the reference `example/simply_ip_vault` checkout, and
+`curl`/`jq`/`cargo`/`openssl` on `PATH`.

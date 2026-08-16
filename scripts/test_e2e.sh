@@ -9,17 +9,30 @@
 #
 #   1. Environment setup: build + boot both instances, wait for /ready on each.
 #   2. Vault provisioning: a scoped read-only key for the exporter, seeded with a contiguous/
-#      overlapping pair of public addresses, a CGN "bogon" address, and (via a whitelist group,
-#      since simply_ip_vault refuses to /ban a private address) an RFC 1918 address.
+#      overlapping pair of public addresses, a CGN "bogon" address, a dedicated address for the
+#      soft-delete test, and (via a whitelist group, since simply_ip_vault refuses to /ban a
+#      private address) an RFC 1918 address.
 #   3. Exporter configuration: an HMAC CANONICAL_V1-signed POST /api/endpoints wired to those Vault
 #      groups with ttl_seconds=2, filter_rfc1918=true, filter_bogons=true.
 #   4. Feed verification: text/plain output, ipnet::IpNet::aggregate() merging the overlapping
 #      pair, and both filters actually removing what they claim to.
 #   5. HTTP optimizations & anti-DoS: ETag + If-None-Match -> 304 (and that a matching conditional
 #      request is NOT rate-limited), then a bare repeat -> 429.
-#   6. Resilience: kill simply_ip_vault, confirm simply_ip_exporter keeps serving the same
-#      in-memory cached feed without interruption.
-#   7. Cleanup: terminate both processes and remove every temporary file.
+#   6. Vault soft-delete propagation: soft-delete a Vault record and confirm the next differential
+#      sync (since=<last_synced_at>&include_deleted=true) removes it from the feed.
+#   7. Hot-reload of endpoint configuration: flip filter_rfc1918 via a signed PUT and confirm the
+#      very next feed request reflects it, with no exporter restart.
+#   8. Client IP restriction (bound_ips): a dedicated endpoint scoped to 10.10.0.0/16 serves an
+#      in-range simulated client and 403s an out-of-range one.
+#   9. Restart & persistence recovery: SIGTERM simply_ip_exporter, restart it against the same
+#      SQLite file, and confirm the Master key, a Daughter key minted before the restart (proving
+#      its encrypted-at-rest signing_secret round-trips through EXPORTER_ENCRYPTION_KEY), and the
+#      original endpoint all survive — then confirm the in-memory IP cache re-hydrates from Vault.
+#  10. Vault disruption & resilience: kill simply_ip_vault, confirm simply_ip_exporter keeps
+#      serving the same in-memory cached feed without interruption.
+#  11. Audit log traversal: fetch GET /api/audit-logs as Master and confirm every administrative
+#      action performed during this run is present, correctly attributed, and timestamped.
+#  12. Cleanup: terminate both processes and remove every temporary file.
 #
 # Usage: ./scripts/test_e2e.sh
 # Requires: curl, jq, cargo, openssl. Needs example/simply_ip_vault present (a reference checkout;
@@ -392,6 +405,11 @@ check "200" "8.8.8.1/32 added to the blacklist group"
 # it IS in simply_ip_exporter's bogon list, which is what this address exercises.
 api_call "$VAULT_URL" POST "/api/ban" "$VAULT_MASTER_KEY" '{"target_address":"100.64.0.5/32","group_name":"pfBlocker_Blacklist","cause":"bogon (CGN) filter test"}'
 check "200" "100.64.0.5/32 (CGN bogon) added to the blacklist group"
+# A dedicated, otherwise-untouched public address for §6's soft-delete propagation test — kept
+# distinct from the aggregation/filter fixtures above so deleting it later can't be confused with
+# (or accidentally break) any other section's assertions.
+api_call "$VAULT_URL" POST "/api/ban" "$VAULT_MASTER_KEY" '{"target_address":"8.8.4.4/32","group_name":"pfBlocker_Blacklist","cause":"soft-delete propagation test"}'
+check "200" "8.8.4.4/32 (soft-delete test fixture) added to the blacklist group"
 
 log "Creating a scoped, read-only key for the Exporter..."
 api_call "$VAULT_URL" POST "/api/keys" "$VAULT_MASTER_KEY" '{"name":"simply_ip_exporter sync key","bound_ips":"0.0.0.0/0,::/0"}'
@@ -411,7 +429,7 @@ check "200" "can_read granted on pfBlocker_Private_Test"
 
 api_call "$VAULT_URL" GET "/api/ips?groups=pfBlocker_Blacklist,pfBlocker_Private_Test" "$EXPORTER_VAULT_KEY"
 check "200" "the scoped Exporter key can read across both groups"
-check_jq "length" "4" "sees all 4 seeded records (restrict-not-reject: no group is silently rejected)"
+check_jq "length" "5" "sees all 5 seeded records (restrict-not-reject: no group is silently rejected)"
 
 # ── 3. Exporter configuration ───────────────────────────────────────────────
 
@@ -456,7 +474,8 @@ check_jq ".filter_rfc1918" "true" "filter_rfc1918 is set as configured"
 check_jq ".filter_bogons" "true" "filter_bogons is set as configured"
 FEED_TOKEN=$(echo "$RESP_BODY" | jq -r '.token_secret')
 FEED_PATH=$(echo "$RESP_BODY" | jq -r '.feed_path')
-log "Feed path: $FEED_PATH"
+FEED_ENDPOINT_ID=$(echo "$RESP_BODY" | jq -r '.id')
+log "Feed path: $FEED_PATH (endpoint id: $FEED_ENDPOINT_ID)"
 
 log "Waiting for the background sync worker (15s tick interval, endpoint is due for an immediate full sync)..."
 sleep 18
@@ -474,10 +493,11 @@ check_local "$CONTENT_TYPE" "text/plain; charset=utf-8" "the feed is served as t
 
 check_contains "$RESP_BODY" "8.8.8.0/24" "8.8.8.0/24 and 8.8.8.1/32 were aggregated into 8.8.8.0/24"
 check_not_contains "$RESP_BODY" "8.8.8.1" "the host-route 8.8.8.1/32 no longer appears on its own (proves aggregation, not just filtering)"
+check_contains "$RESP_BODY" "8.8.4.4/32" "8.8.4.4/32 (the §6 soft-delete fixture) is present and unaggregated (not adjacent to the 8.8.8.0/24 block)"
 check_not_contains "$RESP_BODY" "192.168.1.50" "the RFC1918 address is filtered out (filter_rfc1918=true)"
 check_not_contains "$RESP_BODY" "100.64.0.5" "the CGN bogon address is filtered out (filter_bogons=true)"
 LINE_COUNT=$(echo "$RESP_BODY" | grep -c . || true)
-check_local "$LINE_COUNT" "1" "exactly one line remains after aggregation and filtering"
+check_local "$LINE_COUNT" "2" "exactly two lines remain after aggregation and filtering (8.8.8.0/24, 8.8.4.4/32)"
 
 # ── 5. HTTP optimizations & anti-DoS ────────────────────────────────────────
 
@@ -504,9 +524,135 @@ else
     check "304" "a matching conditional request is STILL free even though this IP is currently throttled"
 fi
 
-# ── 6. Vault disruption & resilience ────────────────────────────────────────
+# ── 6. Vault soft-delete propagation ────────────────────────────────────────
 
-log_section "6. Vault Disruption & Resilience"
+log_section "6. Vault Soft-Delete Propagation"
+
+raw_call GET "$EXPORTER_URL$FEED_PATH" -H "X-Forwarded-For: 198.51.100.21"
+check "200" "feed is served before the soft-delete"
+check_contains "$RESP_BODY" "8.8.4.4" "8.8.4.4/32 is present in the feed (synced during §3's wait)"
+
+log "Looking up 8.8.4.4/32's Vault record id..."
+api_call "$VAULT_URL" GET "/api/ips?ip=8.8.4.4" "$VAULT_MASTER_KEY"
+check "200" "the record lookup succeeds"
+check_jq "length" "1" "exactly one matching record"
+SOFT_DELETE_RECORD_ID=$(echo "$RESP_BODY" | jq -r '.[0].id')
+
+log "Soft-deleting 8.8.4.4/32 in Vault (DELETE /api/ips/<id>, no ?hard=true)..."
+api_call "$VAULT_URL" DELETE "/api/ips/$SOFT_DELETE_RECORD_ID" "$VAULT_MASTER_KEY"
+check "200" "the soft-delete request succeeds"
+check_jq ".deleted" "soft" "the deletion is soft (deleted_at set), not permanent"
+
+log "Waiting for the next differential sync (ttl_seconds=2, tick interval 15s) to observe it via \
+    since=<last_synced_at>&include_deleted=true..."
+sleep 17
+
+raw_call GET "$EXPORTER_URL$FEED_PATH" -H "X-Forwarded-For: 198.51.100.22"
+check "200" "feed is served after the soft-delete"
+check_not_contains "$RESP_BODY" "8.8.4.4" "8.8.4.4/32 is gone from the feed — the differential sync picked up the soft-delete and evicted it from the in-memory cache"
+check_contains "$RESP_BODY" "8.8.8.0/24" "unrelated cached content survives the differential merge untouched"
+
+# ── 7. Hot-reload of endpoint configuration ─────────────────────────────────
+
+log_section "7. Hot-Reload of Endpoint Configuration"
+
+raw_call GET "$EXPORTER_URL$FEED_PATH" -H "X-Forwarded-For: 198.51.100.31"
+check "200" "feed served before the hot-reload"
+check_not_contains "$RESP_BODY" "192.168.1.50" "the private IP stays hidden while filter_rfc1918=true"
+
+log "Disabling filter_rfc1918 via a signed PUT /api/endpoints/$FEED_ENDPOINT_ID..."
+api_call "$EXPORTER_URL" PUT "/api/endpoints/$FEED_ENDPOINT_ID" "$EXPORTER_MASTER_KEY" '{"filter_rfc1918":false}'
+check "200" "the endpoint update succeeds"
+check_jq ".filter_rfc1918" "false" "filter_rfc1918 now reads false"
+
+log "Re-querying the feed immediately — no exporter restart, no wait for a sync tick..."
+raw_call GET "$EXPORTER_URL$FEED_PATH" -H "X-Forwarded-For: 198.51.100.32"
+check "200" "feed served after the hot-reload"
+check_contains "$RESP_BODY" "192.168.1.50" "the private IP now appears: the config change took effect on the very next request, live"
+
+log "Restoring filter_rfc1918=true for the remainder of the run..."
+api_call "$EXPORTER_URL" PUT "/api/endpoints/$FEED_ENDPOINT_ID" "$EXPORTER_MASTER_KEY" '{"filter_rfc1918":true}'
+check "200" "filter_rfc1918 is restored"
+raw_call GET "$EXPORTER_URL$FEED_PATH" -H "X-Forwarded-For: 198.51.100.33"
+check_not_contains "$RESP_BODY" "192.168.1.50" "the private IP is hidden again immediately after restoring the filter"
+
+# ── 8. Client IP restriction (bound_ips) ────────────────────────────────────
+
+log_section "8. Client IP Restriction (bound_ips)"
+
+log "Creating an endpoint restricted to 10.10.0.0/16..."
+api_call "$EXPORTER_URL" POST "/api/endpoints" "$EXPORTER_MASTER_KEY" \
+    '{"name":"Restricted Feed","vault_groups":"pfBlocker_Blacklist","bound_ips":"10.10.0.0/16"}'
+check "200" "the restricted endpoint is created"
+check_jq ".bound_ips" "10.10.0.0/16" "bound_ips is set as configured"
+RESTRICTED_PATH=$(echo "$RESP_BODY" | jq -r '.feed_path')
+
+raw_call GET "$EXPORTER_URL$RESTRICTED_PATH" -H "X-Forwarded-For: 10.10.5.5"
+check "200" "an authorized source IP (10.10.5.5, inside 10.10.0.0/16) is served"
+
+raw_call GET "$EXPORTER_URL$RESTRICTED_PATH" -H "X-Forwarded-For: 203.0.113.99"
+check "403" "an unauthorized source IP (203.0.113.99, outside the bound CIDR) is rejected"
+
+# ── 9. Restart & persistence recovery (encrypted at rest) ──────────────────
+
+log_section "9. Restart & Persistence Recovery (Encrypted at Rest)"
+
+log "Creating a Daughter key whose signing_secret will be sealed with EXPORTER_ENCRYPTION_KEY..."
+api_call "$EXPORTER_URL" POST "/api/keys" "$EXPORTER_MASTER_KEY" '{"name":"Persistence Test Daughter"}'
+check "200" "the Daughter key is created"
+DAUGHTER_KEY=$(echo "$RESP_BODY" | jq -r '.api_key')
+DAUGHTER_SECRET=$(echo "$RESP_BODY" | jq -r '.signing_secret')
+DAUGHTER_ID=$(echo "$RESP_BODY" | jq -r '.id')
+register_key_secret "$DAUGHTER_KEY" "$DAUGHTER_SECRET"
+
+api_call "$EXPORTER_URL" GET "/api/auth/me" "$DAUGHTER_KEY"
+check "200" "the Daughter key authenticates before the restart"
+
+log "Sending SIGTERM to simply_ip_exporter (pid $EXPORTER_PID) for a graceful shutdown..."
+kill -TERM "$EXPORTER_PID"
+wait "$EXPORTER_PID" 2>/dev/null
+EXPORTER_EXIT_CODE=$?
+EXPORTER_PID=""
+check_local "$EXPORTER_EXIT_CODE" "0" "simply_ip_exporter exited cleanly (code 0) on SIGTERM"
+
+log "Restarting simply_ip_exporter against the SAME database file ($EXPORTER_DB_PATH)..."
+# Deliberately no INITIAL_MASTER_KEY this time: the master row already exists, so this proves the
+# persisted row (not a fresh bootstrap) is what authenticates after restart.
+DATABASE_URL="sqlite://$EXPORTER_DB_PATH?mode=rwc" RUST_LOG=info \
+    EXPORTER_ENCRYPTION_KEY="$E2E_ENCRYPTION_KEY" \
+    VAULT_BASE_URL="$VAULT_URL" \
+    VAULT_API_KEY="$EXPORTER_VAULT_KEY" \
+    VAULT_SIGNING_SECRET="$EXPORTER_VAULT_SECRET" \
+    TRUSTED_PROXIES="127.0.0.1" \
+    PORT="$EXPORTER_PORT" \
+    "$PROJECT_ROOT/target/debug/simply_ip_exporter" >>"$EXPORTER_LOG" 2>&1 &
+EXPORTER_PID=$!
+log "Waiting for the restarted simply_ip_exporter to become ready (pid $EXPORTER_PID)..."
+wait_ready "simply_ip_exporter" "$EXPORTER_URL" "$EXPORTER_PID" "$EXPORTER_LOG"
+log "simply_ip_exporter is back up."
+
+api_call "$EXPORTER_URL" GET "/api/auth/me" "$EXPORTER_MASTER_KEY"
+check "200" "the Master key still authenticates after restart (the persisted row, not a re-bootstrap)"
+check_jq ".is_master" "true" "still reports is_master=true"
+
+api_call "$EXPORTER_URL" GET "/api/auth/me" "$DAUGHTER_KEY"
+check "200" "the pre-restart Daughter key STILL authenticates: its signing_secret was sealed, persisted, and successfully decrypted again with the same EXPORTER_ENCRYPTION_KEY"
+
+raw_call GET "$EXPORTER_URL$FEED_PATH" -H "X-Forwarded-For: 198.51.100.41"
+check "200" "the original feed endpoint's token still resolves after restart (the endpoint row persisted)"
+
+log "Waiting for the in-memory IP cache (cleared on restart) to re-hydrate from Vault via the sync worker's first tick..."
+sleep 18
+
+raw_call GET "$EXPORTER_URL$FEED_PATH" -H "X-Forwarded-For: 198.51.100.42"
+check "200" "feed served again after cache rehydration"
+check_contains "$RESP_BODY" "8.8.8.0/24" "the rehydrated cache contains the expected aggregated content"
+check_not_contains "$RESP_BODY" "8.8.4.4" "the soft-deleted address is NOT resurrected by the post-restart full sync"
+check_not_contains "$RESP_BODY" "192.168.1.50" "filter_rfc1918 (restored to true in §7) is still enforced after restart"
+
+# ── 10. Vault disruption & resilience ───────────────────────────────────────
+
+log_section "10. Vault Disruption & Resilience"
 
 log "Terminating simply_ip_vault (pid $VAULT_PID)..."
 kill "$VAULT_PID" 2>/dev/null || true
@@ -533,6 +679,57 @@ check_contains "$RESP_BODY" "8.8.8.0/24" "the cached, aggregated content is unch
 
 api_call "$EXPORTER_URL" GET "/ready" "$EXPORTER_MASTER_KEY"
 check "200" "simply_ip_exporter's own /ready is unaffected by Vault being unreachable"
+
+# ── 11. Audit log traversal ─────────────────────────────────────────────────
+
+log_section "11. Audit Log Traversal"
+
+log "Fetching the full audit trail from simply_ip_exporter as Master..."
+api_call "$EXPORTER_URL" GET "/api/audit-logs?limit=500" "$EXPORTER_MASTER_KEY"
+check "200" "the audit log is readable by Master"
+
+for expected_action in KEY_CREATE ENDPOINT_CREATE ENDPOINT_UPDATE; do
+    COUNT=$(echo "$RESP_BODY" | jq --arg a "$expected_action" '[.[] | select(.action == $a)] | length')
+    if [ -n "$COUNT" ] && [ "$COUNT" -ge 1 ] 2>/dev/null; then
+        PASS_COUNT=$((PASS_COUNT + 1))
+        echo -e "$(ts)   ${GREEN}✓ PASS${RESET} the audit trail contains at least one $expected_action entry (found $COUNT)" >&2
+    else
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+        echo -e "$(ts)   ${RED}✗ FAIL${RESET} the audit trail is missing an entry for $expected_action" >&2
+    fi
+done
+
+log "Checking attribution and timestamp accuracy on the Daughter key's own KEY_CREATE entry..."
+DAUGHTER_ENTRY=$(echo "$RESP_BODY" | jq --arg id "$DAUGHTER_ID" \
+    '[.[] | select(.action == "KEY_CREATE" and (.target_resource // "" | contains($id)))] | .[0]')
+check_local "$(echo "$DAUGHTER_ENTRY" | jq -r '.api_key_name')" "System Master" \
+    "the Daughter key's own KEY_CREATE entry is attributed to the ACTOR who created it (Master), not the new key itself"
+check_local "$(echo "$DAUGHTER_ENTRY" | jq -r '.action')" "KEY_CREATE" "the entry's action is exactly KEY_CREATE"
+
+ENTRY_TIMESTAMP=$(echo "$DAUGHTER_ENTRY" | jq -r '.timestamp')
+ENTRY_EPOCH=$(date -u -d "$ENTRY_TIMESTAMP" +%s 2>/dev/null || echo "")
+NOW_EPOCH=$(date -u +%s)
+if [ -n "$ENTRY_EPOCH" ]; then
+    AGE=$((NOW_EPOCH - ENTRY_EPOCH))
+else
+    AGE=-1
+fi
+if [ "$AGE" -ge 0 ] && [ "$AGE" -lt 300 ]; then
+    PASS_COUNT=$((PASS_COUNT + 1))
+    echo -e "$(ts)   ${GREEN}✓ PASS${RESET} the entry's timestamp ($ENTRY_TIMESTAMP) is accurate — ${AGE}s old, well inside this run" >&2
+else
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo -e "$(ts)   ${RED}✗ FAIL${RESET} the entry's timestamp ($ENTRY_TIMESTAMP) looks wrong — ${AGE}s old" >&2
+fi
+
+# The audit trail is written to the same SQLite database as everything else, so it must have
+# survived §9's restart intact — entries from both before and after the restart should be present.
+PRE_RESTART_COUNT=$(echo "$RESP_BODY" | jq --arg a "ENDPOINT_CREATE" '[.[] | select(.action == $a)] | length')
+check_local "$PRE_RESTART_COUNT" "2" "both ENDPOINT_CREATE entries (the main feed and the bound_ips-restricted one, both created before the restart) survived it"
+
+log "Confirming a Daughter key cannot read the audit log..."
+api_call "$EXPORTER_URL" GET "/api/audit-logs" "$DAUGHTER_KEY"
+check "403" "a Daughter key is forbidden from GET /api/audit-logs"
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 

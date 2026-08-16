@@ -511,3 +511,132 @@ async fn audit_log_action_filter_narrows_results() {
     assert!(!logs.is_empty());
     assert!(logs.iter().all(|l| l["action"] == "KEY_CREATE"));
 }
+
+// ── Malformed request handling (StrictJson / StrictPath) ────────────────────
+//
+// Axum's built-in `Json`/`Path` extractors reject a malformed request with a plain-text body of
+// their own, before any handler runs — bypassing `AppError`'s `{"error": ...}` envelope entirely.
+// `src/extract.rs`'s `StrictJson`/`StrictPath` close that gap; these tests pin the closed shape
+// rather than just the status code, since a regression back to the built-in extractors would still
+// return the same 400 while silently changing the body format every other endpoint promises.
+
+#[tokio::test]
+async fn a_malformed_json_body_is_reported_in_the_normal_error_envelope() {
+    let db = setup_test_db().await;
+    let master = insert_key(&db, true, true).await;
+    let state = test_state(&db).with_pinned_master(master.model.id);
+    let app = create_app(state);
+
+    let response =
+        app.oneshot(signed_request("POST", "/api/keys", &master, "{not valid json")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(response).await;
+    // The envelope is exactly `{"error": "..."}` — a bare string field, present and non-empty —
+    // rather than axum's own plain-text rejection body (which `body_json`'s `serde_json::from_slice`
+    // would fail to parse at all, panicking this test before the assertion below ever ran).
+    assert!(json["error"].as_str().is_some_and(|s| !s.is_empty()));
+}
+
+#[tokio::test]
+async fn an_invalid_uuid_path_parameter_is_reported_in_the_normal_error_envelope() {
+    let db = setup_test_db().await;
+    let master = insert_key(&db, true, true).await;
+    let state = test_state(&db).with_pinned_master(master.model.id);
+    let app = create_app(state);
+
+    let response =
+        app.oneshot(signed_request("DELETE", "/api/keys/not-a-uuid", &master, "")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(response).await;
+    assert!(json["error"].as_str().is_some_and(|s| !s.is_empty()));
+}
+
+/// The body-size limit is a distinct failure from "malformed content" and must keep its own status
+/// (`413`) rather than being flattened into a `400` — see `AppError::BodyRejected`'s doc comment
+/// and the `Content-Length` pre-check in `middleware::auth_middleware`.
+#[tokio::test]
+async fn an_oversized_body_is_413_not_400() {
+    let db = setup_test_db().await;
+    let master = insert_key(&db, true, true).await;
+    let state = test_state(&db).with_pinned_master(master.model.id);
+    let app = create_app(state);
+
+    let huge = format!(r#"{{"name":"{}"}}"#, "x".repeat(simply_ip_exporter::MAX_REQUEST_BODY_BYTES));
+    let response = app.oneshot(signed_request("POST", "/api/keys", &master, &huge)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+// ── Concurrent mutations ─────────────────────────────────────────────────────
+//
+// `tower::ServiceExt::oneshot` consumes one clone of the router per call, but every clone shares
+// the same `AppState` (an `Arc`-wrapped bundle — see `state::AppState`), so firing several clones'
+// requests concurrently genuinely exercises shared state (the DB pool, the replay guard) under
+// real concurrency, not just sequential reuse.
+
+/// The exact same signed request, fired twice at once rather than one after another. The replay
+/// guard (`ReplayGuard::check_and_record`) is a `std::sync::Mutex`-guarded map checked-and-inserted
+/// under one lock acquisition — this is what actually proves that's atomic: a naive
+/// check-then-insert split across two lock acquisitions would let both concurrent callers observe
+/// "not yet seen" and both succeed, silently defeating single-use enforcement.
+#[tokio::test]
+async fn two_concurrent_identical_signed_requests_only_one_succeeds() {
+    let db = setup_test_db().await;
+    let master = insert_key(&db, true, true).await;
+    let state = test_state(&db).with_pinned_master(master.model.id);
+    let app = create_app(state);
+
+    let timestamp = chrono::Utc::now().timestamp();
+    let first = signed_request_at("GET", "/api/auth/me", &master, "", timestamp);
+    let second = signed_request_at("GET", "/api/auth/me", &master, "", timestamp);
+
+    let app_a = app.clone();
+    let app_b = app.clone();
+    let (result_a, result_b) =
+        tokio::join!(app_a.oneshot(first), app_b.oneshot(second));
+    let statuses = [result_a.unwrap().status(), result_b.unwrap().status()];
+
+    let ok_count = statuses.iter().filter(|s| **s == StatusCode::OK).count();
+    let rejected_count = statuses.iter().filter(|s| **s == StatusCode::UNAUTHORIZED).count();
+    assert_eq!(ok_count, 1, "exactly one of the two identical concurrent requests must succeed, got {statuses:?}");
+    assert_eq!(rejected_count, 1, "the other must be rejected as a replay, got {statuses:?}");
+}
+
+/// Two concurrent `DELETE` requests for the same endpoint: exactly one actually deletes it (`204`)
+/// and the other finds it already gone (`404`) — never two `204`s, and never a panic or a
+/// database error surfacing as a `500` from the race.
+#[tokio::test]
+async fn two_concurrent_deletes_of_the_same_endpoint_do_not_both_succeed() {
+    let db = setup_test_db().await;
+    let master = insert_key(&db, true, true).await;
+    let state = test_state(&db).with_pinned_master(master.model.id);
+    let app = create_app(state);
+
+    let create = app
+        .clone()
+        .oneshot(signed_request(
+            "POST",
+            "/api/endpoints",
+            &master,
+            r#"{"name":"Concurrent Delete Target","vault_groups":"g1"}"#,
+        ))
+        .await
+        .unwrap();
+    let id = body_json(create).await["id"].as_str().unwrap().to_owned();
+
+    // Distinct timestamps (and therefore distinct signatures) so this races the DELETE handler's
+    // own find-then-delete logic, not the replay guard from the test above.
+    let now = chrono::Utc::now().timestamp();
+    let first = signed_request_at("DELETE", &format!("/api/endpoints/{id}"), &master, "", now);
+    let second = signed_request_at("DELETE", &format!("/api/endpoints/{id}"), &master, "", now + 1);
+
+    let app_a = app.clone();
+    let app_b = app.clone();
+    let (result_a, result_b) =
+        tokio::join!(app_a.oneshot(first), app_b.oneshot(second));
+    let statuses = [result_a.unwrap().status(), result_b.unwrap().status()];
+
+    let deleted_count = statuses.iter().filter(|s| **s == StatusCode::NO_CONTENT).count();
+    let not_found_count = statuses.iter().filter(|s| **s == StatusCode::NOT_FOUND).count();
+    assert_eq!(deleted_count, 1, "exactly one concurrent delete must succeed, got {statuses:?}");
+    assert_eq!(not_found_count, 1, "the other must find it already gone, got {statuses:?}");
+}

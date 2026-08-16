@@ -2,11 +2,7 @@
 //! owns); managing an existing endpoint requires being its owner or the Master key, per
 //! `AGENT.MD`'s Master/Daughter RBAC.
 
-use axum::{
-    Extension, Json,
-    extract::{Path, State},
-    response::IntoResponse,
-};
+use axum::{Extension, Json, extract::State, response::IntoResponse};
 use chrono::Utc;
 use rand::RngExt;
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
@@ -16,6 +12,7 @@ use uuid::Uuid;
 use crate::api::support::{create_audit_log, describe_resource, validate_bound_ips};
 use crate::entities::{api_key, endpoint, prelude::Endpoint};
 use crate::error::AppError;
+use crate::extract::{StrictJson, StrictPath};
 use crate::middleware::ClientIp;
 use crate::state::AppState;
 
@@ -98,7 +95,7 @@ pub async fn create_endpoint(
     State(state): State<AppState>,
     Extension(caller): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Json(payload): Json<CreateEndpointPayload>,
+    StrictJson(payload): StrictJson<CreateEndpointPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     if payload.name.trim().is_empty() {
         return Err(AppError::InvalidInput("name must not be empty".to_owned()));
@@ -181,8 +178,8 @@ pub async fn update_endpoint(
     State(state): State<AppState>,
     Extension(caller): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Path(id): Path<Uuid>,
-    Json(payload): Json<UpdateEndpointPayload>,
+    StrictPath(id): StrictPath,
+    StrictJson(payload): StrictJson<UpdateEndpointPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     let existing = Endpoint::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
     if !may_manage(&caller, &existing) {
@@ -259,7 +256,7 @@ pub async fn delete_endpoint(
     State(state): State<AppState>,
     Extension(caller): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Path(id): Path<Uuid>,
+    StrictPath(id): StrictPath,
 ) -> Result<impl IntoResponse, AppError> {
     let existing = Endpoint::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
     if !may_manage(&caller, &existing) {
@@ -271,7 +268,17 @@ pub async fn delete_endpoint(
     // Captured before the row is gone, since the audit entry must describe what was deleted.
     let target_resource = describe_resource("endpoint", existing.id, &existing.name);
 
-    Endpoint::delete_by_id(id).exec(&state.db).await?;
+    // `rows_affected` — not just "did the query error?" — is what closes the race between two
+    // concurrent deletes of the same endpoint: both requests can pass the `find_by_id` check above
+    // before either's `DELETE` runs (the check and the delete are two separate round-trips, not one
+    // atomic statement), so without this only the *first* to reach here should report success. A
+    // second `DELETE` for a row already gone is a `404`, not a second `204` — and, just as
+    // importantly, must not write a second `ENDPOINT_DELETE` audit entry claiming a deletion that
+    // this request did not actually perform.
+    let result = Endpoint::delete_by_id(id).exec(&state.db).await?;
+    if result.rows_affected == 0 {
+        return Err(AppError::NotFound);
+    }
     state.ip_cache.evict(id).await;
 
     create_audit_log(&state.db, &caller, client_ip.0, "ENDPOINT_DELETE", Some(target_resource), None)
@@ -285,8 +292,8 @@ pub async fn reassign_endpoint_owner(
     State(state): State<AppState>,
     Extension(caller): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Path(id): Path<Uuid>,
-    Json(payload): Json<ReassignOwnerPayload>,
+    StrictPath(id): StrictPath,
+    StrictJson(payload): StrictJson<ReassignOwnerPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     if !caller.is_master {
         return Err(AppError::Forbidden("Only the Master key can reassign endpoint ownership".to_owned()));

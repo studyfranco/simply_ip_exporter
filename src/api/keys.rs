@@ -1,11 +1,7 @@
 //! CRUD handlers for `api_keys`. Every route here is Master-only, per `AGENT.MD`'s two-tier RBAC:
 //! only the Master key may create, list, update, delete, or rotate local API keys.
 
-use axum::{
-    Extension, Json,
-    extract::{Path, State},
-    response::IntoResponse,
-};
+use axum::{Extension, Json, extract::State, response::IntoResponse};
 use chrono::Utc;
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait};
 use serde::{Deserialize, Serialize};
@@ -15,6 +11,7 @@ use crate::api::support::{create_audit_log, describe_resource, generate_random_k
 use crate::crypto::generate_signing_secret;
 use crate::entities::{api_key, prelude::ApiKey};
 use crate::error::AppError;
+use crate::extract::{StrictJson, StrictPath};
 use crate::middleware::ClientIp;
 use crate::state::AppState;
 
@@ -83,7 +80,7 @@ pub async fn create_api_key(
     State(state): State<AppState>,
     Extension(caller): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Json(payload): Json<CreateKeyPayload>,
+    StrictJson(payload): StrictJson<CreateKeyPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     require_master(&caller)?;
 
@@ -159,8 +156,8 @@ pub async fn update_api_key(
     State(state): State<AppState>,
     Extension(caller): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Path(id): Path<Uuid>,
-    Json(payload): Json<UpdateKeyPayload>,
+    StrictPath(id): StrictPath,
+    StrictJson(payload): StrictJson<UpdateKeyPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     require_master(&caller)?;
 
@@ -209,7 +206,7 @@ pub async fn delete_api_key(
     State(state): State<AppState>,
     Extension(caller): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Path(id): Path<Uuid>,
+    StrictPath(id): StrictPath,
 ) -> Result<impl IntoResponse, AppError> {
     require_master(&caller)?;
 
@@ -221,7 +218,14 @@ pub async fn delete_api_key(
     // Captured before the row is gone, since the audit entry must describe what was deleted.
     let target_resource = describe_resource("api_key", existing.id, &existing.name);
 
-    ApiKey::delete_by_id(id).exec(&state.db).await?;
+    // See the identical race in `api::endpoints::delete_endpoint` for why `rows_affected` (not
+    // just "did the query error?") is what a second, concurrent delete of the same key must be
+    // judged on: a `404`, and no second `KEY_DELETE` audit entry for a deletion this request did
+    // not actually perform.
+    let result = ApiKey::delete_by_id(id).exec(&state.db).await?;
+    if result.rows_affected == 0 {
+        return Err(AppError::NotFound);
+    }
 
     create_audit_log(&state.db, &caller, client_ip.0, "KEY_DELETE", Some(target_resource), None).await?;
 
@@ -233,7 +237,7 @@ pub async fn rotate_api_key(
     State(state): State<AppState>,
     Extension(caller): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Path(id): Path<Uuid>,
+    StrictPath(id): StrictPath,
 ) -> Result<impl IntoResponse, AppError> {
     require_master(&caller)?;
 

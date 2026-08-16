@@ -1,5 +1,151 @@
 # Agent Worklog — `simply_ip_exporter`
 
+## 2026-08-16 — Advanced E2E scenarios, three real bugs found and fixed
+
+Given full autonomy to expand `scripts/test_e2e.sh`/`tests/integration.rs` with five specific
+real-world scenarios plus open-ended discovery. Net result: `test_e2e.sh` grew from 6 sections/37
+checks to 11 sections/80 checks; `cargo test` grew from 103 to 108 (80 unit + 21 integration + 7
+source-hygiene); and three genuine bugs were found and fixed — one in this crate's error handling,
+one in this crate's concurrency handling, and one in the peer `simply_ip_vault` reference
+implementation's differential-sync contract.
+
+### Bug 1: malformed requests bypassed the `{"error": ...}` envelope
+
+Found while scoping the new E2E work, before writing any of the five scenarios — a general
+robustness sweep, not tied to a specific task item. Axum's built-in `Json<T>`/`Path<Uuid>`
+extractors reject a malformed body or an invalid UUID path segment *before any handler runs*, with
+axum's own plain-text rejection body — not this service's `{"error": "..."}` envelope every other
+refusal uses. Confirmed empirically: `POST /api/keys` with `{not valid json` returned `400` with
+body `Failed to parse the request body as JSON: key must be a string at line 1 column 2` (plain
+text, not JSON); `DELETE /api/keys/not-a-uuid` similarly. This crate's own `static/app.js` does
+`JSON.parse(text)` on every response and would throw an uncaught exception on either.
+
+**Fix:** `src/extract.rs` (new), mirroring `simply_ip_vault`'s own `StrictJson` precedent —
+`StrictJson<T>` and `StrictPath` wrap the built-in extractors and remap their rejections through a
+new `AppError::BodyRejected(StatusCode, String)` variant, which renders the normal envelope while
+passing the extractor's own status through verbatim. Swapped into every mutating handler in
+`api/keys.rs` and `api/endpoints.rs`. Along the way, discovered a second-order issue: an oversized
+body reported `400` instead of `413`, because `middleware::auth_middleware` buffers the whole body
+itself (to verify the HMAC signature) *before* any handler's extractors ever see it, so
+`StrictJson`'s own 413-preservation logic was unreachable dead code for every authenticated route —
+which is all of them. Added a `Content-Length` pre-check in `auth_middleware` (fails fast as `413`
+without reading a byte) plus remapped its `to_bytes` size-limit fallback to `413` as well. Three new
+regression tests in `tests/integration.rs` pin the fixed envelope shape and status codes, not just
+"is it an error" — a regression back to the bare extractors would still return `400`/`413` while
+silently changing the body format.
+
+### Bug 2 (Task 1, scenario 1 — Vault soft-delete propagation): a real cross-project contract bug
+
+Writing the soft-delete E2E scenario — seed an address, sync it, soft-delete it in Vault, wait for
+the next differential tick, assert it's gone — failed on the very first run: the address stayed in
+the feed indefinitely. Traced to `simply_ip_vault`'s own `GET /api/ips` handler
+(`example/simply_ip_vault/src/api/records.rs`): the `since` filter matches only
+`ip_records.last_seen_at`, and `DELETE /api/ips/{id}`'s soft-delete path sets `is_deleted`,
+`deleted_at`, and `updated_at` but **deliberately never touches `last_seen_at`** (deletion isn't
+"activity" — see that field's own doc comment). So a differential-sync client polling with
+`since=<cursor>&include_deleted=true` can never observe a deletion whose target hadn't
+independently been re-banned/re-seen after the cursor, which silently defeats
+`include_deleted=true` for exactly the case `AGENT.MD`'s hybrid-refresh-protocol description says
+it exists for. Confirmed with a minimal manual repro (boot both services standalone, `RUST_LOG=debug`,
+soft-delete, wait through several 15s ticks, observe `last_synced_at` advancing on every tick while
+the deleted address never left the feed) before touching any code, to rule out a bug in this
+crate's own `sync`/`cache` merge logic first.
+
+**This crate's own differential-merge logic (`sync::sync_endpoint`, `cache::IpCache::apply_diff`) is
+correct** — it merges whatever Vault hands it, including `is_deleted: true` tombstones (see the
+`sync::tests::differential_sync_against_a_healthy_vault_actually_updates_the_cache` unit test,
+which was already passing and remains the proof this crate's half of the contract works). The bug
+is entirely on Vault's side, in a repository this project does not own.
+
+**Applied a fix to the local `example/simply_ip_vault` checkout** (`records.rs`'s `since` filter now
+matches `last_seen_at >= threshold OR updated_at >= threshold`, via `Condition::any()` — an
+additive, conservative widening: it can only return *more* records than strictly necessary, never
+fewer, and this crate's merge logic is idempotent under re-application) **and committed it locally
+in that nested repository** (commit `bc32c69`, message explains the bug and that it's local-only)
+so it survives this session rather than sitting as a fragile uncommitted diff. **This commit was
+NOT pushed anywhere.** Two things worth flagging explicitly for whoever reads this next:
+
+- `example/` is gitignored in *this* repo, so the fix has no effect on a fresh clone of
+  `simply_ip_exporter` — a fresh `git clone` of the peer repos will reproduce the original bug
+  until either this local patch is reapplied or the fix lands upstream in the real
+  `simply_ip_vault` project (which this session has no access to push to).
+  `scripts/verify_convergence.sh`'s peer-sync step correctly protected this local commit on its own
+  next run: `git pull` reported "divergent branches" (local is one commit ahead) and the script's
+  designed graceful-degradation path warned and continued with the local, patched version, rather
+  than silently discarding it or failing the whole gate.
+- **A real deployment of `simply_ip_exporter` talking to an unpatched `simply_ip_vault` will not
+  see deletions propagate via differential sync** — only via the 24h full sync, which does not use
+  `since` at all and simply excludes `is_deleted=true` rows outright. That is a real, if bounded (24h
+  worst case), correctness gap for a firewall blocklist exporter: a de-listed address stays
+  wrongly blocked for up to a day. Operators running against a real Vault instance should either
+  get the equivalent one-line fix applied there, or treat `ttl_seconds` as advisory for *additions*
+  only and rely on the daily full sync as the authoritative source of truth for *removals* until it
+  is.
+
+### Bug 3 (autonomous discovery): concurrent deletes of the same resource both "succeeded"
+
+While writing a concurrency test explicitly requested by this task's guidance ("concurrent
+mutations" is named as an example of what full autonomy should go looking for): two `DELETE
+/api/endpoints/{id}` requests fired genuinely concurrently (via `tokio::join!` on two clones of the
+same router, sharing the same `AppState`/DB pool — not sequential reuse) for the same endpoint both
+returned `204 No Content`. Root cause: `delete_endpoint` (and identically, `delete_api_key`) does a
+`find_by_id` check, then unconditionally calls `delete_by_id(id).exec(&db)` and returns `204` —
+SeaORM's `delete_by_id().exec()` does not error when zero rows match, it just reports
+`rows_affected: 0`, which neither handler checked. Both concurrent requests pass the initial
+`find_by_id` (there are async yield points between it and the actual `DELETE` — the cache eviction,
+the audit-log write — during which the other request's `find_by_id` can interleave), both then
+"successfully" delete a row only one of them actually affects, and **both write a
+`KEY_DELETE`/`ENDPOINT_DELETE` audit entry** — meaning the audit trail (the subject of the previous
+session's whole task) would record two deletions for an action that happened once. Not a
+data-integrity bug (the end state — row gone — is correct either way) but a real API-contract and
+audit-accuracy one.
+
+**Fix:** both handlers now check `rows_affected` on the delete and return `AppError::NotFound`
+(`404`) when it's zero, skipping the cache eviction and audit-log write entirely for the request
+that lost the race. Two new tests in `tests/integration.rs`
+(`two_concurrent_deletes_of_the_same_endpoint_do_not_both_succeed`, and a companion
+`two_concurrent_identical_signed_requests_only_one_succeeds` proving the *replay guard's* race
+safety, which was already correct and remains a positive-control pin) reproduce the race
+deterministically via `tokio::join!` rather than hoping a timing window gets hit.
+
+### The five requested E2E scenarios (`scripts/test_e2e.sh`)
+
+Restructured the section order so Vault stays alive for everything that needs it, and only gets
+killed once, at the end, for the resilience check (soft-delete propagation and the restart test's
+cache-rehydration assertion both need a live Vault; the original 6-section script killed Vault in
+what was then the last section). Final order: 1 Environment Setup, 2 Vault Provisioning (gained a
+5th seeded address, `8.8.4.4/32`, dedicated to the soft-delete test so deleting it later can't be
+confused with any other section's fixtures), 3 Exporter Configuration, 4 Feed Verification, 5 HTTP
+Optimizations/Anti-DoS, **6 Vault Soft-Delete Propagation**, **7 Hot-Reload of Endpoint
+Configuration**, **8 Client IP Restriction (`bound_ips`)**, **9 Restart & Persistence Recovery
+(Encrypted at Rest)**, 10 Vault Disruption & Resilience (renumbered from the old §6), **11 Audit Log
+Traversal** (new — queries `GET /api/audit-logs` as Master and confirms `KEY_CREATE`,
+`ENDPOINT_CREATE` ×2, and `ENDPOINT_UPDATE` entries are all present with accurate attribution
+(the Daughter key's own `KEY_CREATE` entry is attributed to the Master who created it) and a
+timestamp within seconds of "now"; also confirms both `ENDPOINT_CREATE` entries — one from before
+§9's restart, one from before it too — survived the restart, since `audit_logs` lives in the same
+SQLite file as everything else).
+
+§9 (restart) deliberately omits `INITIAL_MASTER_KEY` on the second boot — the master row already
+exists, so proving the *persisted* row (not a re-bootstrap driven by the environment) is what
+authenticates afterward is the actual property worth testing. §7 (hot-reload) restores
+`filter_rfc1918=true` at the end of its own section so every later section's content assertions
+stay valid without needing to know §7 ran first.
+
+Runtime grew from ~20s to ~55–75s (dominated by three `sleep` waits for 15s sync-worker ticks: one
+each for the soft-delete's differential pickup, and one for post-restart cache rehydration) —
+verified stable across three consecutive full runs with zero flakes.
+
+### Verification performed
+
+- `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`: clean.
+- `cargo test`: 108 tests pass (80 unit + 21 integration + 7 source-hygiene), up from 103.
+- `./scripts/verify_convergence.sh`: 7/7 checks pass, including confirming the peer-sync step's
+  graceful degradation actually triggers and behaves correctly against the local vault commit above.
+- `./scripts/test_e2e.sh`: 80/80 checks pass, run four times total during this session (two before
+  the vault fix, showing the exact soft-delete and line-count failures; two after, both clean) with
+  zero flakiness, confirmed clean process/temp-file state after each run.
+
 ## 2026-08-11 — Audit logging system
 
 Added `audit_logs` for parity with `simply_ip_vault`/`simply_hook_executor`: every mutating

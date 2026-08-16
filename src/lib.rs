@@ -27,6 +27,7 @@ pub mod crypto;
 pub mod db;
 pub mod entities;
 pub mod error;
+pub mod extract;
 pub mod feed;
 pub mod ipfilter;
 pub mod master;
