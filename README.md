@@ -248,7 +248,7 @@ orchestrators, load balancers) cannot compute an HMAC signature.
 ```sh
 cargo check --all-targets
 cargo clippy --all-targets -- -D warnings
-cargo test                     # 80 unit + 4 main.rs unit + 21 integration + 7 source-hygiene tests
+cargo test                     # 80 unit + 4 main.rs unit + 22 integration + 11 source-hygiene tests
 ./scripts/verify_convergence.sh  # source hygiene: raw SQL, unwrap/expect, frontend syntax/DOM refs
 ./scripts/test_e2e.sh          # full live E2E against a real simply_ip_vault + simply_ip_exporter pair
 ```

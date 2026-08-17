@@ -54,6 +54,31 @@ async fn readiness_is_503_until_master_is_pinned_then_200() {
     assert_eq!(response.status(), StatusCode::OK);
 }
 
+/// Adapted from a pattern audited in `example/simply_hook_executor`'s readiness-probe tests
+/// (2026-08-17 peer test-harness audit — see `AGENT_NOTES.MD`): readiness must fail on a genuinely
+/// broken database dependency, not merely on an unpinned Master — the test above already covers
+/// that half. Severs the dependency for real (an unmigrated connection, so the readiness query
+/// errors on a missing table) rather than mocking `db_ok` out, with the Master pre-pinned via
+/// `with_pinned_master` so a passing master check can't be mistaken for the reason this still 503s.
+#[tokio::test]
+async fn readiness_is_503_when_the_database_itself_is_broken_even_with_master_pinned() {
+    let db = sea_orm::Database::connect("sqlite::memory:").await.expect("in-memory sqlite is always available");
+    // Deliberately no `migration::Migrator::up(&db, ...)`: every table-touching query on this
+    // connection fails, which is exactly the dependency this test needs severed.
+    let state = test_state(&db).with_pinned_master(uuid::Uuid::new_v4());
+    let app = create_app(state);
+
+    let response = app
+        .oneshot(with_connect_info(Request::builder().uri("/ready")).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a broken database must fail readiness even when the Master identity is already pinned"
+    );
+}
+
 #[tokio::test]
 async fn an_unsigned_request_to_the_admin_api_is_rejected() {
     let db = setup_test_db().await;

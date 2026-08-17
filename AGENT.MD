@@ -6,22 +6,22 @@ Hello AI Agent! You are assisting with the development of `simply_ip_exporter`. 
 
 ## 📄 Document & Context Hierarchy
 
-1. **`AGENT.MD`** *(This file)*: Core architectural rules, security constraints, in-memory cache design, and testing directives.
-2. **`SCHEMA.MD`**: Official Database Schema (configuration only), SeaORM Entity relations, and Enum specifications.
+To keep this context clean and modular, responsibilities are split across three files:
+1. **`AGENT.MD`** *(This file)*: Core architectural rules, security constraints, documentation standards, and testing directives.
+2. **`SCHEMA.MD`**: Official Database Schema, SeaORM Entity relations, M:N RBAC definitions, and Enum specifications.
 3. **`AGENT_NOTES.MD`**: Agent worklog. You MUST update this file with architectural decisions, progress notes, or pending tasks after completing significant modifications.
-4. **`example/`**: Reference implementations from linked projects (`simply_ip_vault`, `simply_hook_executor`).
+4. **`example/`**: You can find the code of other similar/linked project inside. **Read [Peer Repository Synchronization](#-peer-repository-synchronization) before reading anything in here.**
 
 ---
 
 ## 🔄 Peer Repository Synchronization
 
-`example/` holds live checkouts of the peer projects this service converges against
-(`simply_ip_vault`, `simply_hook_executor`), each its own git repository with a configured
-`origin`. Their working trees can go stale between sessions — a peer's `AGENT.MD`, `RBAC_MODEL.md`,
-or source may have moved on since the last checkout in this tree was made.
+`example/` holds **live git clones** of the peer services, not flat snapshots.
+They are what `scripts/verify_convergence.sh` compares against and what every convergence or security report describes.
 
-**Mandatory:** before reading any file under `example/<peer_repo>/` for the purpose of an audit,
-structural/security comparison, or convergence analysis, run:
+### Mandatory: pull before you analyse
+
+**Before reading any file under `example/`, and before generating a convergence, parity, or security report, you MUST run:**
 
 ```sh
 git -C example/<peer_repo> pull
@@ -35,6 +35,15 @@ producing a comparison/audit artifact) — use judgment, but default to pulling 
 
 `scripts/verify_convergence.sh` automates this at the start of every run for any `example/*`
 directory that contains a `.git` — see that script for the graceful offline-mode fallback.
+
+### Rules
+
+- **Pull first, read second.** Not "pull if it looks stale" — staleness is invisible from inside the tree.
+- **State the revision.** A report that does not name the peer commit it audited cannot be reproduced or re-checked. Both reports in this repository carry the peer's short SHA in their header.
+- **A failed pull is reportable, not ignorable.** If the remote is unreachable, say so in the report and name the local `HEAD` being analysed instead. Silent analysis of an unknown revision is the thing this section exists to prevent.
+- **Never commit the peer.** `example/` is `.gitignore`d. Reports about the peer belong in this repository; the peer's own code does not.
+- **Read-only.** Never modify, stage, or commit inside a peer checkout. `git pull --ff-only` is the only write this repository's tooling performs there.
+- **A bug found in a peer is a report, not a fix.** If auditing a peer checkout turns up a real defect, write it up in `AGENT_NOTES.MD` (with the peer's commit SHA) and stop there — do not patch, and do not carry the fix into this crate's own `src/` unless this crate has the identical bug independently. See `AGENT_NOTES.MD`'s 2026-08-17 (session 2) entry for the current list of `simply_ip_sync` findings reported this way.
 
 ---
 

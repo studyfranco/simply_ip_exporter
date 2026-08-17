@@ -79,7 +79,11 @@ fi
 # Each check is run as its own named test, so a failure names exactly which convention was
 # violated (and where) rather than reporting one undifferentiated "tests failed".
 declare -A CHECKS=(
-    ["Zero raw SQL outside src/db.rs and src/migration/"]="no_raw_sql_outside_db_rs_and_migrations"
+    ["Zero raw SQL outside the documented exceptions"]="no_raw_sql_outside_the_documented_exceptions"
+    ["Zero hand-written DML string literals outside the documented exceptions"]="no_dml_keyword_is_hand_written_outside_the_exceptions"
+    ["No request handler ever holds a raw-SQL exemption"]="no_raw_sql_handler_is_ever_exempted"
+    ["Every raw-SQL allowlist entry still exists and is still needed"]="every_allowlisted_raw_sql_exception_still_exists_and_is_still_needed"
+    ["...and the raw-SQL scanner actually detects what it looks for"]="the_raw_sql_scanner_detects_what_it_is_looking_for"
     ["Zero .unwrap()/.expect() in production code"]="no_unwrap_or_expect_in_production_code"
     ["Production/test-code boundary detection is sound"]="every_source_file_places_its_test_module_last"
     ["static/app.js parses as valid JavaScript"]="app_js_has_no_syntax_errors"

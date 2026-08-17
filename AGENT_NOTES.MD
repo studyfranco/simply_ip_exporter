@@ -1,6 +1,88 @@
 # Agent Worklog — `simply_ip_exporter`
 
-## 2026-08-17 — Three targeted security/resilience scenarios, one real gap found and fixed
+## 2026-08-17 (session 2) — Peer test-harness audit: two patterns adopted, peer bugs reported not fixed
+
+Audited `example/simply_hook_executor`, `example/simply_ip_sync`, and `example/simply_ip_vault`
+(pulled to their current HEADs first, per `AGENT.MD`'s peer-sync rule — `a079e5b`, `4630e76`, and
+`ff18806` respectively) for testing patterns and source-hygiene checks this crate's own suite was
+missing or had a less-complete version of. Two concrete adoptions; `cargo test` grew from 112 to 117
+(80 unit + 4 `src/main.rs` unit + 22 integration + 11 source-hygiene); `verify_convergence.sh` grew
+from 7 to 11 named checks.
+
+### Adopted: a genuine DB-failure-independence test for `/ready`
+
+`simply_hook_executor`'s `tests/health_probes.rs` proves its readiness probe's two dependencies
+(the database, and a boot-time invariant) fail *independently*, each severed for real rather than
+mocked. This crate already had the boot-time-invariant half
+(`readiness_is_503_until_master_is_pinned_then_200`) but nothing proving readiness also fails when
+the database itself is broken while the Master *is* already pinned. Added
+`readiness_is_503_when_the_database_itself_is_broken_even_with_master_pinned` in
+`tests/integration.rs`: an unmigrated in-memory connection (so `readiness_check`'s `ApiKey::find()`
+count genuinely errors) paired with `AppState::with_pinned_master`, so a passing master check can't
+be mistaken for the reason it still 503s.
+
+### Adopted: a materially stronger raw-SQL scanner
+
+`example/simply_ip_vault`'s `tests/source_hygiene.rs` raw-SQL scanner is more mature than the one
+this crate had: it additionally scans for hand-written DML *inside string literals* (not just the
+marker APIs), pins each allowlist entry to a documented reason plus a freshness check ("does this
+path still exist, does it still actually contain raw SQL"), asserts no request-reachable handler is
+ever exempted, and — the detail that matters most, per vault's own module doc comment recounting two
+broken shell-script predecessors of this exact idea — carries a self-test proving the scanner can
+actually see a violation. Ported into this crate's `tests/source_hygiene.rs`, replacing the single
+`no_raw_sql_outside_db_rs_and_migrations` test with five:
+`no_raw_sql_outside_the_documented_exceptions`, `no_dml_keyword_is_hand_written_outside_the_exceptions`,
+`no_raw_sql_handler_is_ever_exempted`, `every_allowlisted_raw_sql_exception_still_exists_and_is_still_needed`,
+`the_raw_sql_scanner_detects_what_it_is_looking_for`. `scripts/verify_convergence.sh`'s `CHECKS` map
+updated to match. `no_unwrap_or_expect_in_production_code` and
+`every_source_file_places_its_test_module_last` (this crate's own inventions, absent from every
+peer) were left as-is — nothing in the audit improved on them.
+
+### Peer bugs found, reported (not fixed) — `example/` is read-only reference material
+
+Per `AGENT.MD`'s peer-repository rules, these are documented here rather than patched in the peer
+checkout. All found in `simply_ip_sync` at `4630e76`:
+
+- **`src/api/health.rs`'s `GET /ready` executes a raw `SELECT 1`** via `query_one_raw` — the
+  service's one unauthenticated endpoint, and the exact anti-pattern
+  `simply_ip_vault`'s own `tests/source_hygiene.rs` module doc comment recounts having shipped once
+  before ("a literal `SELECT 1` in an *unauthenticated* readiness probe, the worst possible
+  location for one"). `simply_ip_sync`'s own `tests/source_hygiene.rs` has no raw-SQL scanner at
+  all to have caught it.
+- **Four TOCTOU concurrent-delete races**: `api::keys::delete_api_key`,
+  `api::vaults::delete_vault_endpoint`, `api::sources::delete_external_source`, and
+  `api::sync_tasks::delete_vault_sync_task` all call `delete_by_id`/`delete_many` without checking
+  `rows_affected`. `DeleteResult` does not error on zero matched rows, so a losing concurrent
+  delete of the same id still returns `204` and writes a duplicate audit-log entry for a deletion
+  it did not perform — the identical class of bug found and fixed in *this* crate's own
+  `delete_endpoint`/`delete_api_key` on 2026-08-16 (see that entry below).
+- **`.unwrap()`/`.expect()` in production code**: `src/main.rs::shutdown_signal` (`.expect()` on
+  both the Ctrl+C and SIGTERM handler installs) and `src/state.rs::AppState::for_tests` (`.expect()`
+  on `SchedulerHandle::new`/`build_http_client`, in a `pub` — not `cfg(test)`-gated — function
+  compiled into the production binary), both direct violations of `simply_ip_sync`'s own `AGENT.MD`
+  ("Zero `.unwrap()` or `.expect()` in production or HTTP handlers"). This crate's `shutdown_signal`
+  is the demonstrated fix for the first shape (structured `tracing::error!` + a `pending::<()>()`
+  fallback instead of a panic); the second shape has no precedent in this crate since nothing here
+  needs a fallible async test-state constructor.
+- **No startup canary for a wrong `SYNC_ENCRYPTION_KEY`** — the same gap this crate had and fixed
+  on 2026-08-17 (session 1, see below): `SecretCipher::from_env()` only validates key *format*, and
+  `bootstrap_master_key` only touches the cipher when bootstrapping a fresh Master, so a mismatched
+  key on restart stays invisible until the first real request fails with an opaque `401`.
+- **Thinner HMAC timestamp-skew coverage**: `stale_timestamp_outside_skew_window_is_rejected` only
+  exercises a coarse (`-3600s`) past-direction case; no test at the precise `±300`/`±301` boundary,
+  and no future-direction case at all, despite `middleware.rs` implementing (correctly) a symmetric
+  window via `.abs()`.
+- **No instant-rotation/revocation test**: nothing proves a Daughter key's old credentials are
+  rejected immediately (no restart) after `POST /api/keys/{id}/rotate` or `DELETE /api/keys/{id}` —
+  this crate gained exactly that coverage on 2026-08-17 (session 1).
+
+A first attempt at this audit mistakenly began implementing these fixes directly against
+`simply_ip_sync` — both its standalone checkout and, briefly, the `example/simply_ip_sync` peer
+checkout here — before being redirected: this crate's job is `simply_ip_exporter` only, `example/`
+is read-only, and any `simply_ip_sync` work belongs to that project's own repository and session.
+Those edits were reverted (`git checkout --`/`git reset --hard`) and are not part of this commit.
+
+## 2026-08-17 (session 1) — Three targeted security/resilience scenarios, one real gap found and fixed
 
 Given three ultra-specific scenarios to close out remaining edge-case coverage: wrong encryption
 key at startup, HMAC anti-replay timestamp skew, and real-time Daughter key rotation/revocation.
