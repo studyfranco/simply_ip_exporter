@@ -114,6 +114,55 @@ async fn bootstrap_master_key(
     Ok(())
 }
 
+/// Why [`verify_encryption_key`] refused to let the process start.
+#[derive(Debug)]
+struct EncryptionKeyMismatch(crypto::CryptoError);
+
+impl std::fmt::Display for EncryptionKeyMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "EXPORTER_ENCRYPTION_KEY does not match the key this database's secrets were sealed \
+             with ({}). Refusing to start: continuing would leave every stored signing secret \
+             unreadable and silently break authentication for every API key. Restore the correct \
+             EXPORTER_ENCRYPTION_KEY, or if rotating it intentionally, re-seal every key's \
+             signing_secret with the new key first.",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for EncryptionKeyMismatch {}
+
+/// Verifies `EXPORTER_ENCRYPTION_KEY` can actually decrypt what is already on disk, using the
+/// Master key's sealed `signing_secret` as a canary.
+///
+/// [`crypto::SecretCipher::from_env`] only validates that the configured key is 64 hex characters
+/// — a syntactically valid key that simply doesn't match the one secrets on disk were sealed with
+/// passes it fine. Left unchecked, that mismatch stays invisible at boot and only surfaces later,
+/// request by request, as every caller's signature verification quietly fails with an opaque `401`
+/// (`recover_signing_secret` in `middleware.rs`). Run once at boot, right after the Master row is
+/// guaranteed to exist (bootstrapped fresh, in which case this trivially passes since it was just
+/// sealed with this same cipher; or pre-existing, in which case a mismatch here means every other
+/// stored secret is equally unreadable).
+async fn verify_encryption_key(
+    db: &DatabaseConnection,
+    cipher: &crypto::SecretCipher,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use entities::{api_key, prelude::ApiKey};
+
+    let Some(master) = ApiKey::find().filter(api_key::Column::IsMaster.eq(true)).one(db).await?
+    else {
+        // bootstrap_master_key runs before this and always leaves exactly one master row behind;
+        // absence here means that invariant broke, which pin_at_boot will report properly next.
+        return Ok(());
+    };
+    let Some(stored) = master.signing_secret.as_deref() else { return Ok(()) };
+
+    cipher.open(stored).map_err(EncryptionKeyMismatch)?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
@@ -165,6 +214,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     bootstrap_master_key(&db, &cipher, initial_master_key.as_deref()).await?;
+    if let Err(e) = verify_encryption_key(&db, &cipher).await {
+        tracing::error!("{e}");
+        std::process::exit(1);
+    }
 
     let state = AppState::new(db, std::sync::Arc::new(config), std::sync::Arc::new(cipher));
 
@@ -194,4 +247,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     sync_handle.abort();
     tracing::info!("Graceful shutdown complete.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sea_orm::Database;
+
+    const KEY_A: &str = "0f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978";
+
+    fn key_b() -> String {
+        "f".repeat(64)
+    }
+
+    async fn fresh_db() -> DatabaseConnection {
+        let db = Database::connect("sqlite::memory:").await.expect("in-memory sqlite opens");
+        db::run_migrations(&db).await.expect("migrations apply");
+        db
+    }
+
+    #[tokio::test]
+    async fn a_freshly_bootstrapped_master_passes_the_canary_check() {
+        let db = fresh_db().await;
+        let cipher = crypto::SecretCipher::from_hex_key(KEY_A).expect("valid key");
+        bootstrap_master_key(&db, &cipher, None).await.expect("bootstrap succeeds");
+
+        assert!(verify_encryption_key(&db, &cipher).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_mismatched_key_is_refused_after_restart_not_silently_accepted() {
+        let db = fresh_db().await;
+        let sealing_cipher = crypto::SecretCipher::from_hex_key(KEY_A).expect("valid key");
+        bootstrap_master_key(&db, &sealing_cipher, None).await.expect("bootstrap succeeds");
+
+        // Simulates a restart with the wrong EXPORTER_ENCRYPTION_KEY against the same database:
+        // bootstrap_master_key sees the existing master row and does nothing, so this canary check
+        // is the only thing standing between a key mismatch and silent per-request auth failures.
+        let wrong_cipher = crypto::SecretCipher::from_hex_key(&key_b()).expect("valid key");
+        let err = verify_encryption_key(&db, &wrong_cipher).await.unwrap_err();
+        assert!(err.to_string().contains("EXPORTER_ENCRYPTION_KEY does not match"));
+    }
+
+    #[tokio::test]
+    async fn plaintext_mode_is_unaffected_by_the_canary_check() {
+        let db = fresh_db().await;
+        let cipher = crypto::SecretCipher::Plaintext;
+        bootstrap_master_key(&db, &cipher, None).await.expect("bootstrap succeeds");
+
+        assert!(verify_encryption_key(&db, &cipher).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn no_master_row_is_not_this_checks_problem_to_report() {
+        // pin_at_boot (run right after this check in main()) is what reports a missing master row;
+        // this check should stay quiet rather than duplicating that diagnosis.
+        let db = fresh_db().await;
+        let cipher = crypto::SecretCipher::from_hex_key(KEY_A).expect("valid key");
+        assert!(verify_encryption_key(&db, &cipher).await.is_ok());
+    }
 }

@@ -28,11 +28,20 @@
 #      SQLite file, and confirm the Master key, a Daughter key minted before the restart (proving
 #      its encrypted-at-rest signing_secret round-trips through EXPORTER_ENCRYPTION_KEY), and the
 #      original endpoint all survive — then confirm the in-memory IP cache re-hydrates from Vault.
-#  10. Vault disruption & resilience: kill simply_ip_vault, confirm simply_ip_exporter keeps
+#  10. Wrong encryption key at startup: SIGTERM simply_ip_exporter again, attempt to restart it
+#      against the SAME database with a different (but syntactically valid) EXPORTER_ENCRYPTION_KEY,
+#      and confirm it exits non-zero with an explicit error rather than starting up with every
+#      stored secret silently unreadable. Then restart it correctly so the suite can continue.
+#  11. HMAC anti-replay: timestamp skew rejection: a validly-signed request timestamped +301s and
+#      -301s from server time is rejected with 401, not accepted or silently ignored.
+#  12. Real-time Daughter key rotation/revocation: rotate one Daughter key and delete another via
+#      the Master key, and confirm each one's OLD credentials are rejected on the very next request
+#      — no restart, no propagation delay.
+#  13. Vault disruption & resilience: kill simply_ip_vault, confirm simply_ip_exporter keeps
 #      serving the same in-memory cached feed without interruption.
-#  11. Audit log traversal: fetch GET /api/audit-logs as Master and confirm every administrative
+#  14. Audit log traversal: fetch GET /api/audit-logs as Master and confirm every administrative
 #      action performed during this run is present, correctly attributed, and timestamped.
-#  12. Cleanup: terminate both processes and remove every temporary file.
+#  15. Cleanup: terminate both processes and remove every temporary file.
 #
 # Usage: ./scripts/test_e2e.sh
 # Requires: curl, jq, cargo, openssl. Needs example/simply_ip_vault present (a reference checkout;
@@ -650,9 +659,164 @@ check_contains "$RESP_BODY" "8.8.8.0/24" "the rehydrated cache contains the expe
 check_not_contains "$RESP_BODY" "8.8.4.4" "the soft-deleted address is NOT resurrected by the post-restart full sync"
 check_not_contains "$RESP_BODY" "192.168.1.50" "filter_rfc1918 (restored to true in §7) is still enforced after restart"
 
-# ── 10. Vault disruption & resilience ───────────────────────────────────────
+# ── 10. Wrong encryption key at startup ─────────────────────────────────────
 
-log_section "10. Vault Disruption & Resilience"
+log_section "10. Wrong Encryption Key Rejected At Startup"
+
+log "Stopping simply_ip_exporter (pid $EXPORTER_PID) for the wrong-key restart attempt..."
+kill -TERM "$EXPORTER_PID"
+wait "$EXPORTER_PID" 2>/dev/null
+EXPORTER_EXIT_CODE=$?
+EXPORTER_PID=""
+check_local "$EXPORTER_EXIT_CODE" "0" "simply_ip_exporter exited cleanly (code 0) on SIGTERM, before the wrong-key attempt"
+
+# 64 hex characters, same shape as E2E_ENCRYPTION_KEY (so it passes the format check that runs
+# before the canary decrypt) but different bytes, so it cannot open what E2E_ENCRYPTION_KEY sealed.
+# Built with printf rather than a literal: a hand-counted string of repeated characters is exactly
+# the kind of off-by-one that silently changes what's under test instead of failing loudly.
+WRONG_ENCRYPTION_KEY="$(printf 'f%.0s' $(seq 1 64))"
+WRONGKEY_LOG="$WORK_DIR/exporter_wrongkey.log"
+log "Attempting to start simply_ip_exporter against the SAME database ($EXPORTER_DB_PATH) with a different (syntactically valid) EXPORTER_ENCRYPTION_KEY..."
+DATABASE_URL="sqlite://$EXPORTER_DB_PATH?mode=rwc" RUST_LOG=info \
+    EXPORTER_ENCRYPTION_KEY="$WRONG_ENCRYPTION_KEY" \
+    VAULT_BASE_URL="$VAULT_URL" \
+    VAULT_API_KEY="$EXPORTER_VAULT_KEY" \
+    VAULT_SIGNING_SECRET="$EXPORTER_VAULT_SECRET" \
+    TRUSTED_PROXIES="127.0.0.1" \
+    PORT="$EXPORTER_PORT" \
+    "$PROJECT_ROOT/target/debug/simply_ip_exporter" >"$WRONGKEY_LOG" 2>&1 &
+WRONGKEY_PID=$!
+
+log "Waiting for it to refuse to start (should exit quickly on its own, without ever answering /ready)..."
+WRONGKEY_EXITED="false"
+for _ in $(seq 1 40); do
+    if ! kill -0 "$WRONGKEY_PID" 2>/dev/null; then
+        WRONGKEY_EXITED="true"
+        break
+    fi
+    sleep 0.25
+done
+
+if [ "$WRONGKEY_EXITED" == "true" ]; then
+    wait "$WRONGKEY_PID" 2>/dev/null
+    WRONGKEY_EXIT_CODE=$?
+else
+    warn "simply_ip_exporter did not exit on its own with the wrong key; killing it and failing this check."
+    kill -9 "$WRONGKEY_PID" 2>/dev/null || true
+    wait "$WRONGKEY_PID" 2>/dev/null || true
+    WRONGKEY_EXIT_CODE=0 # the one value this check must NOT accept: it means startup never stopped
+fi
+
+if [ "$WRONGKEY_EXITED" == "true" ] && [ "$WRONGKEY_EXIT_CODE" -ne 0 ] 2>/dev/null; then
+    PASS_COUNT=$((PASS_COUNT + 1))
+    echo -e "$(ts)   ${GREEN}✓ PASS${RESET} simply_ip_exporter terminated on its own (exit code $WRONGKEY_EXIT_CODE, non-zero) rather than starting with an undecryptable database" >&2
+else
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo -e "$(ts)   ${RED}✗ FAIL${RESET} simply_ip_exporter did not cleanly refuse to start with the wrong key (exited on its own: $WRONGKEY_EXITED, code: $WRONGKEY_EXIT_CODE)" >&2
+fi
+
+WRONGKEY_LOG_CONTENTS=$(cat "$WRONGKEY_LOG" 2>/dev/null || true)
+check_not_contains "$WRONGKEY_LOG_CONTENTS" "panicked at" "no Rust panic in the log — this is a handled error, not a crash"
+check_contains "$WRONGKEY_LOG_CONTENTS" "EXPORTER_ENCRYPTION_KEY does not match" "the log names the actual problem, not a generic failure"
+
+DOWN_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 "$EXPORTER_URL/ready" 2>/dev/null)
+check_local "$DOWN_CODE" "000" "simply_ip_exporter with the wrong key never came up far enough to answer /ready — no silent partial startup"
+
+log "Restarting simply_ip_exporter with the CORRECT EXPORTER_ENCRYPTION_KEY so the suite can continue..."
+DATABASE_URL="sqlite://$EXPORTER_DB_PATH?mode=rwc" RUST_LOG=info \
+    EXPORTER_ENCRYPTION_KEY="$E2E_ENCRYPTION_KEY" \
+    VAULT_BASE_URL="$VAULT_URL" \
+    VAULT_API_KEY="$EXPORTER_VAULT_KEY" \
+    VAULT_SIGNING_SECRET="$EXPORTER_VAULT_SECRET" \
+    TRUSTED_PROXIES="127.0.0.1" \
+    PORT="$EXPORTER_PORT" \
+    "$PROJECT_ROOT/target/debug/simply_ip_exporter" >>"$EXPORTER_LOG" 2>&1 &
+EXPORTER_PID=$!
+log "Waiting for the restarted simply_ip_exporter to become ready (pid $EXPORTER_PID)..."
+wait_ready "simply_ip_exporter" "$EXPORTER_URL" "$EXPORTER_PID" "$EXPORTER_LOG"
+log "simply_ip_exporter is back up with the correct key."
+
+api_call "$EXPORTER_URL" GET "/api/auth/me" "$EXPORTER_MASTER_KEY"
+check "200" "the Master key still authenticates once restarted with the correct key (no DB corruption from the failed attempt)"
+
+api_call "$EXPORTER_URL" GET "/api/auth/me" "$DAUGHTER_KEY"
+check "200" "the pre-existing Daughter key still authenticates too, unaffected by the failed wrong-key attempt"
+
+# ── 11. HMAC anti-replay: timestamp skew rejection ──────────────────────────
+
+log_section "11. HMAC Anti-Replay: Timestamp Skew Rejection"
+
+SKEW_TS_FUTURE=$(( $(date -u +%s) + 301 ))
+SKEW_SIG_FUTURE=$(hmac_sign "$EXPORTER_MASTER_SECRET" GET "/api/auth/me" "$SKEW_TS_FUTURE" "")
+log "Signing a request +301s ahead of server time..."
+raw_call GET "$EXPORTER_URL/api/auth/me" \
+    -H "X-API-Key: $EXPORTER_MASTER_KEY" \
+    -H "X-Timestamp: $SKEW_TS_FUTURE" \
+    -H "X-Signature-256: $SKEW_SIG_FUTURE"
+check "401" "a validly-signed request timestamped +301s in the future is rejected"
+check_contains "$RESP_BODY" "outside the permitted" "the error names the timestamp window, not a generic auth failure"
+
+SKEW_TS_PAST=$(( $(date -u +%s) - 301 ))
+SKEW_SIG_PAST=$(hmac_sign "$EXPORTER_MASTER_SECRET" GET "/api/auth/me" "$SKEW_TS_PAST" "")
+log "Signing a request -301s behind server time..."
+raw_call GET "$EXPORTER_URL/api/auth/me" \
+    -H "X-API-Key: $EXPORTER_MASTER_KEY" \
+    -H "X-Timestamp: $SKEW_TS_PAST" \
+    -H "X-Signature-256: $SKEW_SIG_PAST"
+check "401" "a validly-signed request timestamped -301s in the past is rejected"
+check_contains "$RESP_BODY" "outside the permitted" "the error names the timestamp window here too"
+
+log "Confirming the key itself is still fine — only the timestamp was the problem..."
+api_call "$EXPORTER_URL" GET "/api/auth/me" "$EXPORTER_MASTER_KEY"
+check "200" "a freshly-timestamped request from the same key succeeds"
+
+# ── 12. Real-time Daughter key rotation/revocation ──────────────────────────
+
+log_section "12. Real-Time Daughter Key Rotation/Revocation"
+
+log "Confirming the pre-existing Daughter key (from §9) still works before rotating it..."
+api_call "$EXPORTER_URL" GET "/api/auth/me" "$DAUGHTER_KEY"
+check "200" "the Daughter key authenticates before rotation"
+OLD_DAUGHTER_KEY="$DAUGHTER_KEY"
+
+log "Rotating it via the Master key (POST /api/keys/\$id/rotate)..."
+api_call "$EXPORTER_URL" POST "/api/keys/$DAUGHTER_ID/rotate" "$EXPORTER_MASTER_KEY"
+check "200" "the rotation request succeeds"
+NEW_DAUGHTER_KEY=$(echo "$RESP_BODY" | jq -r '.api_key')
+NEW_DAUGHTER_SECRET=$(echo "$RESP_BODY" | jq -r '.signing_secret')
+register_key_secret "$NEW_DAUGHTER_KEY" "$NEW_DAUGHTER_SECRET"
+
+log "Immediately retrying with the OLD (pre-rotation) credentials — no restart, no delay..."
+api_call "$EXPORTER_URL" GET "/api/auth/me" "$OLD_DAUGHTER_KEY"
+check "401" "the old credentials are rejected on the very next request after rotation"
+
+log "Confirming the NEW credentials work immediately..."
+api_call "$EXPORTER_URL" GET "/api/auth/me" "$NEW_DAUGHTER_KEY"
+check "200" "the newly rotated credentials authenticate right away"
+DAUGHTER_KEY="$NEW_DAUGHTER_KEY"
+
+log "Minting a throwaway Daughter key to exercise instant revocation via DELETE..."
+api_call "$EXPORTER_URL" POST "/api/keys" "$EXPORTER_MASTER_KEY" '{"name":"Revocation Test Daughter"}'
+check "200" "the throwaway Daughter key is created"
+DOOMED_KEY=$(echo "$RESP_BODY" | jq -r '.api_key')
+DOOMED_SECRET=$(echo "$RESP_BODY" | jq -r '.signing_secret')
+DOOMED_ID=$(echo "$RESP_BODY" | jq -r '.id')
+register_key_secret "$DOOMED_KEY" "$DOOMED_SECRET"
+
+api_call "$EXPORTER_URL" GET "/api/auth/me" "$DOOMED_KEY"
+check "200" "the throwaway key authenticates before deletion"
+
+log "Deleting it via the Master key..."
+api_call "$EXPORTER_URL" DELETE "/api/keys/$DOOMED_ID" "$EXPORTER_MASTER_KEY"
+check "204" "the delete request succeeds"
+
+log "Immediately retrying with the deleted key's credentials — no restart, no delay..."
+api_call "$EXPORTER_URL" GET "/api/auth/me" "$DOOMED_KEY"
+check "401" "the deleted key's credentials are rejected on the very next request"
+
+# ── 13. Vault disruption & resilience ───────────────────────────────────────
+
+log_section "13. Vault Disruption & Resilience"
 
 log "Terminating simply_ip_vault (pid $VAULT_PID)..."
 kill "$VAULT_PID" 2>/dev/null || true
@@ -680,9 +844,9 @@ check_contains "$RESP_BODY" "8.8.8.0/24" "the cached, aggregated content is unch
 api_call "$EXPORTER_URL" GET "/ready" "$EXPORTER_MASTER_KEY"
 check "200" "simply_ip_exporter's own /ready is unaffected by Vault being unreachable"
 
-# ── 11. Audit log traversal ─────────────────────────────────────────────────
+# ── 14. Audit log traversal ─────────────────────────────────────────────────
 
-log_section "11. Audit Log Traversal"
+log_section "14. Audit Log Traversal"
 
 log "Fetching the full audit trail from simply_ip_exporter as Master..."
 api_call "$EXPORTER_URL" GET "/api/audit-logs?limit=500" "$EXPORTER_MASTER_KEY"

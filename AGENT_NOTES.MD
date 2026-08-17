@@ -1,5 +1,71 @@
 # Agent Worklog — `simply_ip_exporter`
 
+## 2026-08-17 — Three targeted security/resilience scenarios, one real gap found and fixed
+
+Given three ultra-specific scenarios to close out remaining edge-case coverage: wrong encryption
+key at startup, HMAC anti-replay timestamp skew, and real-time Daughter key rotation/revocation.
+Net result: `test_e2e.sh` grew from 11 sections/80 checks to 14 sections/100 checks; `cargo test`
+grew from 108 to 112 (80 unit + 4 new `src/main.rs` unit + 21 integration + 7 source-hygiene); one
+real startup-time gap was found and fixed.
+
+### Gap: a wrong `EXPORTER_ENCRYPTION_KEY` was never caught at startup
+
+`crypto::SecretCipher::from_env()` only validates that the configured key is 64 hex characters — a
+syntactically valid but *different* key (e.g. after an operator typo, or restoring the wrong secret
+from a vault) passed straight through. `bootstrap_master_key` only runs its seal-with-`cipher` path
+when the `api_keys` table is empty; on every subsequent boot it sees the existing Master row and
+returns immediately without ever touching the cipher. Nothing in the startup path attempted a
+decrypt. The mismatch stayed completely invisible until the first real request: every caller's
+`recover_signing_secret` (`middleware.rs`) would fail `cipher.open(...)` and the request would die
+with a generic `401`, indistinguishable from a bad signature or a stale replay guard — no log
+message pointed at the actual cause, and the failure only showed up in production traffic rather
+than in the deployment step where the operator could have caught it immediately. This is exactly
+the "silent DB corruption-adjacent" failure mode `AGENT.MD`'s fail-fast startup philosophy (see the
+existing `RuntimeConfig::from_env` / `validate_initial_master_key` / `MasterPin::pin_at_boot`
+pattern, all of which abort loudly on a bad boot-time invariant) is meant to prevent, and this was
+the one config-validity check missing from that list.
+
+**Fix:** `src/main.rs` — new `verify_encryption_key(db, cipher)`, run once at boot right after
+`bootstrap_master_key` and before `AppState::new`/`pin_at_boot`. Uses the Master key's own sealed
+`signing_secret` as a canary: on a fresh bootstrap this trivially passes (just sealed with the same
+cipher); on a restart, a failed `cipher.open` means every other stored secret in the database is
+equally unreadable, so a single check is a sufficient and cheap proxy for "does this key match what
+the database was sealed with" without opening every row. On failure, logs an explicit
+`EXPORTER_ENCRYPTION_KEY does not match...` message naming the actual problem and its remedy, then
+`std::process::exit(1)` — following the same match-on-`Result`-then-`exit(1)` shape `main()` already
+uses for the two existing boot-time config checks, rather than exiting from deep inside a helper.
+Four new `#[cfg(test)]` unit tests in `src/main.rs` (fresh bootstrap passes; a deliberately wrong key
+after a simulated restart is refused with the expected message; `Plaintext` mode is unaffected; no
+master row is not this check's problem to report — that's `pin_at_boot`'s job, so this check stays
+quiet rather than duplicating the diagnosis) — `main.rs` had no test module before this.
+
+### The other two scenarios: already correct, added as regression coverage
+
+**HMAC timestamp skew** — `middleware::validate_timestamp` already rejects any request timestamped
+more than `signature_max_age_seconds` (300s) off server time in either direction, before touching
+the database, with a unit test (`timestamps_outside_the_window_are_rejected`) already covering exact
++301s/-301s. No bug; added E2E section 11 to exercise it end-to-end through the real HTTP/HMAC stack
+(a validly-signed but skewed request against `/api/auth/me` in both directions gets `401` with an
+error naming the timestamp window, and a follow-up freshly-timestamped request from the same key
+still works — proving only the timestamp was ever the problem).
+
+**Instant Daughter key rotation/revocation** — `auth_middleware` looks up the caller's key fresh
+from the database on every single request (no in-memory key/secret cache anywhere in `AppState`),
+and `rotate_api_key` changes `key_hash` itself (not just the signing secret), while `delete_api_key`
+removes the row outright. Both were already necessarily instant with no possible staleness window.
+Confirmed empirically rather than assumed: E2E section 12 rotates one Daughter key and deletes
+another via the Master key, and both old credential sets are rejected with `401` on the very next
+request, no restart, no delay. No bug found or fix needed.
+
+### Verification
+
+`cargo check --all-targets` / `cargo clippy --all-targets -- -D warnings`: clean. `cargo test`: 112
+passed (80 lib unit + 4 `src/main.rs` unit + 21 integration + 7 source-hygiene). `test_e2e.sh`: 14
+sections, 100/100 checks, run twice consecutively for stability (the wrong-key-startup section in
+particular is timing-sensitive — it polls for the doomed process to exit rather than sleeping a
+fixed duration). `verify_convergence.sh`: 7/7, including the same graceful-degradation warning from
+2026-08-16's local (unpushed) `simply_ip_vault` fix, confirmed still behaving correctly.
+
 ## 2026-08-16 — Advanced E2E scenarios, three real bugs found and fixed
 
 Given full autonomy to expand `scripts/test_e2e.sh`/`tests/integration.rs` with five specific
