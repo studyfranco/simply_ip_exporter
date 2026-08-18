@@ -10,7 +10,7 @@ To keep this context clean and modular, responsibilities are split across three 
 1. **`AGENT.MD`** *(This file)*: Core architectural rules, security constraints, documentation standards, and testing directives.
 2. **`SCHEMA.MD`**: Official Database Schema, SeaORM Entity relations, M:N RBAC definitions, and Enum specifications.
 3. **`AGENT_NOTES.MD`**: Agent worklog. You MUST update this file with architectural decisions, progress notes, or pending tasks after completing significant modifications.
-4. **`example/`**: You can find the code of other similar/linked project inside. **Read [Peer Repository Synchronization](#-peer-repository-synchronization) before reading anything in here.**
+4. **`example/`**: Live checkouts of the wider ecosystem's sibling projects (`simply_ip_vault`, `simply_hook_executor`, `simply_ip_sync`, and any later additions) — reference material for security, structural, and testing-strategy parity, not a dependency of this crate. **Read [Peer Repository Synchronization](#-peer-repository-synchronization) before reading anything in here.**
 
 ---
 
@@ -18,6 +18,40 @@ To keep this context clean and modular, responsibilities are split across three 
 
 `example/` holds **live git clones** of the peer services, not flat snapshots.
 They are what `scripts/verify_convergence.sh` compares against and what every convergence or security report describes.
+
+### Philosophy: why `example/` exists
+
+`simply_ip_exporter` is one member of a wider ecosystem of closely related Rust services that share
+one security architecture, implemented independently in each codebase rather than via a shared
+library. That ecosystem's structural and security convergence historically originated with two
+foundational sibling projects, `simply_ip_vault` and `simply_hook_executor` — the pair
+`RBAC_MODEL.md` is scoped to, and the first two services to establish the `CANONICAL_V1` HMAC
+scheme, the `SecretCipher` secrets-at-rest envelope, and the boot-time `MasterPin` pattern this crate
+also implements. The ecosystem has since scaled: `simply_ip_sync` and `simply_ip_exporter` itself
+are later members, each implementing a deliberate, documented subset or extension of the founding
+model rather than copying it wholesale (see `AGENT_NOTES.MD` for this crate's own "two-tier, not
+three" deviation).
+
+Every sibling project checked out under `example/` — currently `simply_ip_vault`,
+`simply_hook_executor`, and `simply_ip_sync`, and any further services the ecosystem grows to
+include — serves the same three purposes for an agent working in this repository:
+
+- **Security posture parity.** A pattern this crate implements (signing, replay, secrets at rest,
+  RBAC enforcement) can be checked against how the rest of the ecosystem implements the same
+  concern, surfacing gaps or regressions neither codebase's own test suite would catch alone.
+- **Architectural alignment.** Module layout, naming conventions, and error-handling shape are
+  expected to converge across the ecosystem where the underlying concern is shared, and to diverge
+  only where the service's actual domain differs. `STRUCTURAL_CONVERGENCE_REPORT.md` is the
+  standing record of how well that currently holds.
+- **Testing-strategy comparison.** Peer test suites (dedicated concurrency/contract tests,
+  source-hygiene scanners, `verify_convergence.sh`/`test_e2e.sh` harnesses) are a live source of
+  patterns this crate's own suite may be missing, and vice versa — convergence is not assumed to
+  flow only from the founding pair outward; a later project can and does improve on a founder's
+  pattern (see `SECURITY_COMPARISON_REPORT.md`'s and `STRUCTURAL_CONVERGENCE_REPORT.md`'s executive
+  verdicts for current examples in both directions).
+
+`example/` is reference material for all three purposes, never a dependency of this crate's build,
+and never a target of this crate's own commits — see **Rules** below.
 
 ### Mandatory: pull before you analyse
 

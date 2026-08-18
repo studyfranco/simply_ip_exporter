@@ -1,5 +1,87 @@
 # Agent Worklog — `simply_ip_exporter`
 
+## 2026-08-17 (session 4) — Ecosystem-wide convergence audit (all `example/` peers) + `AGENT.MD` philosophy
+
+Broadened session 3's single-peer audit (`simply_ip_exporter` vs. `simply_ip_vault` only) to all
+three checkouts under `example/`. `SECURITY_COMPARISON_REPORT.md` and
+`STRUCTURAL_CONVERGENCE_REPORT.md` were each overwritten/rewritten wholesale to compare against
+`simply_ip_vault`, `simply_hook_executor`, and `simply_ip_sync` simultaneously, using comparative
+tables across all four projects throughout. `AGENT.MD` gained a new "Philosophy" subsection under
+Peer Repository Synchronization documenting why `example/` exists and what it is used for (Task 3).
+
+### Methodology
+
+Same zero-knowledge discipline as session 3: no prior audit report (of this crate or any peer) was
+read. Findings rest on fresh reads of each peer's current `master.rs`, `middleware.rs`, `crypto.rs`,
+`extract.rs`, `error.rs`, `db.rs`, and representative `api/*.rs` payload structs, cross-checked with
+targeted `grep` sweeps across all four `src/` trees for specific properties (`deny_unknown_fields`
+count, `SchemaManager::has_index` vs. custom `db::has_index` call sites, `OnceLock`/`OnceCell`
+choice, `rows_affected` checks, `ConflictWithDetails`/`TooManyRequests` presence, `guards.rs`
+presence, LOC and test-file counts) rather than a uniform line-by-line read of ~40,000 combined LOC.
+`simply_ip_sync`'s own `SECURITY_COMPARISON_REPORT.md`/`STRUCTURAL_CONVERGENCE_REPORT.md` (newly
+present in its checkout as of this pull — see below) were deliberately **not** read, consistent with
+the clean-room instruction extending to any project's prior audit output, not only this crate's own.
+
+### Task 0 — peer sync (all three)
+
+```
+$ for d in example/*/; do git -C "$d" pull --ff-only; done
+```
+
+| Project | Result | Commit |
+| :--- | :--- | :--- |
+| `simply_hook_executor` | Updated — 12 files changed, 968 insertions(+), 531 deletions(-) | `15b8af6` |
+| `simply_ip_sync` | Updated — 22 files changed, 2330 insertions(+), 55 deletions(-) (new: `SECURITY_COMPARISON_REPORT.md`, `STRUCTURAL_CONVERGENCE_REPORT.md`, `tests/concurrency_and_contracts.rs`, `tests/health_probes.rs`, `tests/referential_integrity.rs`) | `72cce13` |
+| `simply_ip_vault` | Already up to date | `14c8fa3` (unchanged from session 3) |
+
+### Headline findings (full detail and severity in `SECURITY_COMPARISON_REPORT.md`)
+
+- **New this pass: `simply_hook_executor` — one of the two "gold standard" founders — carries the
+  same `SchemaManager::has_index` defect `simply_ip_vault` already found and fixed**, and does so
+  against an `AGENT.MD` that explicitly mandates "SQL-agnostic (PostgreSQL-ready)". Rated **High**
+  for hook_executor specifically (a defect against a stated current capability), versus **Medium**
+  for `simply_ip_exporter`'s own instance of the identical bug (SQLite-only deployment claim, so
+  latent rather than live).
+- `simply_ip_exporter` remains the **sole ecosystem member with zero `deny_unknown_fields` usage** —
+  now confirmed against three peers (8/11/10 occurrences respectively), not one, strengthening the
+  session-3 finding from "one peer does this" to "ecosystem-wide convergence exporter is missing."
+- The wrong-encryption-key startup canary finding **also broadens**: both founding projects
+  (`simply_ip_vault`, `simply_hook_executor`) lack it; both later projects
+  (`simply_ip_exporter`, `simply_ip_sync`) have it.
+- **New observation, not in session 3**: a consistent implementation-lineage split unrelated to
+  founding order. `{simply_ip_vault, simply_ip_sync}` share `std::sync::OnceLock` for the Master pin
+  and a fixed `MAX_TIMESTAMP_SKEW_SECS` constant; `{simply_ip_exporter, simply_hook_executor}`
+  independently share `tokio::sync::OnceCell` and a runtime-configurable
+  `signature_max_age_seconds`. The founding pair disagrees with each other on both points — "gold
+  standard" tracks founding sequence, not tightest mutual alignment.
+- `api/guards.rs` is now confirmed present in **three of four** projects (all but this crate) —
+  broadens the structural recommendation from "vault has this" to "the ecosystem has converged on
+  this," including both later entrants independently.
+- `simply_ip_sync`'s own `AGENT.MD` still describes `scripts/verify_convergence.sh` as present; it
+  is still absent from that checkout at `72cce13`. Reported as an open item for that project, not
+  fixed here.
+- No **Critical** finding on any of the four projects in this pass.
+
+### Task 3 — `AGENT.MD` philosophy update
+
+Added a "Philosophy: why `example/` exists" subsection to the Peer Repository Synchronization
+section, stating the ecosystem's founding pair (`simply_ip_vault`/`simply_hook_executor`), that it
+has since scaled to include later members (`simply_ip_sync`, this crate), and the three standing
+purposes `example/` serves (security posture parity, architectural alignment, testing-strategy
+comparison) — explicitly noting convergence is observed to flow in both directions between founders
+and later members, not only outward from the founders, per this session's own findings. Updated the
+Document & Context Hierarchy's `example/` line item to match. `RBAC_MODEL.md` was not modified
+(read-only, per its own status line and this file's existing rule).
+
+### Verification performed
+
+Read-only/documentation task except for `AGENT.MD` (Task 3, explicitly authorized). Confirmed via
+`git status --short` before committing that only `AGENT.MD`, `AGENT_NOTES.MD`, `FILE_MAP.MD`,
+`SECURITY_COMPARISON_REPORT.md`, and `STRUCTURAL_CONVERGENCE_REPORT.md` differ from `HEAD` — no file
+under `src/`/`tests/`/`scripts/` was touched, and no peer checkout under `example/` was modified,
+staged, or committed (`git status --short` inside each of the three peer directories was clean after
+the Task 0 pulls completed).
+
 ## 2026-08-17 (session 3) — Independent security & structural convergence audit vs. `simply_ip_vault`
 
 Zero-knowledge, read-only comparison of `simply_ip_exporter` against `example/simply_ip_vault`,
