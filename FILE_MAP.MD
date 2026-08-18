@@ -63,8 +63,8 @@ then the frontend and test suites.
 | File | Responsibility |
 | :--- | :--- |
 | `src/migration/mod.rs` | `Migrator` — the ordered `Vec<Box<dyn MigrationTrait>>` SeaORM runs at startup. |
-| `src/migration/m20260101_000001_initial_schema.rs` | The single initial migration: creates `api_keys` and `endpoints` per `SCHEMA.MD`, then adds `api_keys.master_marker` as a raw-SQL `GENERATED ALWAYS AS (CASE WHEN is_master THEN 1 ELSE NULL END) VIRTUAL` column under a unique index — the database-level half of the Master-uniqueness guarantee, done correctly from the start rather than as a later correction. |
-| `src/migration/m20260101_000002_add_audit_logs.rs` | Adds `audit_logs` per `SCHEMA.MD` §3: `api_key_id` `ON DELETE SET NULL`, `api_key_name`/`api_key_prefix`/`client_ip`/`action`/`timestamp` all `NOT NULL` from the start (no later correction needed, unlike the reference `simply_ip_vault`'s two-step history for the equivalent columns), plus indexes on `action`, `timestamp`, and `api_key_id`. |
+| `src/migration/m20260811_115204_initial_schema.rs` | The single initial migration: creates `api_keys` and `endpoints` per `SCHEMA.MD`, then adds `api_keys.master_marker` as a raw-SQL `GENERATED ALWAYS AS (CASE WHEN is_master THEN 1 ELSE NULL END) VIRTUAL` column under a unique index — the database-level half of the Master-uniqueness guarantee, done correctly from the start rather than as a later correction. Renamed 2026-08-19 from `m20260101_000001_initial_schema.rs` to embed its real authorship timestamp (see `AGENT_NOTES.MD`). |
+| `src/migration/m20260811_152352_add_audit_logs.rs` | Adds `audit_logs` per `SCHEMA.MD` §3: `api_key_id` `ON DELETE SET NULL`, `api_key_name`/`api_key_prefix`/`client_ip`/`action`/`timestamp` all `NOT NULL` from the start (no later correction needed, unlike the reference `simply_ip_vault`'s two-step history for the equivalent columns), plus indexes on `action`, `timestamp`, and `api_key_id`. Renamed 2026-08-19 from `m20260101_000002_add_audit_logs.rs` (see `AGENT_NOTES.MD`). |
 
 ## `src/` — in-memory cache, IP pipeline, and Vault sync
 

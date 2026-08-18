@@ -1,5 +1,43 @@
 # Agent Worklog — `simply_ip_exporter`
 
+## 2026-08-19 (session 6) — Migration files renamed to real `mYYYYMMDD_HHMMSS_*` timestamps
+
+Session 5's own entry below declined renaming `src/migration/`'s two files, reasoning that (a) they
+already matched the ecosystem's actual ambient convention (date + monotonic counter) and (b)
+renaming an already-merged migration breaks `seaql_migrations` tracking for any real deployment. The
+owner explicitly requested the rename again in this session and addressed (b) directly: this crate
+has not reached a real deployment, so no `seaql_migrations` table anywhere outside this repository's
+own ephemeral dev/test databases references the old filenames. Proceeded on that basis.
+
+### What changed
+
+- `src/migration/m20260101_000001_initial_schema.rs` → `src/migration/m20260811_115204_initial_schema.rs`
+- `src/migration/m20260101_000002_add_audit_logs.rs` → `src/migration/m20260811_152352_add_audit_logs.rs`
+
+Timestamps are each file's real authorship time, taken from `git log --follow --date=iso-strict`
+against the pre-rename paths and converted to UTC:
+- `initial_schema`: first committed `8ff3da5`, `2026-08-11T13:52:04+02:00` → `2026-08-11T11:52:04Z`
+- `add_audit_logs`: first committed `ad17353`, `2026-08-11T17:23:52+02:00` → `2026-08-11T15:23:52Z`
+
+`git mv` used for both (preserves rename history in `git log --follow`, rather than showing as a
+delete+add). `src/migration/mod.rs`'s two `mod` declarations and the `Migrator::migrations()` vec
+updated to the new module names — this is the one place the rename has a real code dependency,
+since `#[derive(DeriveMigrationName)]` derives each migration's tracked version string from its
+module path. No other `.rs` file referenced the old module names. `FILE_MAP.MD` and `AGENT.MD`
+(the "Database Migrations" section's own example filenames and the naming-convention text itself,
+which now documents real timestamps as the primary form with a monotonic counter as an accepted
+alternative, matching what the rest of `example/` actually does) updated to match; `AGENT_NOTES.MD`'s
+own prior entries were left as-is (a historical record, not a live index) rather than edited to match
+retroactively.
+
+### Verification performed
+
+`cargo check --all-targets`: clean, confirming `mod.rs`'s updated module paths resolve. Full
+`cargo test`, `cargo clippy --all-targets -- -D warnings`, `./scripts/verify_convergence.sh`, and
+`./scripts/test_e2e.sh` re-run after the rename (all migrations apply to a fresh SQLite file on every
+test/E2E run in this crate, so there was no stale `seaql_migrations` state anywhere in the test
+suite for the rename to disrupt).
+
 ## 2026-08-18 (session 5) — Harmonization pass: acted on session 4's own audit findings
 
 Given a broad "harmonize core modules, frontend, tooling, migrations, and audit attribution with

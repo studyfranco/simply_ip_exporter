@@ -174,31 +174,39 @@ To protect the underlying storage hardware, **IP records are kept strictly in-me
 
 ### Naming convention
 
-Every migration file is named `m<YYYYMMDD>_<NNNNNN>_<migration_name>.rs`: an `m` prefix, an 8-digit
-date, an underscore, a 6-digit sequence segment, an underscore, and a `snake_case` description —
-`sea-orm-cli migrate generate`'s own default shape, and the convention every project in the wider
-`example/` ecosystem uses identically (see `AGENT.MD`'s "Peer Repository Synchronization" section).
+Every migration file is named `m<YYYYMMDD>_<HHMMSS>_<migration_name>.rs`: an `m` prefix, an 8-digit
+UTC date, an underscore, a 6-digit UTC time-of-day, an underscore, and a `snake_case` description.
+Both of this crate's current migrations — `m20260811_115204_initial_schema.rs` and
+`m20260811_152352_add_audit_logs.rs` — carry their real authorship timestamp (derived from git
+history at the time each was renamed into this form; see `AGENT_NOTES.MD`, 2026-08-19).
 
-**The 6-digit segment is a monotonically increasing sequence number, not a literal wall-clock
-`HHMMSS`.** Both of this crate's current migrations —
-`m20260101_000001_initial_schema.rs` and `m20260101_000002_add_audit_logs.rs` — already conform:
-`000001`, `000002` are valid 6-digit sequence values, ordering correctly against each other and
-against any later migration generated the same way. Nothing under `src/migration/` currently
-violates this format, and none has ever needed renaming to comply with it.
+A 6-digit segment that is instead a plain monotonic sequence counter (`000001`, `000002`, …) — the
+shape `sea-orm-cli migrate generate` produces by default, and what every other project in the wider
+`example/` ecosystem currently uses (see `AGENT.MD`'s "Peer Repository Synchronization" section) — is
+also accepted and orders correctly against a real-timestamp segment or another counter; the
+requirement is a valid 6-digit value in that position, monotonically non-decreasing against every
+migration before it, not that it be a literal clock reading. Prefer a real timestamp for a new
+migration when convenient; do not renumber an existing file's counter into a synthetic timestamp
+just to convert its shape (see below).
 
-### Renaming an already-generated migration is forbidden
+### Renaming an already-generated migration is forbidden (outside a narrow, explicit exception)
 
-**Never rename, renumber, or reorder a migration file that has already been committed.** SeaORM
-tracks applied migrations by filename (the `seaql_migrations` table records each migration's
-version string as derived from its module name) — renaming a migration after it has run against any
-real database, including a deployed instance this crate's own maintainers cannot see, orphans that
-row: the running service no longer recognizes its own migration history, and on next boot either
-silently re-attempts a migration already applied (erroring on an object that already exists) or
-skips one it should have run. This holds even for a migration that has *only* run inside this
-repository's own CI/test databases — those are ephemeral and safe to disregard, but a migration file
-is a public contract the moment it is merged, not the moment it reaches a specific deployment. A
-migration needing correction after merge gets a new, later migration that fixes it forward; the
-original file's name and contents are never touched again.
+**Never rename, renumber, or reorder a migration file that has already been committed**, with one
+narrow exception: this crate has not yet reached a real deployment, and its owner explicitly
+authorized a one-time rename of both existing migrations for exactly that reason (2026-08-19, see
+`AGENT_NOTES.MD`) after this document's own prior wording had declined the same request on safety
+grounds. That authorization does not generalize — the reason the rule exists is unchanged and takes
+effect again the moment a real deployment exists, including this crate's own CI/test databases only
+being exempt because they are ephemeral, never because a rename is generally low-risk.
+
+The rule itself: SeaORM tracks applied migrations by filename (the `seaql_migrations` table records
+each migration's version string as derived from its module name) — renaming a migration after it has
+run against any real database, including a deployed instance this crate's own maintainers cannot
+see, orphans that row: the running service no longer recognizes its own migration history, and on
+next boot either silently re-attempts a migration already applied (erroring on an object that
+already exists) or skips one it should have run. A migration needing correction after a real
+deployment exists gets a new, later migration that fixes it forward instead; the original file's
+name and contents are never touched again from that point on.
 
 ### Audit attribution & soft-deletion interaction
 
