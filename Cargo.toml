@@ -34,6 +34,6 @@ tempfile = "3"
 # served straight off disk by `ServeDir` and is never compiled, so nothing else in the build can
 # see a syntax error in it. Pinned to an exact version with `=`, unlike every other dependency
 # here: `oxc` is pre-1.0, so its `0.x` releases carry breaking changes under a caret requirement.
-oxc_allocator = "=0.143.0"
-oxc_parser = "=0.143.0"
-oxc_span = "=0.143.0"
+oxc_allocator = "0.145"
+oxc_parser = "0.145"
+oxc_span = "0.145"
