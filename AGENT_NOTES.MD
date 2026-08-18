@@ -1,5 +1,86 @@
 # Agent Worklog — `simply_ip_exporter`
 
+## 2026-08-17 (session 3) — Independent security & structural convergence audit vs. `simply_ip_vault`
+
+Zero-knowledge, read-only comparison of `simply_ip_exporter` against `example/simply_ip_vault`,
+producing `SECURITY_COMPARISON_REPORT.md` (overwritten — this crate had no prior version) and
+`STRUCTURAL_CONVERGENCE_REPORT.md` (new file). No application code was modified; both reports are
+analytical output only.
+
+### Methodology
+
+Per the task's explicit "clean-room" instruction, no prior audit report of either project was read
+or referenced. Findings are based solely on: the current `.rs` source of both projects (read fresh,
+file by file — `master.rs`, `middleware.rs`, `crypto.rs`, `extract.rs`, `error.rs`, `db.rs`,
+`config.rs`, `api/guards.rs`, and every mutating `api/*.rs` payload struct on the vault side; the
+equivalent files, already well known from this repo's own development history, on the exporter
+side), `RBAC_MODEL.md`, and each project's own `AGENT.MD`/`FILE_MAP.MD`.
+
+**Peer selection.** `RBAC_MODEL.md`'s own header scopes it to `simply_ip_vault`/
+`simply_hook_executor` specifically; `simply_ip_exporter` is not a party to it and `FILE_MAP.MD`
+already documents this crate as a deliberate two-tier subset. Of the two RBAC_MODEL.md signatories
+under `example/`, `simply_ip_vault` is the one this crate has an actual runtime relationship with
+(sync source for every feed endpoint, origin of the `CANONICAL_V1` scheme this crate speaks
+outbound) — `simply_hook_executor` was not used as the comparison peer for this reason, and the
+reports state this explicitly in their own headers rather than leaving it implicit.
+
+### Task 0 — peer sync
+
+```
+$ cd example/simply_ip_vault && git pull --ff-only
+From https://oshino.tomidejetsu.ovh/fallrik/simply_ip_vault
+   0c4eb7b..14c8fa3  master     -> origin/master
+Updating 0c4eb7b..14c8fa3
+Fast-forward
+ AGENT_NOTES.MD                     | 103 ++++++++
+ FILE_MAP.MD                        |   1 +
+ scripts/test_e2e.sh                |  73 +++++-
+ tests/concurrency_and_contracts.rs | 506 +++++++++++++++++++++++++++++++++++++
+ 4 files changed, 676 insertions(+), 7 deletions(-)
+ create mode 100644 tests/concurrency_and_contracts.rs
+```
+
+Audited at `14c8fa3`. The other two `example/` checkouts (`simply_hook_executor`,
+`simply_ip_sync`) were **not** pulled or read for this pass — this audit's scope is the exporter/
+vault pair specifically (see peer-selection rationale above), and `AGENT.MD`'s "pull first" rule
+applies to whatever is actually consulted, not to every checkout under `example/` regardless of
+relevance.
+
+### Headline findings (full detail and severity in `SECURITY_COMPARISON_REPORT.md`)
+
+- **`simply_ip_exporter` has zero `#[serde(deny_unknown_fields)]` usage** across all six mutating
+  payload structs (`keys.rs`, `endpoints.rs`), against 8 occurrences in `simply_ip_vault`. The
+  primary control (`is_master` absent from the payload type) holds on both sides — this is a
+  defense-in-depth/API-contract-strictness gap, not a privilege-escalation path — but it is exactly
+  the gap `simply_ip_vault`'s own `extract.rs` module doc comment was written to close. Medium
+  severity; recommended fix in the report.
+- **`master.rs::pin_at_boot` uses `SchemaManager::has_index`**, the exact API `simply_ip_vault`
+  replaced with a custom `db::has_index` after finding it returns `BackendNotSupported` on
+  PostgreSQL. Not currently exploitable (this crate's `AGENT.MD` states SQLite is used
+  "exclusively"), but a latent portability trap if that ever changes.
+- **The relationship inverts on one finding**: `simply_ip_vault` has *no* startup canary for a
+  syntactically-valid-but-wrong encryption key — the exact gap this crate closed in session 1
+  (2026-08-17, `main.rs::verify_encryption_key`). Reported in `simply_ip_vault`'s favor as a peer
+  finding, not fixed here, per `AGENT.MD`'s peer-repository rule (see the new line added to that
+  section in session 2).
+- **No High/Critical findings on either side** — no authorization bypass, forgeable signature,
+  plaintext-secret exposure, or uniqueness-bypass was found in this pass.
+- **Structural convergence is high**: 13 of 17 compared naming conventions are byte-identical Rust
+  identifiers; every module either project has a reason to hold exists under an identical filename
+  in the other; migration/entity/error-handling conventions match exactly. The two areas of visible
+  divergence — `simply_ip_vault`'s centralized `api/guards.rs` (justified by R1–R7 conjunction rules
+  this crate's simpler two-tier RBAC has no equivalent of) and its far higher test-to-source LOC
+  ratio (1.17:1 against this crate's 0.26:1) — both track `simply_ip_vault`'s longer iteration
+  history rather than a design disagreement.
+
+### Verification performed
+
+Read-only task: no `cargo check`/`clippy`/`test`/`verify_convergence.sh`/`test_e2e.sh` re-run was
+required or performed, since no application code changed. Confirmed via `git status --short` after
+writing both reports that only `SECURITY_COMPARISON_REPORT.md`, `STRUCTURAL_CONVERGENCE_REPORT.md`,
+`AGENT_NOTES.MD`, and `FILE_MAP.MD` differ from `HEAD` — no file under `src/`/`tests/`/`scripts/`
+was touched.
+
 ## 2026-08-17 (session 2) — Peer test-harness audit: two patterns adopted, peer bugs reported not fixed
 
 Audited `example/simply_hook_executor`, `example/simply_ip_sync`, and `example/simply_ip_vault`

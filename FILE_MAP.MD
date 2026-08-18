@@ -19,6 +19,8 @@ then the frontend and test suites.
 | `SCHEMA.MD` | Authoritative SQLite schema for `api_keys`/`endpoints`/`audit_logs`, including the `master_marker` generated-column mechanism. |
 | `RBAC_MODEL.md` | The fuller Master/Parent/Daughter RBAC spec shared by `simply_ip_vault`/`simply_hook_executor`. This crate implements a simpler two-tier subset — see `AGENT_NOTES.MD` for the deliberate deviation. |
 | `AGENT_NOTES.MD` | Running worklog: architectural decisions, deviations, and verification performed, updated after each significant change. |
+| `SECURITY_COMPARISON_REPORT.md` | Independent, zero-knowledge security comparison against `example/simply_ip_vault` (the RBAC_MODEL.md-scoped peer this crate has an actual runtime relationship with). Overwritten wholesale on each fresh audit pass — see its own header for the peer commit audited and `AGENT_NOTES.MD` for the pull log. |
+| `STRUCTURAL_CONVERGENCE_REPORT.md` | Companion architectural/naming-convention comparison against the same peer. Same overwrite convention. |
 | `README.md` | User-facing documentation: architecture, quickstart, env var reference, pfBlockerNG integration, API/probe overview. |
 | `FILE_MAP.MD` | This file. |
 | `LICENSE` | Project license. |
