@@ -65,7 +65,14 @@ pub struct MintedKeyResponse {
 }
 
 /// Payload for creating a Daughter key.
+///
+/// `is_master` is deliberately absent from this type (never settable through the API) *and* the
+/// struct denies unknown fields — the field's absence alone only means a stray `"is_master": true`
+/// is silently ignored; `deny_unknown_fields` is what makes it refused, with an error naming the
+/// field, instead. See `simply_ip_vault`'s `src/extract.rs` module doc comment for the fuller
+/// rationale this mirrors.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateKeyPayload {
     name: String,
     bound_ips: Option<String>,
@@ -143,8 +150,10 @@ pub async fn list_api_keys(
     Ok(Json(keys.into_iter().map(KeyResponse::from).collect::<Vec<_>>()))
 }
 
-/// Payload for updating a key. `is_master` cannot appear here by construction.
+/// Payload for updating a key. `is_master` cannot appear here by construction, and an unknown
+/// field is refused rather than silently dropped (see `CreateKeyPayload`'s doc comment).
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateKeyPayload {
     name: Option<String>,
     bound_ips: Option<String>,

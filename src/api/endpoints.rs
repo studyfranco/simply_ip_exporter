@@ -67,8 +67,10 @@ impl From<endpoint::Model> for EndpointResponse {
     }
 }
 
-/// Payload for creating an endpoint.
+/// Payload for creating an endpoint. Denies unknown fields — a stray/mistyped field is refused with
+/// an error naming it, rather than silently ignored (matches `simply_ip_vault`'s convention).
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateEndpointPayload {
     name: String,
     description: Option<String>,
@@ -160,8 +162,10 @@ pub async fn list_endpoints(
 }
 
 /// Payload for updating an endpoint. Ownership (`owner_key_id`) is reassignable by Master only,
-/// via a separate route, and never through this general update.
+/// via a separate route, and never through this general update — enforced structurally (the field
+/// is absent here) and denies any other unknown field too, rather than silently ignoring it.
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateEndpointPayload {
     name: Option<String>,
     description: Option<String>,
@@ -328,6 +332,7 @@ pub async fn reassign_endpoint_owner(
 
 /// Payload for [`reassign_endpoint_owner`].
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReassignOwnerPayload {
     owner_key_id: Option<Uuid>,
 }

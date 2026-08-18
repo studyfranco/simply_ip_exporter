@@ -562,6 +562,35 @@ async fn a_malformed_json_body_is_reported_in_the_normal_error_envelope() {
     assert!(json["error"].as_str().is_some_and(|s| !s.is_empty()));
 }
 
+/// `#[serde(deny_unknown_fields)]` on every mutating payload (2026-08-18 harmonization pass, see
+/// `AGENT_NOTES.MD`): a stray field is refused with a `400` naming it, not silently dropped. The
+/// primary control — `is_master` absent from the type entirely — already stops it from taking
+/// effect even without this; this proves the *second* control, that the attempt itself is refused
+/// and visible, actually fires.
+#[tokio::test]
+async fn an_unknown_field_in_a_mutating_payload_is_rejected_rather_than_silently_dropped() {
+    let db = setup_test_db().await;
+    let master = insert_key(&db, true, true).await;
+    let state = test_state(&db).with_pinned_master(master.model.id);
+    let app = create_app(state);
+
+    let response = app
+        .oneshot(signed_request(
+            "POST",
+            "/api/keys",
+            &master,
+            r#"{"name":"daughter","is_master":true}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(response).await;
+    assert!(
+        json["error"].as_str().is_some_and(|s| s.contains("is_master")),
+        "the error should name the rejected field: {json:?}"
+    );
+}
+
 #[tokio::test]
 async fn an_invalid_uuid_path_parameter_is_reported_in_the_normal_error_envelope() {
     let db = setup_test_db().await;

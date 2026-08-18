@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
-# Source hygiene / convergence checks for simply_ip_exporter, per AGENT.MD:
+# Convergence gate for simply_ip_exporter: source hygiene, lint, and the full test suite, per
+# AGENT.MD. Source hygiene specifically means:
 #
 #   1. Zero raw SQL outside src/db.rs and src/migration/ (pragmas in db.rs are the documented
 #      exception; everything else must go through SeaORM's query builder).
@@ -14,11 +15,13 @@
 # whose remote is unreachable, log a warning and fall through to whatever is on disk rather than
 # failing the whole gate over a network hiccup.
 #
-# The actual analysis lives in tests/source_hygiene.rs (a real Rust file scanner plus an oxc-based
-# JS parser for the JS check — a shell script cannot reliably parse either). This script is the
-# single, memorable entry point `./scripts/verify_convergence.sh` the validation checklist expects,
-# and adds one thing the bare `cargo test` invocation doesn't: a pass/fail summary per named check
-# rather than an undifferentiated test list.
+# The source-hygiene analysis itself lives in tests/source_hygiene.rs (a real Rust file scanner plus
+# an oxc-based JS parser for the JS check — a shell script cannot reliably parse either). This
+# script is the single, memorable entry point `./scripts/verify_convergence.sh` the validation
+# checklist expects, and adds one thing the bare `cargo test` invocation doesn't: a pass/fail
+# summary per named check rather than an undifferentiated test list. `cargo clippy -D warnings` and
+# `cargo test` run afterwards as two more named checks in the same summary, so a single invocation
+# of this script is a complete pre-commit gate rather than one piece of a checklist run by hand.
 #
 # Usage: ./scripts/verify_convergence.sh
 # Exit code: 0 if every check passed, 1 otherwise.
@@ -115,6 +118,32 @@ for description in "${!CHECKS[@]}"; do
         FAIL_COUNT=$((FAIL_COUNT + 1))
     fi
 done
+
+# ── Lint and the full test suite ────────────────────────────────────────────
+#
+# Named checks in the same summary as the hygiene scans above, not separate scripts to run by
+# hand — a passing `verify_convergence.sh` is meant to mean the whole pre-commit gate is green, not
+# just the source-hygiene third of it.
+echo "" >&2
+log "Running cargo clippy --all-targets -- -D warnings ..."
+CLIPPY_OUTPUT="$(cargo clippy --all-targets --quiet -- -D warnings 2>&1)"
+if [ $? -eq 0 ]; then
+    echo -e "$(ts) ${GREEN}✓ PASS${RESET} cargo clippy --all-targets -- -D warnings" >&2
+else
+    echo -e "$(ts) ${RED}✗ FAIL${RESET} cargo clippy --all-targets -- -D warnings" >&2
+    echo "$CLIPPY_OUTPUT" | sed 's/^/          /' >&2
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+fi
+
+log "Running cargo test (unit + integration + source-hygiene) ..."
+TEST_OUTPUT="$(cargo test --quiet 2>&1)"
+if [ $? -eq 0 ]; then
+    echo -e "$(ts) ${GREEN}✓ PASS${RESET} cargo test" >&2
+else
+    echo -e "$(ts) ${RED}✗ FAIL${RESET} cargo test" >&2
+    echo "$TEST_OUTPUT" | sed 's/^/          /' >&2
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+fi
 
 echo "" >&2
 if [ "$FAIL_COUNT" -eq 0 ]; then

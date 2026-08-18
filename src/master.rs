@@ -8,7 +8,6 @@
 //! demoted in place rather than trusted.
 
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
-use sea_orm_migration::SchemaManager;
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
@@ -93,8 +92,10 @@ impl MasterPin {
 
     /// Establishes the Master identity at startup, asserting every §5 invariant on the way.
     pub async fn pin_at_boot(&self, db: &DatabaseConnection) -> Result<Uuid, MasterPinError> {
-        let manager = SchemaManager::new(db);
-        if !manager.has_index(API_KEYS_TABLE, MASTER_MARKER_INDEX).await? {
+        // `crate::db::has_index` rather than `sea_orm_migration::SchemaManager::has_index`: the
+        // latter's catalog query is gated behind cargo features this crate does not enable for
+        // PostgreSQL and answers `BackendNotSupported` there — see that function's doc comment.
+        if !crate::db::has_index(db, API_KEYS_TABLE, MASTER_MARKER_INDEX).await? {
             return Err(MasterPinError::MissingConstraint);
         }
 

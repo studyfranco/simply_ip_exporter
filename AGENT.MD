@@ -166,7 +166,58 @@ To protect the underlying storage hardware, **IP records are kept strictly in-me
    - May **NEVER** create, modify, or list other API keys.
 3. **Master Uniqueness & Pinning:**
    - Database level uniqueness via generated marker column.
-   - Identity pinned at boot in a write-once `OnceLock`.
+   - Identity pinned at boot in a write-once `tokio::sync::OnceCell`.
+
+---
+
+## 🗄️ Database Migrations (SeaORM)
+
+### Naming convention
+
+Every migration file is named `m<YYYYMMDD>_<NNNNNN>_<migration_name>.rs`: an `m` prefix, an 8-digit
+date, an underscore, a 6-digit sequence segment, an underscore, and a `snake_case` description —
+`sea-orm-cli migrate generate`'s own default shape, and the convention every project in the wider
+`example/` ecosystem uses identically (see `AGENT.MD`'s "Peer Repository Synchronization" section).
+
+**The 6-digit segment is a monotonically increasing sequence number, not a literal wall-clock
+`HHMMSS`.** Both of this crate's current migrations —
+`m20260101_000001_initial_schema.rs` and `m20260101_000002_add_audit_logs.rs` — already conform:
+`000001`, `000002` are valid 6-digit sequence values, ordering correctly against each other and
+against any later migration generated the same way. Nothing under `src/migration/` currently
+violates this format, and none has ever needed renaming to comply with it.
+
+### Renaming an already-generated migration is forbidden
+
+**Never rename, renumber, or reorder a migration file that has already been committed.** SeaORM
+tracks applied migrations by filename (the `seaql_migrations` table records each migration's
+version string as derived from its module name) — renaming a migration after it has run against any
+real database, including a deployed instance this crate's own maintainers cannot see, orphans that
+row: the running service no longer recognizes its own migration history, and on next boot either
+silently re-attempts a migration already applied (erroring on an object that already exists) or
+skips one it should have run. This holds even for a migration that has *only* run inside this
+repository's own CI/test databases — those are ephemeral and safe to disregard, but a migration file
+is a public contract the moment it is merged, not the moment it reaches a specific deployment. A
+migration needing correction after merge gets a new, later migration that fixes it forward; the
+original file's name and contents are never touched again.
+
+### Audit attribution & soft-deletion interaction
+
+`audit_logs`' attribution columns (`api_key_name`, `api_key_prefix`) are `NOT NULL` from this
+crate's *first* migration that creates the table — not retrofitted after a backfill, because the
+schema was designed to avoid ever needing one. This is deliberate and must not regress:
+
+- `api_key_id` (the *live* foreign key to `api_keys`) is nullable, with `ON DELETE SET NULL` — so
+  deleting the acting key never deletes or blocks deletion of the audit rows it wrote; the link
+  simply severs.
+- `api_key_name`/`api_key_prefix` are **denormalized snapshots**, captured at write time and never
+  updated afterwards. They carry no foreign key at all, so they are free to be `NOT NULL` without
+  ever conflicting with the `SET NULL` behavior on `api_key_id` — the two columns answer different
+  questions ("what can we still join to" vs. "what did we already know and record"), and only the
+  first one is allowed to go empty.
+- Any future migration adding a new denormalized attribution column must follow this same shape:
+  `NOT NULL` on the snapshot, nullable + `SET NULL` only on the live reference, with a data backfill
+  in the migration's own `up()` *before* the `NOT NULL` constraint is added if the column is not
+  present from the table's first migration.
 
 ---
 

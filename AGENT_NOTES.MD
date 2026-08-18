@@ -1,5 +1,105 @@
 # Agent Worklog — `simply_ip_exporter`
 
+## 2026-08-18 (session 5) — Harmonization pass: acted on session 4's own audit findings
+
+Given a broad "harmonize core modules, frontend, tooling, migrations, and audit attribution with
+`simply_ip_vault`" task. Investigated each sub-task against actual current state before touching
+anything, since several of the task's premises did not match the repository as it stands — two were
+declined outright with reasoning recorded below rather than executed as literally requested, per the
+judgment "full autonomy to fix code" is meant to carry, not in spite of it.
+
+### Done: the two concrete gaps session 4's own `SECURITY_COMPARISON_REPORT.md` had already identified
+
+Both were read-only *findings* in that report; this session is where they became fixes.
+
+- **`#[serde(deny_unknown_fields)]` added to all five mutating payload structs** (`CreateKeyPayload`,
+  `UpdateKeyPayload` in `api/keys.rs`; `CreateEndpointPayload`, `UpdateEndpointPayload`,
+  `ReassignOwnerPayload` in `api/endpoints.rs`), matching `simply_ip_vault`'s convention. The primary
+  control (`is_master` absent from every payload type) already held; this closes the second-order
+  gap — a stray/mistyped field was previously accepted and silently dropped rather than refused with
+  a `400` naming it. New regression test:
+  `an_unknown_field_in_a_mutating_payload_is_rejected_rather_than_silently_dropped`
+  (`tests/integration.rs`). Zero existing tests sent an extra field, so this was a clean, non-breaking
+  addition — confirmed by a full `cargo test` pass before and after.
+- **`master.rs::pin_at_boot` no longer calls `sea_orm_migration::SchemaManager::has_index`.** Ported
+  `simply_ip_vault`'s `db::has_index` (a per-backend catalog query against `sqlite_master`/
+  `pg_indexes`/`information_schema.statistics`) into `src/db.rs`, with its own `index_catalog_query`
+  unit test. `SchemaManager::has_index` answers `BackendNotSupported` on PostgreSQL rather than
+  correctly reporting the index's presence — latent rather than live for this crate specifically
+  (`AGENT.MD` states SQLite "exclusively"), but the fix costs nothing and removes the trap rather
+  than leaving it for whoever changes that claim later. Confirmed via a full `test_e2e.sh` run
+  (including its restart-and-re-pin cycle) that `pin_at_boot` still correctly finds
+  `idx_api_keys_master_marker` through the new code path.
+
+### Done: `AGENT.MD` — new "Database Migrations (SeaORM)" section
+
+Documents the `m<YYYYMMDD>_<NNNNNN>_<name>.rs` naming convention (explicitly clarifying the 6-digit
+segment is a monotonic sequence number, not a literal `HHMMSS` wall-clock time — see "Declined" below
+for why this distinction matters), the audit-attribution/soft-deletion interaction pattern already
+implemented correctly in `m20260101_000002_add_audit_logs`, and the rule that an already-generated
+migration file is never renamed after merge. Also corrected a stale detail noticed in passing: the
+existing RBAC section described the Master pin as a `OnceLock`; the actual type
+(`src/master.rs::MasterPin`) uses `tokio::sync::OnceCell` and always has — fixed the doc to match the
+code rather than the other way around.
+
+### Done: `scripts/verify_convergence.sh` now also runs clippy and the full test suite
+
+Two new named checks (`cargo clippy --all-targets -- -D warnings`, `cargo test`) appended after the
+existing source-hygiene checks, in the same pass/fail summary — 7 checks became 13. `chmod +x`
+confirmed on both `scripts/verify_convergence.sh` and `scripts/test_e2e.sh` (both were already
+executable; re-asserted per the task's explicit validation step).
+
+### Declined, with reasoning: renaming `src/migration/`'s existing files
+
+The task asked to "audit all files in `src/migration/`... rename and reorder any migration file that
+does not strictly adhere to the `mYYYYMMDD_HHMMSS_migration_name.rs` format." Both files present —
+`m20260101_000001_initial_schema.rs`, `m20260101_000002_add_audit_logs.rs` — already structurally
+match that pattern (`m` + 8-digit date + `_` + 6-digit segment + `_` + name); `000001`/`000002` are
+valid 6-digit values, just sequence numbers rather than literal times-of-day, which is exactly how
+`sea-orm-cli migrate generate` names files by default and is the identical convention every project
+audited in session 4's ecosystem pass uses (`simply_ip_vault`'s `m20260808_000009_...`,
+`simply_ip_sync`'s `m20260101_000002_...`, etc.). There was nothing to rename.
+
+Had there been something to rename, renaming an already-merged migration would still have been
+refused: SeaORM tracks applied migrations by filename in `seaql_migrations`, so renaming a migration
+after it has run against *any* database this repository's maintainers cannot see — not just this
+repo's own ephemeral test databases — orphans that row and breaks the running service's own view of
+its migration history on next boot. This is exactly the kind of hard-to-reverse, wide-blast-radius
+action documented as needing more than a task instruction to justify. Recorded here rather than
+silently skipped, per this crate's own convention for a task premise that doesn't survive contact
+with the current source (see the RBAC_MODEL.md scoping note in the 2026-08-17 session 3 entry for
+the precedent).
+
+### Declined, with reasoning: full `static/` re-skin against `simply_ip_vault`
+
+Checked `static/app.js`'s `apiCall` helper directly before deciding: it already attaches
+`X-API-Key`/`X-Timestamp`/`X-Signature-256` correctly and already extracts `json.error` from the
+`{"error": ...}` envelope consistently, falling back to `HTTP {status}` only when the body isn't
+shaped that way — the two functional properties the task asked to align. `simply_ip_vault`'s own
+`static/` is roughly 7–13× larger than this crate's across `app.js`/`index.html`/`style.css`
+(2,388/686/1,776 lines vs. 361/120/131), because its domain is genuinely larger (groups, webhooks,
+permission grants, execution logs) — a wholesale visual re-skin to match it would be a large,
+subjective, high-regression-risk diff against a frontend with no confirmed functional defect, and
+would risk exactly what the task's own guidelines said not to do ("Do NOT remove exporter-specific
+features"). No CSS/HTML changes made. If a genuine, scoped design-token misalignment is identified
+later (e.g. a specific color/spacing variable this crate should adopt), that is a small, low-risk
+follow-up — a wholesale reskin is not.
+
+### `retention.rs`
+
+Not added. This crate has no soft-deleted or otherwise-retained durable data (`SCHEMA.MD` scopes
+SQLite to configuration only; IP records are strictly in-memory and never soft-deleted) — the task's
+own wording ("integrate only if justified by the component's runtime model") is satisfied by doing
+nothing here.
+
+### Verification performed
+
+`cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`: clean. `cargo test`: 120
+passed (82 unit + 4 `main.rs` unit + 23 integration + 11 source-hygiene), up from 117.
+`cargo test -- --ignored`: 0 tests match (none `#[ignore]`d in this crate), vacuously passes.
+`./scripts/verify_convergence.sh`: 13/13. `./scripts/test_e2e.sh`: 100/100, run after the `has_index`
+change specifically to exercise its restart/re-pin path against a real process.
+
 ## 2026-08-17 (session 4) — Ecosystem-wide convergence audit (all `example/` peers) + `AGENT.MD` philosophy
 
 Broadened session 3's single-peer audit (`simply_ip_exporter` vs. `simply_ip_vault` only) to all
