@@ -2,7 +2,7 @@
 
 use chrono::Utc;
 use rand::RngExt;
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection};
+use sea_orm::{ActiveModelTrait, ActiveValue::Set, ConnectionTrait};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -48,8 +48,14 @@ pub fn describe_resource(kind: &str, id: Uuid, name: &str) -> String {
 /// report `200 OK` for an action the audit trail never recorded — the two are meant to be
 /// inseparable. A `500` here is the honest answer: something is wrong with the database, and the
 /// caller should know its request did not fully succeed.
-pub async fn create_audit_log(
-    db: &DatabaseConnection,
+///
+/// Generic over `ConnectionTrait` rather than a concrete `&DatabaseConnection` so a caller running a
+/// multi-step mutation inside `db.transaction(...)` (e.g. `api::keys::delete_api_key`'s endpoint
+/// reassignment) can pass the transaction handle directly — the audit entry then commits or rolls
+/// back atomically with the mutation it describes, rather than being a separate write that could
+/// succeed even if the transaction it was meant to describe did not.
+pub async fn create_audit_log<C: ConnectionTrait>(
+    db: &C,
     key: &api_key::Model,
     client_ip: std::net::IpAddr,
     action: &str,

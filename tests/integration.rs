@@ -694,3 +694,223 @@ async fn two_concurrent_deletes_of_the_same_endpoint_do_not_both_succeed() {
     assert_eq!(deleted_count, 1, "exactly one concurrent delete must succeed, got {statuses:?}");
     assert_eq!(not_found_count, 1, "the other must find it already gone, got {statuses:?}");
 }
+
+/// 2026-08-19 hardening pass (see `AGENT_NOTES.MD`): `PUT /api/keys/{id}` had no explicit guard
+/// against the target being the Master key beyond `is_master` already being absent from
+/// `UpdateKeyPayload`'s type — `name` and `can_manage_keys` were freely settable on the Master's own
+/// row. `bound_ips` remains changeable (`AGENT.MD`: the Master key is immutable through the API
+/// except for its own network binding); everything else on the Master's row must not be.
+#[tokio::test]
+async fn master_key_name_and_can_manage_keys_cannot_be_changed_via_the_api() {
+    let db = setup_test_db().await;
+    let master = insert_key(&db, true, true).await;
+    let state = test_state(&db).with_pinned_master(master.model.id);
+    let app = create_app(state);
+
+    let rename = app
+        .clone()
+        .oneshot(signed_request(
+            "PUT",
+            &format!("/api/keys/{}", master.model.id),
+            &master,
+            r#"{"name":"Renamed Master"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rename.status(), StatusCode::FORBIDDEN);
+
+    let escalate = app
+        .clone()
+        .oneshot(signed_request(
+            "PUT",
+            &format!("/api/keys/{}", master.model.id),
+            &master,
+            r#"{"can_manage_keys":false}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(escalate.status(), StatusCode::FORBIDDEN);
+
+    // The one field the Master's own record may still change through this route.
+    let rebind = app
+        .clone()
+        .oneshot(signed_request(
+            "PUT",
+            &format!("/api/keys/{}", master.model.id),
+            &master,
+            r#"{"bound_ips":"10.0.0.0/8"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rebind.status(), StatusCode::OK);
+    let updated = body_json(rebind).await;
+    assert_eq!(updated["bound_ips"], "10.0.0.0/8");
+    assert_eq!(updated["name"], "Test Key", "the rejected rename must not have taken effect");
+    assert_eq!(updated["can_manage_keys"], true, "the rejected escalation attempt must not have taken effect");
+}
+
+/// `AuditLogQuery` denies unknown fields like every other payload type in this crate — a stray
+/// query parameter is refused with a `400` naming it, not silently ignored.
+#[tokio::test]
+async fn an_unknown_query_parameter_is_rejected_with_a_400_naming_it() {
+    let db = setup_test_db().await;
+    let master = insert_key(&db, true, true).await;
+    let state = test_state(&db).with_pinned_master(master.model.id);
+    let app = create_app(state);
+
+    let response =
+        app.oneshot(signed_request("GET", "/api/audit-logs?stray_field=1", &master, "")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(response).await;
+    assert!(
+        json["error"].as_str().is_some_and(|s| s.contains("stray_field")),
+        "the error should name the rejected query parameter: {json:?}"
+    );
+}
+
+/// `DELETE /api/keys/{id}` without `?reassign_to=` on a key that still owns endpoints must refuse
+/// with a structured `409` inventory rather than silently orphaning them (`owner_key_id` is `ON
+/// DELETE SET NULL`, so the delete itself would otherwise have "succeeded" while quietly leaving
+/// endpoints Master-supervised with no confirmation the caller ever asked for that).
+#[tokio::test]
+async fn deleting_a_key_that_owns_endpoints_without_reassign_to_returns_409_with_inventory() {
+    let db = setup_test_db().await;
+    let master = insert_key(&db, true, true).await;
+    let owner = insert_key(&db, false, false).await;
+    let state = test_state(&db).with_pinned_master(master.model.id);
+    let app = create_app(state);
+
+    let create = app
+        .clone()
+        .oneshot(signed_request("POST", "/api/endpoints", &owner, r#"{"name":"Owned Feed","vault_groups":"g1"}"#))
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::OK);
+    let ep_id = body_json(create).await["id"].as_str().unwrap().to_owned();
+
+    let delete =
+        app.clone().oneshot(signed_request("DELETE", &format!("/api/keys/{}", owner.model.id), &master, "")).await.unwrap();
+    assert_eq!(delete.status(), StatusCode::CONFLICT);
+    let body = body_json(delete).await;
+    assert!(body["error"].as_str().is_some_and(|s| s.contains('1')), "the message should mention the count: {body:?}");
+    let inventory = body["owned_endpoints"].as_array().expect("owned_endpoints is present");
+    assert_eq!(inventory.len(), 1);
+    assert_eq!(inventory[0]["id"], ep_id);
+    assert_eq!(inventory[0]["name"], "Owned Feed");
+
+    // Nothing took effect: the key survives the refused delete. No `GET /api/keys/{id}` route
+    // exists, so this is checked against the list.
+    let keys = app.oneshot(signed_request("GET", "/api/keys", &master, "")).await.unwrap();
+    let keys = body_json(keys).await;
+    assert!(
+        keys.as_array().unwrap().iter().any(|k| k["id"] == owner.model.id.to_string()),
+        "the owner key must still exist: {keys:?}"
+    );
+}
+
+/// With `?reassign_to=<key id>`, the endpoint reassignment and the key deletion happen atomically:
+/// the endpoint's `owner_key_id` moves to the new owner, the old key is gone, and one `KEY_DELETE`
+/// audit entry records both halves.
+#[tokio::test]
+async fn deleting_a_key_with_reassign_to_atomically_moves_its_endpoints_and_deletes_it() {
+    let db = setup_test_db().await;
+    let master = insert_key(&db, true, true).await;
+    let owner = insert_key(&db, false, false).await;
+    let new_owner = insert_key(&db, false, false).await;
+    let state = test_state(&db).with_pinned_master(master.model.id);
+    let app = create_app(state);
+
+    let create = app
+        .clone()
+        .oneshot(signed_request("POST", "/api/endpoints", &owner, r#"{"name":"Owned Feed","vault_groups":"g1"}"#))
+        .await
+        .unwrap();
+    let ep_id = body_json(create).await["id"].as_str().unwrap().to_owned();
+
+    let delete = app
+        .clone()
+        .oneshot(signed_request(
+            "DELETE",
+            &format!("/api/keys/{}?reassign_to={}", owner.model.id, new_owner.model.id),
+            &master,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+
+    // The key is gone. No `GET /api/keys/{id}` route exists, so this is checked against the list.
+    let keys = app.clone().oneshot(signed_request("GET", "/api/keys", &master, "")).await.unwrap();
+    let keys = body_json(keys).await;
+    assert!(
+        keys.as_array().unwrap().iter().all(|k| k["id"] != owner.model.id.to_string()),
+        "the deleted key must no longer be listed: {keys:?}"
+    );
+
+    // The endpoint survived and now belongs to the new owner. No `GET /api/endpoints/{id}` route
+    // exists either, so this is checked against the list.
+    let endpoints = app.clone().oneshot(signed_request("GET", "/api/endpoints", &master, "")).await.unwrap();
+    let endpoints = body_json(endpoints).await;
+    let reassigned = endpoints
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"] == ep_id)
+        .expect("the endpoint must still exist");
+    assert_eq!(reassigned["owner_key_id"], new_owner.model.id.to_string());
+
+    let logs = fetch_audit_logs(app, &master).await;
+    let delete_entry = logs
+        .iter()
+        .find(|l| l["action"] == "KEY_DELETE" && l["target_resource"].as_str().is_some_and(|t| t.contains(&owner.model.id.to_string())))
+        .expect("a KEY_DELETE entry for the deleted key");
+    let details = delete_entry["details"].as_str().expect("details is present");
+    assert!(details.contains("reassigned 1 endpoint"), "details should describe the reassignment: {details}");
+    assert!(details.contains(&new_owner.model.id.to_string()), "details should name the new owner: {details}");
+}
+
+/// `reassign_to` naming a key that doesn't exist is a client error, not a silent no-op or a
+/// half-applied transaction.
+#[tokio::test]
+async fn reassign_to_naming_a_nonexistent_key_is_rejected_and_changes_nothing() {
+    let db = setup_test_db().await;
+    let master = insert_key(&db, true, true).await;
+    let owner = insert_key(&db, false, false).await;
+    let state = test_state(&db).with_pinned_master(master.model.id);
+    let app = create_app(state);
+
+    let create = app
+        .clone()
+        .oneshot(signed_request("POST", "/api/endpoints", &owner, r#"{"name":"Owned Feed","vault_groups":"g1"}"#))
+        .await
+        .unwrap();
+    let ep_id = body_json(create).await["id"].as_str().unwrap().to_owned();
+
+    let bogus_target = uuid::Uuid::new_v4();
+    let delete = app
+        .clone()
+        .oneshot(signed_request(
+            "DELETE",
+            &format!("/api/keys/{}?reassign_to={bogus_target}", owner.model.id),
+            &master,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delete.status(), StatusCode::BAD_REQUEST);
+
+    // Neither the key nor the endpoint's ownership changed. Neither single-item `GET` route
+    // exists, so both are checked against their list endpoints.
+    let keys = app.clone().oneshot(signed_request("GET", "/api/keys", &master, "")).await.unwrap();
+    let keys = body_json(keys).await;
+    assert!(
+        keys.as_array().unwrap().iter().any(|k| k["id"] == owner.model.id.to_string()),
+        "the owner key must still exist: {keys:?}"
+    );
+
+    let endpoints = app.oneshot(signed_request("GET", "/api/endpoints", &master, "")).await.unwrap();
+    let endpoints = body_json(endpoints).await;
+    let unchanged =
+        endpoints.as_array().unwrap().iter().find(|e| e["id"] == ep_id).expect("the endpoint must still exist");
+    assert_eq!(unchanged["owner_key_id"], owner.model.id.to_string());
+}

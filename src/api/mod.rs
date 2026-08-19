@@ -9,6 +9,9 @@ pub mod auth;
 pub mod health;
 /// CRUD for `endpoints`.
 pub mod endpoints;
+/// Authorization decisions shared by more than one handler — Master-key immutability and the
+/// generic administrative check every route already inlined before this module existed.
+pub mod guards;
 /// CRUD for `api_keys`.
 pub mod keys;
 /// Shared key-minting/hashing helpers and the audit-log writer.

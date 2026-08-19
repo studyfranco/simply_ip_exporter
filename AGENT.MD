@@ -161,12 +161,84 @@ To protect the underlying storage hardware, **IP records are kept strictly in-me
 1. **Master Key:** Auto-generated on boot if `api_keys` contains no master records.
    - Holds `is_master = true` and `can_manage_keys = true`.
    - Only key capable of creating or revoking local API keys.
+   - **Immutable through the API** beyond its own `bound_ips`: `PUT /api/keys/{id}` refuses any
+     request touching `name` or `can_manage_keys` when the target is the Master
+     (`api::guards::guard_master_update`), and deletion/rotation are refused outright
+     (`api::guards::guard_master_delete_or_rotate`). `is_master` itself needs no separate guard — it
+     is not a field on `CreateKeyPayload`/`UpdateKeyPayload` at all, so no request body can name it
+     regardless of which key is targeted.
 2. **Daughter Keys:** Created by the Master key (`can_manage_keys = false`).
    - May create, edit, and delete their own endpoints/feeds.
    - May **NEVER** create, modify, or list other API keys.
 3. **Master Uniqueness & Pinning:**
    - Database level uniqueness via generated marker column.
    - Identity pinned at boot in a write-once `tokio::sync::OnceCell`.
+
+### Why two tiers, not three
+
+This is a deliberate scope boundary, not an unfinished migration toward the fuller model. `example/`
+peers `simply_ip_vault` and `simply_hook_executor` implement a three-tier Master/Parent/Daughter
+model with M:N per-resource group permissions (`RBAC_MODEL.md`, scoped to those two projects
+specifically) because their domains need it: multiple tenants sharing partial, overlapping access to
+the same managed resources. `simply_ip_exporter` has no such requirement — it is a **single-purpose
+feed exposition daemon**. Every endpoint has exactly one owner at a time (`endpoints.owner_key_id`);
+there is no concept of two keys jointly administering the same endpoint with different verbs, no
+delegated-grant mechanism to reason about, and therefore no R1–R7-style conjunction rules for a third
+tier to enforce. Adding one would mean building and maintaining an authorization surface with no
+present requirement driving its shape — see `STRUCTURAL_CONVERGENCE_REPORT.md`'s note that this
+divergence from the wider ecosystem is domain-justified, not a gap.
+
+`src/api/guards.rs` exists despite the small RBAC surface for the same reason three of four
+`example/` peers already centralize their own authorization decisions: reviewability. It holds
+exactly the checks a two-tier model actually needs (`require_master`,
+`guard_master_delete_or_rotate`, `guard_master_update`) — not a scaffold for tiers this crate does
+not have.
+
+### Endpoint ownership: transfer and the `DELETE /api/keys/{id}` conflict
+
+An endpoint's `owner_key_id` is a single, exclusive pointer, reassignable in two ways:
+
+- **Explicitly**, at any time, via `PUT /api/endpoints/{id}/owner` (Master-only) — a direct,
+  single-write reassignment with no other side effect.
+- **As a side effect of deleting the owning key**, via `DELETE /api/keys/{id}?reassign_to=<key id>`.
+  A key that still owns endpoints cannot simply be deleted out from under them:
+  - **Without `reassign_to`**, if the target key owns any endpoints, the delete is refused with
+    `409 Conflict` and a structured body — `{"error": "...", "owned_endpoints": [{"id", "name"}, ...]}`
+    (`AppError::ConflictWithDetails`) — naming exactly what is blocking the delete, so the caller
+    does not have to separately query `GET /api/endpoints` to discover it.
+  - **With `reassign_to`**, the reassignment (`Endpoint::update_many().filter(...).col_expr(...)`)
+    and the key deletion happen inside one `SeaORM` transaction (`state.db.begin()` /
+    `txn.commit()`), including the audit log write — either the endpoints move to their new owner
+    and the old key is gone, or neither happens. A losing concurrent delete of the same key
+    (`rows_affected == 0` on the delete itself) rolls the whole transaction back, including any
+    reassignment already applied within it, rather than leaving endpoints reassigned to a delete
+    that never actually took effect.
+  - `reassign_to` must name an existing key other than the one being deleted; either violation is
+    `400 Bad Request`, checked *inside* the transaction so the check and the write it gates observe
+    a consistent snapshot.
+  - This is why `endpoints.owner_key_id` being `ON DELETE SET NULL` at the schema level (see
+    `SCHEMA.MD`) is a *backstop*, not the primary mechanism: the API path above is what a normal
+    admin-driven deletion goes through, and it never lets ownership silently fall through to `NULL`
+    without the caller either being told first (`409`) or explicitly redirecting it (`reassign_to`).
+
+### Multi-backend readiness (SQLite, PostgreSQL, MariaDB)
+
+`SCHEMA.MD`/AGENT.MD historically describe this crate's configuration store as SQLite-exclusive in
+practice, but every query, migration, and transaction in `src/` is written to be portable regardless:
+
+- All mutations go through SeaORM's entity/query builders (`ActiveModel::update`,
+  `Entity::update_many().col_expr(...)`, `Entity::delete_by_id`) or `db.transaction`/explicit
+  `begin()`/`commit()` — never a hand-assembled, backend-specific SQL string. `tests/source_hygiene.rs`
+  enforces the "zero raw SQL outside `src/db.rs`/`src/migration/`" half of this mechanically.
+- The one place this crate previously used a non-portable check — `master.rs::pin_at_boot`'s
+  uniqueness-index lookup, via `sea_orm_migration::SchemaManager::has_index`, which answers
+  `BackendNotSupported` on PostgreSQL rather than correctly reporting the index — was replaced
+  2026-08-18 with `db::has_index`, a per-backend catalog query (`sqlite_master`/`pg_indexes`/
+  `information_schema.statistics`) ported from `simply_ip_vault`'s identical fix. See
+  `AGENT_NOTES.MD` (session 5) for the incident this addresses.
+- `src/migration/`'s DDL (`ColumnDef`/`Table`/`ForeignKey` builders, plus the one documented raw-SQL
+  exception for `api_keys.master_marker`'s `GENERATED ALWAYS AS` column, which has no SeaQuery
+  builder representation on any backend) uses no vendor-specific syntax either.
 
 ---
 

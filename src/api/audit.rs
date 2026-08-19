@@ -2,20 +2,20 @@
 //! key and endpoint in the system, so a scoped Daughter key seeing them would be an RBAC leak
 //! regardless of what it owns.
 
-use axum::{
-    Extension, Json,
-    extract::{Query, State},
-    response::IntoResponse,
-};
+use axum::{Extension, Json, extract::State, response::IntoResponse};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 use serde::Deserialize;
 
 use crate::entities::{api_key, audit_log, prelude::AuditLog};
 use crate::error::AppError;
+use crate::extract::StrictQuery;
 use crate::state::AppState;
 
-/// Query parameters for `GET /api/audit-logs`.
+/// Query parameters for `GET /api/audit-logs`. Denies unknown fields — a stray/mistyped parameter
+/// is refused with a `400` naming it, rather than silently ignored (matches every mutating JSON
+/// payload's convention; see `api::keys::CreateKeyPayload`'s doc comment for the fuller rationale).
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AuditLogQuery {
     /// Filter by exact action type (e.g. `KEY_CREATE`).
     pub action: Option<String>,
@@ -29,7 +29,7 @@ pub struct AuditLogQuery {
 pub async fn list_audit_logs(
     State(state): State<AppState>,
     Extension(caller): Extension<api_key::Model>,
-    Query(query): Query<AuditLogQuery>,
+    StrictQuery(query): StrictQuery<AuditLogQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     if !caller.is_master {
         return Err(AppError::Forbidden("Only the Master key can view audit logs".to_owned()));

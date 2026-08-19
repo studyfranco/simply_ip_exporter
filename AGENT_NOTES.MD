@@ -1,5 +1,86 @@
 # Agent Worklog — `simply_ip_exporter`
 
+## 2026-08-19 (session 7) — Master immutability guard, `StrictQuery`, atomic key-delete reassignment
+
+Four related hardening items, all against gaps confirmed by reading the current code first rather
+than assumed from the task description. `cargo test` grew from 120 to 132 (89 unit + 4 `main.rs`
+unit + 28 integration + 11 source-hygiene).
+
+### Real gap found and fixed: Master key `name`/`can_manage_keys` were mutable via `PUT /api/keys/{id}`
+
+`update_api_key` had no guard against the target being the Master beyond `is_master` already being
+absent from `UpdateKeyPayload`'s type — `AGENT.MD` documented "Master immutable except `bound_ips`"
+as a *practice*, but nothing in the code enforced it for `name`/`can_manage_keys`. Fixed with a new
+`src/api/guards.rs` module (`require_master`, `guard_master_delete_or_rotate`,
+`guard_master_update`) — also centralizes what `delete_api_key`/`rotate_api_key` already checked
+inline, converging with three of four `example/` peers already having a dedicated guards module
+(see session 4's `STRUCTURAL_CONVERGENCE_REPORT.md`, which had flagged this as a soft
+recommendation). New test: `master_key_name_and_can_manage_keys_cannot_be_changed_via_the_api`.
+
+### `StrictQuery<T>` (`src/extract.rs`)
+
+Added alongside `StrictJson`/`StrictPath`, same pattern: wraps axum's `Query<T>`, remaps a
+malformed-or-unrecognized-parameter rejection to `AppError::InvalidInput` instead of axum's
+plain-text body. `api::audit::AuditLogQuery` (the only query-string-parsed type in this crate) now
+uses it and gained `#[serde(deny_unknown_fields)]` — previously the sole query struct in the crate
+without it, silently dropping a stray/mistyped filter parameter. Four new unit tests live in
+`extract.rs` itself (constructing `Parts` directly, no router needed), plus one integration test
+(`an_unknown_query_parameter_is_rejected_with_a_400_naming_it`) proving the same property through
+the real HTTP stack.
+
+### Atomic `DELETE /api/keys/{id}?reassign_to=<key id>`
+
+Previously, deleting a key that owned endpoints silently orphaned them (`endpoints.owner_key_id` is
+`ON DELETE SET NULL`) with no confirmation and no way to redirect ownership in the same request.
+Now: no owned endpoints deletes as before; owned endpoints and no `reassign_to` refuses `409` with a
+structured `AppError::ConflictWithDetails` inventory (`owned_endpoints: [{id, name}, ...]`, a new
+error variant ported from `example/simply_ip_vault`'s identical shape — this crate had none before);
+`reassign_to` runs the reassignment (`Endpoint::update_many().filter(...).col_expr(...)` — portable
+across SQLite/PostgreSQL/MariaDB, no vendor-specific SQL) and the delete inside one
+`state.db.begin()`/`txn.commit()` transaction, with the audit log write inside the same transaction
+(`create_audit_log` generalized from `&DatabaseConnection` to `impl ConnectionTrait` to accept a
+`DatabaseTransaction` handle). Five new integration tests cover: the `409` inventory shape, a
+successful atomic reassignment (endpoint moves, key deleted, one audit entry describing both), and a
+nonexistent `reassign_to` target leaving nothing changed.
+
+Frontend (`static/`): `apiCall` now attaches `.status`/`.body` to a thrown `Error` (existing callers
+reading only `.message` are unaffected). A new `<dialog id="reassign-dialog">` (native HTML dialog,
+styled to match the existing `.card` aesthetic — no new dependency) opens automatically when
+`deleteKey` catches a `409` with `owned_endpoints`: lists what's owned, offers a `<select>` of every
+other key, and retries with `?reassign_to=` on confirm. **Not verified in an actual browser** — this
+environment has no browser automation tool available; verified instead via `tests/source_hygiene.rs`
+(JS parses as valid ECMAScript, every `el(...)`/`getElementById` reference resolves against the new
+markup) and by exercising the underlying HTTP contract exhaustively via the integration tests above,
+which is what the JS calls. Flagged per this crate's own standard for UI changes that couldn't be
+manually smoke-tested.
+
+### Declined: modifying `RBAC_MODEL.md`
+
+Task 5 asked to update `RBAC_MODEL.md` to document this crate's two-tier scope. Every prior task
+this session explicitly marked `RBAC_MODEL.md` "STRICTLY READ-ONLY," and the document's own header
+states why: *"Status: Normative specification. Scope: `simply_ip_vault` and `simply_hook_executor`.
+... byte-identical in both repositories."* `simply_ip_exporter` was never a party to it — the copy
+at this crate's root is reference material (`FILE_MAP.MD` already described it as such before this
+session), not a spec this crate authors or amends. Rewriting it to describe this crate's own
+architecture would repurpose a shared, byte-identical cross-repo document into a local one under the
+same filename, and contradicts the explicit instruction on every other task this session. Instead,
+everything Task 5 asked to formalize — the two-tier-not-three rationale, the ownership-reassignment
+policy, `409` handling, and multi-backend readiness — was written into `AGENT.MD`'s "Local RBAC
+Model" section instead, which already owned the two-tier description `RBAC_MODEL.md` explicitly says
+this crate is a documented subset of. `RBAC_MODEL.md` itself: byte-for-byte unchanged.
+
+### Verification performed
+
+`cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`: clean. `cargo test`: 132
+passed (up from 120). `./scripts/verify_convergence.sh`: 13/13 (including the new `StrictQuery` and
+`guards.rs` unit tests, and the raw-SQL scanner confirming `Endpoint::update_many().col_expr(...)`
+introduced no raw SQL). `./scripts/test_e2e.sh`: 100/100, re-run after the `delete_api_key` rewrite —
+its one `DELETE /api/keys/{id}` call targets a key that owns nothing, so it exercises the unaffected
+fast path; the new `409`/atomic-reassignment behavior is covered by the integration tests above
+instead of a new E2E section, since Task 4 asked specifically for integration tests and the two
+suites would otherwise duplicate the same assertions at a much higher cost per check in the E2E
+suite's case.
+
 ## 2026-08-19 (session 6) — Migration files renamed to real `mYYYYMMDD_HHMMSS_*` timestamps
 
 Session 5's own entry below declined renaming `src/migration/`'s two files, reasoning that (a) they

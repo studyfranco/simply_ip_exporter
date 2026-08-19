@@ -33,6 +33,19 @@ pub enum AppError {
     #[error("Conflict: {0}")]
     Conflict(String),
 
+    /// A conflict the caller is expected to *resolve*, carrying the structured detail needed to do
+    /// so — e.g. deleting an API key that still owns endpoints: the inventory of what it owns, so
+    /// the caller can decide whether to reassign or delete them without a second round-trip to
+    /// discover what's blocking the delete. `details` is merged into the response body alongside
+    /// `error`, so a client that only reads `error` behaves exactly as it does for [`Self::Conflict`].
+    #[error("Conflict: {message}")]
+    ConflictWithDetails {
+        /// Human-readable summary, in the same `error` field every other variant uses.
+        message: String,
+        /// Machine-readable detail, merged into the response body at the top level.
+        details: serde_json::Value,
+    },
+
     /// The caller exceeded the anti-DoS rate limit.
     #[error("Too Many Requests: {0}")]
     TooManyRequests(String),
@@ -55,6 +68,20 @@ pub enum AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        // Handled ahead of the flat match: it's the one variant whose body is not just
+        // `{"error": ...}` — the structured detail is merged in at the top level rather than
+        // nested, so `error` reads identically to every other variant for a client that ignores
+        // the rest.
+        if let AppError::ConflictWithDetails { message, details } = self {
+            let mut body = json!({ "error": message });
+            if let (Some(object), Some(extra)) = (body.as_object_mut(), details.as_object()) {
+                for (k, v) in extra {
+                    object.insert(k.clone(), v.clone());
+                }
+            }
+            return (StatusCode::CONFLICT, Json(body)).into_response();
+        }
+
         let (status, error_message) = match self {
             AppError::DbError(err) => {
                 tracing::error!("Database error: {}", err);
@@ -65,6 +92,8 @@ impl IntoResponse for AppError {
             AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg),
             AppError::NotFound => (StatusCode::NOT_FOUND, "Resource not found".to_owned()),
             AppError::Conflict(msg) => (StatusCode::CONFLICT, msg),
+            // Returned above; repeated here only because the match must stay exhaustive.
+            AppError::ConflictWithDetails { message, .. } => (StatusCode::CONFLICT, message),
             AppError::TooManyRequests(msg) => (StatusCode::TOO_MANY_REQUESTS, msg),
             AppError::BodyRejected(status, msg) => (status, msg),
             AppError::Internal => {

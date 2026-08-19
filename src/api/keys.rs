@@ -3,25 +3,19 @@
 
 use axum::{Extension, Json, extract::State, response::IntoResponse};
 use chrono::Utc;
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait};
+use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, TransactionTrait};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use uuid::Uuid;
 
+use crate::api::guards::{guard_master_delete_or_rotate, guard_master_update, require_master};
 use crate::api::support::{create_audit_log, describe_resource, generate_random_key, hash_key, validate_bound_ips};
 use crate::crypto::generate_signing_secret;
-use crate::entities::{api_key, prelude::ApiKey};
+use crate::entities::{api_key, endpoint, prelude::ApiKey, prelude::Endpoint};
 use crate::error::AppError;
-use crate::extract::{StrictJson, StrictPath};
+use crate::extract::{StrictJson, StrictPath, StrictQuery};
 use crate::middleware::ClientIp;
 use crate::state::AppState;
-
-fn require_master(key: &api_key::Model) -> Result<(), AppError> {
-    if key.is_master {
-        Ok(())
-    } else {
-        Err(AppError::Forbidden("Only the Master key can manage API keys".to_owned()))
-    }
-}
 
 /// A key as returned to clients. Never carries `key_hash` or `signing_secret`.
 #[derive(Serialize)]
@@ -171,6 +165,8 @@ pub async fn update_api_key(
     require_master(&caller)?;
 
     let existing = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    guard_master_update(&existing, payload.name.is_some(), payload.can_manage_keys.is_some())?;
+
     let mut active: api_key::ActiveModel = existing.into();
     let mut changed: Vec<&str> = Vec::new();
 
@@ -210,33 +206,108 @@ pub async fn update_api_key(
     Ok(Json(KeyResponse::from(updated)))
 }
 
+/// Query parameters for `DELETE /api/keys/{id}`.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteKeyQuery {
+    /// If the target key owns any endpoints, they are reassigned to this key — in the same
+    /// transaction as the delete — instead of being refused. Omit when the target owns nothing.
+    #[serde(default)]
+    pub reassign_to: Option<Uuid>,
+}
+
 /// `DELETE /api/keys/{id}` — removes a key. The Master key cannot be deleted through the API.
+///
+/// If the key owns any endpoints and no `?reassign_to=<key id>` is given, refuses with `409
+/// Conflict` and a structured inventory of what it owns, so the caller knows what's blocking the
+/// delete without a second round-trip to discover it. With `reassign_to`, the reassignment and the
+/// delete happen inside one database transaction, isolated from concurrent readers/writers and
+/// expressed entirely through SeaORM's query builder (`Entity::update_many().col_expr(...)`) —
+/// portable across SQLite, PostgreSQL, and MariaDB with no vendor-specific SQL.
 pub async fn delete_api_key(
     State(state): State<AppState>,
     Extension(caller): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
     StrictPath(id): StrictPath,
+    StrictQuery(query): StrictQuery<DeleteKeyQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     require_master(&caller)?;
 
     let existing = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
-    if existing.is_master {
-        return Err(AppError::Forbidden("The Master key cannot be deleted through the API".to_owned()));
+    guard_master_delete_or_rotate(&existing, "deleted")?;
+
+    if query.reassign_to == Some(id) {
+        return Err(AppError::InvalidInput("reassign_to cannot name the key being deleted".to_owned()));
     }
 
     // Captured before the row is gone, since the audit entry must describe what was deleted.
     let target_resource = describe_resource("api_key", existing.id, &existing.name);
+    let now = Utc::now().naive_utc();
+
+    // Explicit `begin()`/`commit()` (rather than the `db.transaction(|txn| ...)` closure helper)
+    // for control over the early-return branches below: a `409` on the no-`reassign_to` path and a
+    // `404` on the concurrent-delete race both need to leave the transaction uncommitted, which a
+    // plain `return Err(...)` here does automatically — `DatabaseTransaction` rolls back on drop
+    // when it was never committed, the same guarantee sqlx's own `Transaction` gives.
+    let txn = state.db.begin().await?;
+
+    let owned_endpoints = Endpoint::find().filter(endpoint::Column::OwnerKeyId.eq(id)).all(&txn).await?;
+
+    let reassign_target = match query.reassign_to {
+        Some(target_id) => Some(
+            ApiKey::find_by_id(target_id)
+                .one(&txn)
+                .await?
+                .ok_or_else(|| AppError::InvalidInput("reassign_to does not name an existing key".to_owned()))?,
+        ),
+        None => {
+            if !owned_endpoints.is_empty() {
+                let inventory: Vec<_> =
+                    owned_endpoints.iter().map(|e| json!({ "id": e.id, "name": e.name })).collect();
+                return Err(AppError::ConflictWithDetails {
+                    message: format!(
+                        "this key still owns {} endpoint(s); reassign or delete them first, or retry with \
+                         ?reassign_to=<key id>",
+                        owned_endpoints.len()
+                    ),
+                    details: json!({ "owned_endpoints": inventory }),
+                });
+            }
+            None
+        }
+    };
+
+    if let Some(target) = &reassign_target {
+        Endpoint::update_many()
+            .filter(endpoint::Column::OwnerKeyId.eq(id))
+            .col_expr(endpoint::Column::OwnerKeyId, sea_orm::sea_query::Expr::value(target.id))
+            .col_expr(endpoint::Column::UpdatedAt, sea_orm::sea_query::Expr::value(now))
+            .exec(&txn)
+            .await?;
+    }
 
     // See the identical race in `api::endpoints::delete_endpoint` for why `rows_affected` (not
     // just "did the query error?") is what a second, concurrent delete of the same key must be
     // judged on: a `404`, and no second `KEY_DELETE` audit entry for a deletion this request did
-    // not actually perform.
-    let result = ApiKey::delete_by_id(id).exec(&state.db).await?;
+    // not actually perform. Reached after the reassignment above, so a losing concurrent request
+    // rolls back its reassignment too, rather than leaving endpoints reassigned out from under a
+    // key delete that itself never took effect.
+    let result = ApiKey::delete_by_id(id).exec(&txn).await?;
     if result.rows_affected == 0 {
         return Err(AppError::NotFound);
     }
 
-    create_audit_log(&state.db, &caller, client_ip.0, "KEY_DELETE", Some(target_resource), None).await?;
+    let details = reassign_target.as_ref().map(|target| {
+        format!(
+            "reassigned {} endpoint(s) to {} ({}); key deleted",
+            owned_endpoints.len(),
+            target.name,
+            target.id
+        )
+    });
+    create_audit_log(&txn, &caller, client_ip.0, "KEY_DELETE", Some(target_resource), details).await?;
+
+    txn.commit().await?;
 
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
@@ -251,12 +322,7 @@ pub async fn rotate_api_key(
     require_master(&caller)?;
 
     let existing = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
-    if existing.is_master {
-        return Err(AppError::Forbidden(
-            "The Master key cannot be rotated through the API; regenerate it in the database"
-                .to_owned(),
-        ));
-    }
+    guard_master_delete_or_rotate(&existing, "rotated")?;
 
     let plaintext_key = generate_random_key();
     let signing_secret = generate_signing_secret();

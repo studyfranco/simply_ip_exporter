@@ -137,7 +137,14 @@ async function apiCall(method, path, bodyObj) {
   const text = await response.text();
   const json = text ? JSON.parse(text) : null;
   if (!response.ok) {
-    throw new Error((json && json.error) || `HTTP ${response.status}`);
+    const err = new Error((json && json.error) || `HTTP ${response.status}`);
+    // Most callers only ever read `.message` (unchanged behavior). A caller that needs to react to
+    // *which* error this was — e.g. the key-deletion flow distinguishing a 409's structured
+    // `owned_endpoints` inventory from every other failure — reads `.status`/`.body` instead of
+    // parsing the message string back apart.
+    err.status = response.status;
+    err.body = json;
+    throw err;
   }
   return json;
 }
@@ -268,8 +275,7 @@ async function loadKeys() {
   tbody.querySelectorAll('[data-delete-key]').forEach((btn) => {
     btn.addEventListener('click', async () => {
       if (!confirm('Delete this key?')) return;
-      await apiCall('DELETE', `/api/keys/${btn.dataset.deleteKey}`);
-      await loadKeys();
+      await deleteKey(btn.dataset.deleteKey, keys);
     });
   });
   tbody.querySelectorAll('[data-rotate-key]').forEach((btn) => {
@@ -280,6 +286,66 @@ async function loadKeys() {
       await loadKeys();
     });
   });
+}
+
+// Deletes a key, handling the 409 "still owns endpoints" case by opening the reassignment dialog
+// rather than failing silently or dumping a raw error string on the caller. `allKeys` is the
+// already-fetched key list `loadKeys` just rendered, reused as the reassignment dropdown's
+// candidate set so opening the dialog needs no extra round-trip.
+async function deleteKey(keyId, allKeys) {
+  try {
+    await apiCall('DELETE', `/api/keys/${keyId}`);
+    await loadKeys();
+    await loadEndpoints();
+  } catch (e) {
+    if (e.status === 409 && e.body && Array.isArray(e.body.owned_endpoints)) {
+      openReassignDialog(keyId, e.body.owned_endpoints, allKeys);
+    } else {
+      alert(e.message);
+    }
+  }
+}
+
+// Lists the endpoints blocking a key's deletion and lets the operator pick another key to receive
+// them before retrying the delete with ?reassign_to=<id> — the reassignment and the delete happen
+// together, atomically, on the server (api::keys::delete_api_key).
+function openReassignDialog(keyId, ownedEndpoints, allKeys) {
+  const dialog = el('reassign-dialog');
+  el('reassign-summary').textContent =
+    `This key still owns ${ownedEndpoints.length} endpoint(s). Choose another key to take ownership, ` +
+    'or cancel and reassign/delete them individually first.';
+
+  el('reassign-endpoint-list').innerHTML =
+    ownedEndpoints.map((ep) => `<li>${escapeHtml(ep.name)}</li>`).join('');
+
+  const select = el('reassign-target');
+  const candidates = allKeys.filter((k) => k.id !== keyId);
+  select.innerHTML = candidates
+    .map((k) => `<option value="${k.id}">${escapeHtml(k.name)}${k.is_master ? ' (Master)' : ''}</option>`)
+    .join('');
+
+  hideError('reassign-error');
+
+  // Assigned (not addEventListener'd) so a second delete attempt replaces the previous attempt's
+  // closure over `keyId`/`allKeys` rather than stacking a second listener beside it.
+  el('reassign-cancel-btn').onclick = () => dialog.close();
+  el('reassign-confirm-btn').onclick = async () => {
+    hideError('reassign-error');
+    if (!select.value) {
+      showError('reassign-error', 'No other key exists to receive these endpoints.');
+      return;
+    }
+    try {
+      await apiCall('DELETE', `/api/keys/${keyId}?reassign_to=${encodeURIComponent(select.value)}`);
+      dialog.close();
+      await loadKeys();
+      await loadEndpoints();
+    } catch (e) {
+      showError('reassign-error', e.message);
+    }
+  };
+
+  dialog.showModal();
 }
 
 function showMintedKey(minted) {

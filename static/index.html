@@ -95,6 +95,19 @@
         </form>
       </section>
 
+      <dialog id="reassign-dialog">
+        <h2>This key owns endpoints</h2>
+        <p id="reassign-summary" class="dim"></p>
+        <ul id="reassign-endpoint-list"></ul>
+        <label for="reassign-target">Reassign them to</label>
+        <select id="reassign-target"></select>
+        <div class="row" style="margin-top:16px">
+          <button id="reassign-confirm-btn" type="button" class="danger">Reassign &amp; delete</button>
+          <button id="reassign-cancel-btn" type="button" class="secondary">Cancel</button>
+        </div>
+        <div id="reassign-error" class="error hidden"></div>
+      </dialog>
+
       <section class="card hidden" id="audit-card">
         <h2>Audit Logs (Master only)</h2>
         <div class="row">
