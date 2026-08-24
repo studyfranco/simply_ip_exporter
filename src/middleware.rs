@@ -85,8 +85,12 @@ pub async fn auth_middleware(
     req: Request<Body>,
     next: Next,
 ) -> Result<Response, AppError> {
-    let client_ip =
-        resolve_client_ip(addr.ip(), &headers, state.config.trusted_proxies.networks());
+    // `resolved()` is what turns a hostname entry into addresses. Awaited per request so a
+    // container that moved is picked up within the DNS reuse window rather than at the next
+    // restart; with no hostnames configured it's a refcount bump and touches neither lock nor
+    // resolver — see `config::TrustedProxies::resolved`.
+    let trusted_proxies = state.config.trusted_proxies.resolved().await;
+    let client_ip = resolve_client_ip(addr.ip(), &headers, &trusted_proxies);
 
     let presented_key = headers
         .get(API_KEY_HEADER)

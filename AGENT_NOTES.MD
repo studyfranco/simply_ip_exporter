@@ -1,5 +1,84 @@
 # Agent Worklog — `simply_ip_exporter`
 
+## 2026-08-19 (session 8) — `TRUSTED_PROXIES` hostname/DNS resolution (Docker container names)
+
+Fixed a real startup bug: `TRUSTED_PROXIES=traefik_tomidejetsu` (or any hostname/Docker container
+name) failed startup with `FATAL: TRUSTED_PROXIES entry 'traefik_tomidejetsu' is not a valid IP
+address or CIDR range` — `config.rs` only ever accepted `IpAddr`/`IpNet`. `cargo test` grew from 132
+to 145 (102 unit + 4 `main.rs` unit + 28 integration + 11 source-hygiene).
+
+### Design: ported from `example/simply_ip_vault`/`example/simply_hook_executor`, not built fresh
+
+The task's own guideline block asked for a simpler fail-fast scheme ("if DNS resolution fails,
+exit 1"), which conflicts with what those two peers actually do — mid-task, explicitly directed to
+copy their design instead, which is what shipped. Peers pulled fresh first: `simply_ip_vault`
+`cd3ed25`, `simply_hook_executor` `d6070d3`.
+
+The peers' actual design is more nuanced than "fail fast" and deliberately so, per their own doc
+comments (ported near-verbatim into this crate's `config.rs`):
+- **Syntax is checked at parse time and is still fatal.** An entry that is neither an address, a
+  CIDR, nor shaped like a hostname at all (`hostname_rejection`: contains `/`/`:`, digits-and-dots
+  only, bad edge characters, >253 chars) aborts startup exactly as before — this half of the
+  original task instruction (and the current behavior for a *genuine* typo) is unchanged.
+- **DNS resolution is explicitly not part of that fatal check.** A well-formed hostname is accepted
+  at parse time whether or not it currently resolves. Actual resolution happens later, asynchronously,
+  and never blocks or fails startup: `TrustedProxies::prime_with_grace()` resolves once immediately
+  (so a typo'd-but-well-formed name is still visible in the boot log), and if anything failed, once
+  more after a 60s grace period — because a daemon and its reverse proxy commonly start together,
+  and the proxy's DNS record may not exist for the daemon's first few seconds. Failing startup over
+  that would turn an ordinary boot race into a crash loop, strictly worse than serving with one
+  proxy entry temporarily untrusted. An unresolvable entry simply isn't trusted until it resolves —
+  fails closed, per-entry, never service-wide.
+- **Per-request resolution is cached** (30s positive / 5s negative TTL, matching the peers exactly)
+  so a hot path behind a dead hostname can't turn this service into a DNS-amplification vector — a
+  bounded one query per name per interval, not one query per inbound request.
+
+### What changed
+
+- `src/config.rs`: `TrustedProxies` rewritten from a flat `Vec<IpNet>` wrapper into an `Arc`-backed
+  struct holding precomputed literal networks, unresolved hostnames, and an async
+  `tokio::sync::RwLock`-guarded resolution cache. New: `ProxyMatcher` (`Network`/`Hostname`),
+  `InvalidProxyEntry`/`InvalidTrustedProxies` (replacing the old single-entry `TrustedProxyError`),
+  `hostname_rejection`, `resolve_hostname` (the actual `tokio::net::lookup_host` call),
+  `resolved()`/`prime()`/`prime_with_grace()`. `parse_trusted_proxies` is now purely syntactic
+  (`Result<Vec<ProxyMatcher>, Vec<InvalidProxyEntry>>` — no I/O), collecting *every* bad entry
+  rather than just the first. `RuntimeConfig` is no longer `PartialEq` (the resolution cache holds
+  an `RwLock`, which has none; nothing in this crate compared whole configs).
+- `src/main.rs`: one new line, `state.config.trusted_proxies.prime_with_grace();`, placed after
+  `pin_at_boot` (matching the peers' ordering — after the database/master are ready, before
+  spawning the sync worker).
+- `src/middleware.rs`, `src/feed.rs`: both call sites of `resolve_client_ip` now
+  `.resolved().await` the trust set first instead of reading a precomputed slice directly — the one
+  ripple from the resolution cache being genuinely async. Both handlers were already `async fn`, so
+  this is a two-line change at each site, not a signature change.
+- 19 new/rewritten unit tests in `config.rs`: matcher-kind parsing (address/CIDR/hostname,
+  including the literal `traefik_tomidejetsu` motivating case), every `hostname_rejection` edge
+  case, multi-entry error collection, and five `#[tokio::test]`s exercising real DNS behavior —
+  `localhost` (resolvable via `/etc/hosts` in any sandboxed test environment, no real network
+  needed) for the success path, a `.invalid`-TLD name (RFC 2606, guaranteed never to resolve) for
+  the failure path, `prime()` naming which hostname failed, and the full `resolve_client_ip`
+  pipeline against a resolved hostname end-to-end.
+
+### Verification performed
+
+`cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`: clean. `cargo test`: 145
+passed, including the DNS-dependent tests completing in well under a second in this sandbox (the
+`.invalid` lookup fails fast rather than hanging — worth re-checking if this suite ever moves to an
+environment with different resolver behavior, since a hung DNS query in a test would be a slow test,
+not a wrong one). `./scripts/verify_convergence.sh`: 13/13. `./scripts/test_e2e.sh`: 100/100
+(`TRUSTED_PROXIES=127.0.0.1` there, a literal — unaffected by this change; exercises the resolution
+path's steady-state no-op case through a real restart cycle).
+
+**Manual smoke test reproducing the exact reported bug**: booted the real binary with
+`TRUSTED_PROXIES="localhost,this-hostname-does-not-exist.invalid"` (a real hostname alongside a
+guaranteed-unresolvable one, mirroring `traefik_tomidejetsu` alongside a possible typo). Before this
+change this would have been `FATAL` and exited immediately. Observed instead: clean boot, `GET
+/ready` → `200`, log line `TRUSTED_PROXIES is set: forwarding headers are honoured from 2
+matcher(s): [Hostname("localhost"), Hostname("this-hostname-does-not-exist.invalid")]` at startup,
+and — after `prime_with_grace`'s immediate resolution attempt — a `WARN`/`ERROR` pair naming
+specifically the unresolvable entry ("NOT trusted... every other entry is unaffected and the
+service is serving normally. Retrying in 60s") while the process kept serving.
+
 ## 2026-08-19 (session 7) — Master immutability guard, `StrictQuery`, atomic key-delete reassignment
 
 Four related hardening items, all against gaps confirmed by reading the current code first rather

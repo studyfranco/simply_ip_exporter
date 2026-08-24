@@ -144,7 +144,7 @@ All configuration is environment-variable driven; nothing security-relevant has 
 | `VAULT_BASE_URL` | *(unset)* | Base URL of the `simply_ip_vault` instance to sync from, e.g. `http://vault:3000`. Sync stays idle (feeds remain empty) until this and the two variables below are all set. |
 | `VAULT_API_KEY` | *(unset)* | The `X-API-Key` used to authenticate outbound requests to Vault. Should belong to a Vault key scoped `can_read`-only on the groups this exporter needs. |
 | `VAULT_SIGNING_SECRET` | *(unset)* | The HMAC-SHA256 signing secret paired with `VAULT_API_KEY`. |
-| `TRUSTED_PROXIES` | *(unset)* | Comma-separated CIDR ranges or bare IPs. `X-Forwarded-For`/`X-Real-IP` are honored **only** from these peers; everything else is matched against the raw TCP connection. Leave unset for a directly-exposed deployment. |
+| `TRUSTED_PROXIES` | *(unset)* | Comma-separated CIDR ranges, bare IPs, or hostnames/Docker container names (e.g. `traefik_tomidejetsu`), resolved via DNS and re-checked periodically. `X-Forwarded-For`/`X-Real-IP` are honored **only** from these peers; everything else is matched against the raw TCP connection. A malformed entry is fatal at startup; a well-formed hostname that doesn't currently resolve is not — it's simply untrusted until it does, retried automatically. Leave unset for a directly-exposed deployment. |
 | `SIGNATURE_MAX_AGE_SECONDS` | `300` | Symmetric freshness window (±) for `X-Timestamp` on signed `/api/*` requests. |
 | `INITIAL_MASTER_KEY` / `INITIAL_MASTER_SIGNING_SECRET` | *(unset)* | Deterministic bootstrap credentials for test/CI (see `scripts/test_e2e.sh`). Each must be exactly 64 hex characters if set. **Do not set these in a real deployment** — let the daemon generate a random Master key. |
 | `BOOTSTRAP_SUBNET` | `0.0.0.0/0,::/0` | `bound_ips` assigned to the auto-generated Master key. |
@@ -248,7 +248,7 @@ orchestrators, load balancers) cannot compute an HMAC signature.
 ```sh
 cargo check --all-targets
 cargo clippy --all-targets -- -D warnings
-cargo test                     # 89 unit + 4 main.rs unit + 28 integration + 11 source-hygiene tests
+cargo test                     # 102 unit + 4 main.rs unit + 28 integration + 11 source-hygiene tests
 ./scripts/verify_convergence.sh  # source hygiene (raw SQL, unwrap/expect, frontend syntax/DOM refs) + clippy -D warnings + cargo test, one gate
 ./scripts/test_e2e.sh          # full live E2E against a real simply_ip_vault + simply_ip_exporter pair
 ```

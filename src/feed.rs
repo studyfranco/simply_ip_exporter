@@ -32,8 +32,10 @@ pub async fn serve_feed(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let client_ip =
-        resolve_client_ip(addr.ip(), &headers, state.config.trusted_proxies.networks());
+    // See `middleware::auth_middleware`'s identical call for why this is awaited per request
+    // rather than resolved once at startup.
+    let trusted_proxies = state.config.trusted_proxies.resolved().await;
+    let client_ip = resolve_client_ip(addr.ip(), &headers, &trusted_proxies);
 
     let ep = Endpoint::find()
         .filter(endpoint::Column::TokenSecret.eq(token_secret))

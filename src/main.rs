@@ -223,6 +223,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     state.master_pin.pin_at_boot(&state.db).await?;
 
+    // Resolve every configured TRUSTED_PROXIES hostname once, now, so a typo is reported at boot
+    // rather than discovered as an unexplained 403 later. Detached and non-blocking: an
+    // unresolvable entry is retried after a grace period and disabled meanwhile, never a reason to
+    // refuse to start — see `config::TrustedProxies::prime_with_grace`.
+    state.config.trusted_proxies.prime_with_grace();
+
     if state.vault_client.is_some() {
         tracing::info!("simply_ip_vault sync is configured; starting the background sync worker.");
     } else {

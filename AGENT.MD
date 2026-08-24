@@ -152,7 +152,17 @@ To protect the underlying storage hardware, **IP records are kept strictly in-me
 #### IP Extraction & Trusted Proxies
 - Respect `X-Forwarded-For` / `X-Real-IP` **only** when TCP peer is in `TRUSTED_PROXIES`.
 - Walk `X-Forwarded-For` right-to-left, skipping trusted proxy hops.
-- Invalid syntax in `TRUSTED_PROXIES` is fatal at startup.
+- `TRUSTED_PROXIES` entries may be a literal address, a CIDR range, **or a hostname/Docker
+  container name** (2026-08-19, e.g. `traefik_tomidejetsu`), resolved via DNS
+  (`config::TrustedProxies`, ported from `example/simply_ip_vault`/`example/simply_hook_executor`'s
+  identical design — see `AGENT_NOTES.MD`). A well-formed hostname is accepted **whether or not it
+  currently resolves**; only a genuinely unparseable entry (not an address, not a CIDR, not shaped
+  like a hostname) is fatal at startup. An unresolvable hostname is not trusted until it resolves
+  (fails closed, per-entry, not service-wide) and is retried in the background: once immediately at
+  boot, once more after a 60s grace period (a container and its reverse proxy often start
+  together, and the proxy's DNS record may not exist for the first few seconds), and thereafter on
+  every request whose 30s/5s positive/negative cache entry has expired. Startup is never blocked
+  waiting on DNS.
 
 ---
 
