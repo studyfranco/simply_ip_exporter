@@ -464,3 +464,57 @@ fn the_dom_id_check_rejects_a_reference_to_a_nonexistent_id() {
     let defined = extract_html_ids(html);
     assert!(!defined.contains("totally-made-up-id"), "the fixture must not accidentally define it");
 }
+
+/// Every `fetch(...)` call whose first argument is a string/template literal starting with `/`
+/// bypasses `REQUEST_BASE` (see the "Proxy-aware base paths" section of `app.js`) and hardcodes a
+/// root-relative URL — exactly the bug that breaks this dashboard when it's mounted behind a
+/// reverse proxy under a subpath. `apiCall`'s own `fetch(requestUrl, ...)` call is fine (its
+/// argument is a variable, not a literal); this only flags a *literal* absolute path.
+fn hardcoded_absolute_fetch_calls(source: &str) -> Vec<String> {
+    let mut violations = Vec::new();
+    let mut rest = source;
+    let mut consumed = 0usize;
+    while let Some(start) = rest.find("fetch(") {
+        let after = &rest[start + "fetch(".len()..];
+        let trimmed = after.trim_start();
+        let quote = trimmed.chars().next();
+        if let Some(q) = quote.filter(|c| *c == '\'' || *c == '"' || *c == '`') {
+            let arg = &trimmed[1..];
+            if arg.starts_with('/') {
+                let offset = consumed + start;
+                let line = source[..offset].matches('\n').count() + 1;
+                let snippet: String = arg.chars().take(30).collect();
+                violations.push(format!("{line}: fetch({q}{snippet}..."));
+            }
+        }
+        consumed += start + "fetch(".len();
+        rest = after;
+    }
+    violations
+}
+
+#[test]
+fn no_hardcoded_absolute_path_bypasses_the_subpath_request_base() {
+    let app_js = std::fs::read_to_string(repo_path("static/app.js")).expect("static/app.js must be readable");
+    let violations = hardcoded_absolute_fetch_calls(&app_js);
+    assert!(
+        violations.is_empty(),
+        "static/app.js calls fetch() with a hardcoded absolute path, bypassing REQUEST_BASE \
+         and breaking reverse-proxy subpath deployments: {violations:?}"
+    );
+}
+
+/// A check that has never been shown to fail is not evidence of anything: this feeds it a
+/// deliberately hardcoded `fetch('/api/...')` call and asserts it is caught.
+#[test]
+fn the_hardcoded_fetch_check_rejects_a_literal_absolute_path() {
+    let js = "async function bad() { return fetch('/api/auth/me'); }";
+    let violations = hardcoded_absolute_fetch_calls(js);
+    assert_eq!(violations.len(), 1, "must flag the literal absolute fetch() call");
+
+    let ok = "async function good() { return fetch(requestUrl, opts); }";
+    assert!(
+        hardcoded_absolute_fetch_calls(ok).is_empty(),
+        "must not flag a fetch() call whose argument is a variable"
+    );
+}

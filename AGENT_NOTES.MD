@@ -1,5 +1,113 @@
 # Agent Worklog — `simply_ip_exporter`
 
+## 2026-08-24 (session 9) — Frontend CSS/HTML harmonization + reverse-proxy subpath resolution
+
+Two related frontend tasks landed together since both touch `static/app.js`/`static/index.html`.
+`cargo test` grew from 145 to 147 (102 unit + 4 `main.rs` unit + 28 integration + 13 source-hygiene
+— two new hygiene tests for the subpath check).
+
+### Task A: visual/CSS harmonization with `example/simply_ip_vault` / `example/simply_hook_executor`
+
+Pulled both peers fresh (`simply_ip_vault` → `8d53525`, `simply_hook_executor` already at `d6070d3`)
+and read their `static/style.css` in full. Their `:root` design-token block is byte-identical
+between the two (`--bg-main: #232629`, `--accent: #1cdc9a`, `--font-sans`/`--font-mono` names,
+radii, shadows, transition timings) — one canonical token layer shared by both, used here as the
+single source of truth. A follow-up diff of the two peers' component-level CSS beyond `:root` found
+divergence only in page-specific layout (`simply_hook_executor`'s `.grid-layout` two-column
+dashboard, its wider fluid `max-width: 1800px` container vs. vault's fixed `1280px`) — none of it
+touches the shared component vocabulary (`.card`, `.btn-*`, `.badge`, `.data-table`, `.input-field`,
+modals, toasts), so nothing further needed reconciling between the two before porting.
+
+`static/style.css` was rewritten wholesale with the peers' tokens and component classes
+(`.header`/`.logo`/`.logo-icon`, `.card`, `.btn-primary/secondary/danger/logout/cancel`,
+`.form-group`/`.input-field`/`.select-field`/`.field-hint`, `.data-table` with hover/zebra/
+`.table-empty`, `.badge`/`.badge-tier-master`/`.badge-tier-daughter`, `.toast-container`/`.toast`,
+uniform `input[type=checkbox]` theming). Two deliberate deviations from a literal port, both noted
+in `style.css`'s own comments:
+- **Kept the native `<dialog>` for the key-reassignment confirmation** rather than adopting vault's
+  div-based `.modal-overlay`/`.modal-card` mechanism — `<dialog>` already provides its own top-layer
+  stacking and focus trap, and the task's "zero regressions... modal behaviors" constraint protected
+  the existing element. Restyled only (background/radius/shadow/typography) to match vault's modal
+  look.
+- `.btn-cancel` uses vault's own blue-slate palette (not a literal `.btn-secondary` reuse) so the
+  reassignment dialog's safe "Cancel" reads as its own affordance next to the red "Reassign &
+  delete" button, matching vault's stated rationale for the same distinction.
+
+`static/index.html` was restructured to vault's markup conventions (`.login-screen`/`.login-card`,
+`.header`/`.header-actions`, `.table-container` wrapping every `<table>`, `.form-group`-wrapped
+inputs) while preserving **every** existing `id="..."` attribute `app.js` depends on — verified by
+`tests/source_hygiene.rs::every_dom_id_referenced_in_app_js_exists_in_index_html`, unchanged and
+still passing. `static/app.js`'s dynamically-generated markup (badge/button class strings in
+`renderIdentity`, `loadKeys`, `loadEndpoints`) was updated to match, and each of the three tables
+(`endpoints-body`, `keys-body`, `audit-body`) gained an empty-state row (`.table-empty`) where none
+existed before. The `deleteKey()` non-409 error path (previously a bare `alert(e.message)`) now
+raises a `.toast-error` instead — a leftover from before this dashboard had any toast affordance at
+all.
+
+**Pre-existing bug fixed in passing:** `#minted-key-box` had no `hidden` class in the original
+`index.html`, even though `app.js`'s `showMintedKey()`/dismiss-button pair only makes sense if it
+starts hidden (`classList.remove('hidden')` on mint, `.add('hidden')` on dismiss) — meaning the
+empty "New credential" card was visible on every fresh dashboard load before any key was ever
+minted. Fixed by adding `hidden` to its default class list.
+
+### Task B: reverse-proxy subpath resolution
+
+Real deployment bug: mounting this dashboard behind a reverse proxy under a subpath (e.g.
+`https://host/ip_exporter/`) broke every API call, because `app.js` fetched hardcoded root-relative
+paths (`/api/auth/me`) instead of resolving them against the page's actual mount point. Audited
+`example/simply_ip_vault/static/app.js`'s `FirewallClient` class (`deriveRequestBase`,
+`normalizeBasePath`, the `requestBase`/`signingBase` split) — `simply_hook_executor`'s
+`HookExecutorClient` carries the identical pattern.
+
+Ported the same two-base design, adapted to this crate's plain-function `apiCall(method, path,
+bodyObj)` style rather than vault's class-based client (`path` here already includes the leading
+`/api`, unlike vault's bare `/auth/me`-style endpoints):
+- `REQUEST_BASE` (`deriveRequestBase()`) — computed once from `window.location.pathname`'s
+  directory. `/` → `''` (byte-identical behavior to before this change for a direct, non-proxied
+  deployment); `/ip_exporter/index.html` → `/ip_exporter`. This is where the *browser* sends the
+  request — `fetch(`${REQUEST_BASE}${path}`, ...)`.
+- `Session.apiBaseOverride` — what gets *signed* in front of `path`. Defaults to `''` (sign `path`
+  unchanged), which is correct both for direct deployment and for the common reverse-proxy case
+  where the proxy strips its own prefix before forwarding to this process — i.e. the fix works with
+  **zero operator configuration** for the ordinary case. The override (a new "API base path
+  override" field on the login form, `#login-api-base`, sessionStorage-backed) exists only for the
+  uncommon case where the proxy does *not* strip its prefix, so this process itself sees the full
+  `/ip_exporter/api/...` path and the CANONICAL_V1 signature must be computed over that instead.
+  Kept independent of `Session.clear()` (logout) — it describes the deployment, not the credential,
+  so an operator behind a non-stripping proxy doesn't have to retype it every session.
+
+Deviated from vault's `localStorage`-backed override in one respect: kept it in `sessionStorage`,
+matching this crate's existing (not vault's) convention of never persisting credentials/config
+across browser restarts — noted here since it's the one place this port doesn't mirror vault
+byte-for-byte.
+
+Added two `tests/source_hygiene.rs` checks: `no_hardcoded_absolute_path_bypasses_the_subpath_
+request_base` scans `static/app.js` for any `fetch(` call whose first argument is a string/template
+literal starting with `/` (the exact bug class this fix closes — `apiCall`'s own `fetch(requestUrl,
+...)` call is a variable, not a literal, so it doesn't trip the check), plus a self-test
+(`the_hardcoded_fetch_check_rejects_a_literal_absolute_path`) proving the check actually fires
+against a deliberately broken fixture before trusting it against the real file.
+
+### An unrelated build breakage found and fixed along the way
+
+`Cargo.toml`'s `oxc_allocator`/`oxc_parser`/`oxc_span` dev-dependencies had been bumped to `0.147`
+by a concurrent process outside this session (visible mid-task as an out-of-band diff, consistent
+with this repo's established pattern of not reverting such bumps). `0.147` requires rustc 1.96;
+this environment has 1.95.0, so `cargo check` failed outright before any of the above could be
+verified. Downgraded the pin to `=0.145.0` (the version already present in the local registry
+cache, and the version this crate used before the bump) and ran `cargo update -p oxc_parser
+--precise 0.145.0` to bring `Cargo.lock` back in sync. Also restored the `=` exact-pin form the
+dependency's own doc comment says it should have (the 0.147 bump had silently dropped it, allowing
+a caret range on a pre-1.0 crate — exactly what the comment warns against).
+
+### Verification performed
+
+- `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`: clean.
+- `cargo test`: 147 passed, 0 failed (102 unit + 4 `main.rs` unit + 28 integration + 13
+  source-hygiene).
+- `./scripts/verify_convergence.sh`: all 13 named checks pass.
+- `./scripts/test_e2e.sh`: 100/100 checks pass.
+
 ## 2026-08-19 (session 8) — `TRUSTED_PROXIES` hostname/DNS resolution (Docker container names)
 
 Fixed a real startup bug: `TRUSTED_PROXIES=traefik_tomidejetsu` (or any hostname/Docker container

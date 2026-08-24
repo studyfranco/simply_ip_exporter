@@ -232,6 +232,12 @@ GET /feed/v1/<token_secret>/list.txt
 4. If pfSense reaches the exporter through a reverse proxy or load balancer, set `TRUSTED_PROXIES`
    to that proxy's address so `bound_ips` (if configured on the endpoint) evaluates the real
    client address rather than the proxy's.
+5. The admin web UI (`static/`) works unmodified when mounted under a subpath (e.g.
+   `https://host/ip_exporter/`) — it derives its own API base path from the page's URL, no
+   configuration needed, as long as the proxy strips its prefix before forwarding to this service
+   (the common case). If it does *not* strip the prefix, set the "API base path override" field on
+   the login screen to that prefix so client-side request signing matches what this process
+   actually receives.
 
 ## Probes
 
@@ -248,7 +254,7 @@ orchestrators, load balancers) cannot compute an HMAC signature.
 ```sh
 cargo check --all-targets
 cargo clippy --all-targets -- -D warnings
-cargo test                     # 102 unit + 4 main.rs unit + 28 integration + 11 source-hygiene tests
+cargo test                     # 102 unit + 4 main.rs unit + 28 integration + 13 source-hygiene tests
 ./scripts/verify_convergence.sh  # source hygiene (raw SQL, unwrap/expect, frontend syntax/DOM refs) + clippy -D warnings + cargo test, one gate
 ./scripts/test_e2e.sh          # full live E2E against a real simply_ip_vault + simply_ip_exporter pair
 ```

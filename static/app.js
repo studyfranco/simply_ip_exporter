@@ -102,13 +102,56 @@ async function hmacSign(secret, method, target, timestamp, body) {
   return 'sha256=' + toHex(PureCrypto.hmacSha256(secretBytes, messageBytes));
 }
 
+// ── Proxy-aware base paths ──────────────────────────────────────────────────
+// Two distinct bases, because behind a reverse proxy they are genuinely different paths:
+//
+//   REQUEST_BASE — where to SEND. Derived from the directory this page is served from, so a
+//                  dashboard mounted at /ip_exporter/ fetches /ip_exporter/api/... with no
+//                  configuration. Computed once at load: the page's own location never changes
+//                  under it.
+//   apiBaseOverride — what to SIGN in front of `path`. The prefix this process itself sees after
+//                  the proxy is done rewriting, which no amount of introspection in the browser
+//                  can discover — hence the override field on the login form. Defaults to '' (sign
+//                  `path` exactly as called), which is correct for both a direct deployment and
+//                  the common reverse-proxy case where the proxy strips its own prefix before
+//                  forwarding here.
+//
+// Signing the browser's own request URL instead would break the moment a stripping proxy is in
+// front: this service would verify '/api/auth/me' against a signature computed over
+// '/ip_exporter/api/auth/me'.
+
+/** Trims a user-typed override, guarantees exactly one leading slash and no trailing one, and
+ * collapses a blank entry to '' (meaning "sign `path` unchanged"). Idempotent. */
+function normalizeBasePath(raw) {
+  const trimmed = (raw || '').trim();
+  if (!trimmed) return '';
+  return '/' + trimmed.replace(/^\/+/, '').replace(/\/+$/, '');
+}
+
+/** The directory this page was served from: '/ip_exporter/index.html' → '/ip_exporter', '/' → ''. */
+function deriveRequestBase() {
+  const path = window.location.pathname;
+  const dir = path.slice(0, path.lastIndexOf('/') + 1) || '/';
+  return dir.replace(/\/+$/, '');
+}
+
+const REQUEST_BASE = deriveRequestBase();
+
 // ── Session & API client ────────────────────────────────────────────────────
 const Session = {
   get apiKey() { return sessionStorage.getItem('sie_api_key') || ''; },
   get signingSecret() { return sessionStorage.getItem('sie_signing_secret') || ''; },
+  get apiBaseOverride() { return sessionStorage.getItem('sie_api_base') || ''; },
   set(apiKey, signingSecret) {
     sessionStorage.setItem('sie_api_key', apiKey);
     sessionStorage.setItem('sie_signing_secret', signingSecret);
+  },
+  // Kept separate from set()/clear(): the override describes the deployment, not the credential,
+  // so it survives a logout instead of forcing the operator to retype it on every session.
+  setApiBaseOverride(raw) {
+    const normalized = normalizeBasePath(raw);
+    if (normalized) sessionStorage.setItem('sie_api_base', normalized);
+    else sessionStorage.removeItem('sie_api_base');
   },
   clear() {
     sessionStorage.removeItem('sie_api_key');
@@ -120,9 +163,11 @@ const Session = {
 async function apiCall(method, path, bodyObj) {
   const body = bodyObj !== undefined ? JSON.stringify(bodyObj) : '';
   const timestamp = Math.floor(Date.now() / 1000).toString();
-  const signature = await hmacSign(Session.signingSecret, method, path, timestamp, body);
+  const signTarget = `${Session.apiBaseOverride}${path}`;
+  const signature = await hmacSign(Session.signingSecret, method, signTarget, timestamp, body);
+  const requestUrl = `${REQUEST_BASE}${path}`.replace(/\/{2,}/g, '/');
 
-  const response = await fetch(path, {
+  const response = await fetch(requestUrl, {
     method,
     headers: {
       'X-API-Key': Session.apiKey,
@@ -161,6 +206,26 @@ function hideError(id) {
   el(id).classList.add('hidden');
 }
 
+// Transient, non-blocking notification — used where a raw `alert()` would otherwise interrupt an
+// error the user can act on elsewhere (e.g. deleteKey's non-409 failures). Falls back to `alert`
+// if the container isn't in the DOM (defensive only; index.html always defines it).
+function showToast(message, kind) {
+  const container = el('toast-container');
+  if (!container) {
+    window.alert(message);
+    return;
+  }
+  const toast = document.createElement('div');
+  toast.className = `toast toast-${kind || 'error'}`;
+  toast.textContent = message;
+  container.appendChild(toast);
+  requestAnimationFrame(() => toast.classList.add('visible'));
+  setTimeout(() => {
+    toast.classList.remove('visible');
+    setTimeout(() => toast.remove(), 300);
+  }, 4000);
+}
+
 let me = null;
 
 async function tryLogin(apiKey, signingSecret) {
@@ -191,7 +256,7 @@ function renderIdentity() {
   el('identity-prefix').textContent = me.prefix;
   const badge = el('identity-badge');
   badge.textContent = me.is_master ? 'MASTER' : 'DAUGHTER';
-  badge.className = 'badge ' + (me.is_master ? 'master' : 'daughter');
+  badge.className = 'badge badge-tier ' + (me.is_master ? 'badge-tier-master' : 'badge-tier-daughter');
 }
 
 function logout() {
@@ -207,18 +272,21 @@ async function loadEndpoints() {
   const endpoints = await apiCall('GET', '/api/endpoints');
   const tbody = el('endpoints-body');
   tbody.innerHTML = '';
+  if (endpoints.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="6" class="table-empty">No endpoints yet — create one below.</td></tr>';
+  }
   for (const ep of endpoints) {
     const tr = document.createElement('tr');
-    const feedUrl = window.location.origin + ep.feed_path;
+    const feedUrl = window.location.origin + REQUEST_BASE + ep.feed_path;
     tr.innerHTML = `
-      <td>${escapeHtml(ep.name)}<div class="dim">${escapeHtml(ep.vault_groups)}</div></td>
-      <td class="mono">${escapeHtml(feedUrl)}</td>
+      <td>${escapeHtml(ep.name)}<div class="text-muted text-sm">${escapeHtml(ep.vault_groups)}</div></td>
+      <td class="font-mono">${escapeHtml(feedUrl)}</td>
       <td>${ep.ttl_seconds}s</td>
       <td>${[ep.filter_rfc1918 && 'RFC1918', ep.filter_bogons && 'Bogons', ep.filter_loopback && 'Loopback'].filter(Boolean).join(', ') || '—'}</td>
       <td>${ep.last_synced_at || 'never'}</td>
       <td class="row">
-        <button class="small secondary" data-copy="${escapeHtml(feedUrl)}">Copy URL</button>
-        <button class="small danger" data-delete-endpoint="${ep.id}">Delete</button>
+        <button class="btn btn-secondary btn-sm" data-copy="${escapeHtml(feedUrl)}">Copy URL</button>
+        <button class="btn btn-danger btn-sm" data-delete-endpoint="${ep.id}">Delete</button>
       </td>`;
     tbody.appendChild(tr);
   }
@@ -260,15 +328,19 @@ async function loadKeys() {
   const keys = await apiCall('GET', '/api/keys');
   const tbody = el('keys-body');
   tbody.innerHTML = '';
+  if (keys.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="4" class="table-empty">No keys yet.</td></tr>';
+  }
   for (const k of keys) {
     const tr = document.createElement('tr');
+    const tierClass = k.is_master ? 'badge-tier-master' : 'badge-tier-daughter';
     tr.innerHTML = `
-      <td>${escapeHtml(k.name)}<div class="dim mono">${escapeHtml(k.prefix)}…</div></td>
-      <td><span class="badge ${k.is_master ? 'master' : 'daughter'}">${k.is_master ? 'MASTER' : 'DAUGHTER'}</span></td>
+      <td>${escapeHtml(k.name)}<div class="text-muted font-mono text-sm">${escapeHtml(k.prefix)}…</div></td>
+      <td><span class="badge badge-tier ${tierClass}">${k.is_master ? 'MASTER' : 'DAUGHTER'}</span></td>
       <td>${k.can_manage_keys ? 'Yes' : 'No'}</td>
       <td class="row">
-        ${k.is_master ? '' : `<button class="small secondary" data-rotate-key="${k.id}">Rotate</button>
-        <button class="small danger" data-delete-key="${k.id}">Delete</button>`}
+        ${k.is_master ? '' : `<button class="btn btn-secondary btn-sm" data-rotate-key="${k.id}">Rotate</button>
+        <button class="btn btn-danger btn-sm" data-delete-key="${k.id}">Delete</button>`}
       </td>`;
     tbody.appendChild(tr);
   }
@@ -301,7 +373,7 @@ async function deleteKey(keyId, allKeys) {
     if (e.status === 409 && e.body && Array.isArray(e.body.owned_endpoints)) {
       openReassignDialog(keyId, e.body.owned_endpoints, allKeys);
     } else {
-      alert(e.message);
+      showToast(e.message, 'error');
     }
   }
 }
@@ -380,15 +452,18 @@ async function loadAuditLogs() {
     const logs = await apiCall('GET', path);
     const tbody = el('audit-body');
     tbody.innerHTML = '';
+    if (logs.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="6" class="table-empty">No audit log entries match.</td></tr>';
+    }
     for (const entry of logs) {
       const tr = document.createElement('tr');
       tr.innerHTML = `
-        <td class="dim">${escapeHtml(entry.timestamp)}</td>
-        <td><span class="mono">${escapeHtml(entry.action)}</span></td>
+        <td class="text-muted">${escapeHtml(entry.timestamp)}</td>
+        <td><span class="font-mono">${escapeHtml(entry.action)}</span></td>
         <td>${escapeHtml(entry.target_resource || '—')}</td>
-        <td>${escapeHtml(entry.api_key_name)}<div class="dim mono">${escapeHtml(entry.api_key_prefix)}…</div></td>
-        <td class="mono">${escapeHtml(entry.client_ip)}</td>
-        <td class="dim">${escapeHtml(entry.details || '—')}</td>`;
+        <td>${escapeHtml(entry.api_key_name)}<div class="text-muted font-mono text-sm">${escapeHtml(entry.api_key_prefix)}…</div></td>
+        <td class="font-mono">${escapeHtml(entry.client_ip)}</td>
+        <td class="text-muted">${escapeHtml(entry.details || '—')}</td>`;
       tbody.appendChild(tr);
     }
   } catch (e) {
@@ -404,9 +479,14 @@ function escapeHtml(str) {
 
 // ── Wiring ───────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
+  // Prefill from storage so a proxied deployment doesn't ask for the override again on every
+  // logout — only the credentials themselves are cleared by Session.clear().
+  el('login-api-base').value = Session.apiBaseOverride;
   el('login-form').addEventListener('submit', (event) => {
     event.preventDefault();
     hideError('login-error');
+    // Applied before tryLogin(), since its very first request (GET /api/auth/me) is already signed.
+    Session.setApiBaseOverride(el('login-api-base').value);
     tryLogin(el('login-api-key').value.trim(), el('login-signing-secret').value.trim());
   });
   el('logout-btn').addEventListener('click', logout);
