@@ -72,12 +72,17 @@ body {
     max-width: 1280px;
     margin: 0 auto;
     padding: 2rem;
-    transition: opacity var(--transition-slow), transform var(--transition-slow);
+    transition: opacity var(--transition-slow);
 }
 
+/* Opacity-only fade — deliberately no `transform` here. A non-`none` `transform` on this
+   container (even transiently, mid-transition) creates a new containing block for any
+   `position: fixed` descendant, including a native <dialog> shown via showModal(): the
+   reassign-confirmation dialog would render pinned to this element's own box instead of the
+   viewport, landing top-left instead of centered, if it were ever opened while this transition
+   is still in flight. */
 .container.hidden {
     opacity: 0;
-    transform: translateY(10px);
     pointer-events: none;
     display: block !important;
 }
@@ -583,7 +588,10 @@ input[type='checkbox']:checked::after {
 
 .toast-container {
     position: fixed;
-    top: 1.5rem;
+    /* Cleared past .header (2rem container padding + its own content/border), not the 1.5rem a
+       page with no fixed header could use — at 1.5rem a toast overlapped the identity badge and
+       logout button instead of appearing below them. */
+    top: 6rem;
     right: 1.5rem;
     z-index: 9999;
     display: flex;
@@ -630,6 +638,11 @@ input[type='checkbox']:checked::after {
    background/radius/shadow, .modal-header's title-and-close layout) rather than adopting the
    overlay-div mechanism itself. See AGENT_NOTES.MD for why the mechanism was kept. */
 dialog {
+    /* The universal `* { margin: 0; }` reset above zeroes out the UA stylesheet's `margin: auto`
+       on `dialog:modal` — that `auto` is the entire mechanism native <dialog> centering relies on
+       (fixed positioning + inset:0 on all four sides + auto margins). Without restoring it here,
+       showModal() renders the dialog pinned to the viewport's top-left corner instead of centered. */
+    margin: auto;
     background-color: var(--bg-card);
     color: var(--text-main);
     border: 1px solid var(--border);
@@ -687,6 +700,13 @@ dialog select {
 
 .font-mono {
     font-family: var(--font-mono);
+}
+
+/* Only for a genuinely long, unbroken token (a feed URL, a minted API key/secret) that would
+   otherwise overflow its container — NOT the default for every .font-mono use. Applied to
+   .font-mono alone, this same rule used to break short identifiers like ENDPOINT_UPDATE into
+   "ENDPOINT_UPDAT" + "E" mid-word the moment their column got narrow. */
+.break-all {
     word-break: break-all;
 }
 

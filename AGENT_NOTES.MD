@@ -1,5 +1,69 @@
 # Agent Worklog — `simply_ip_exporter`
 
+## 2026-08-25 (session 10) — Visual QA: screenshot comparison against the peer dashboards, three real CSS bugs found
+
+Session 9's harmonization pass was verified by reading CSS side by side, not by looking at a
+rendered page. Asked to actually compare screenshots, so: booted `static/` (exporter),
+`example/simply_ip_vault/static/`, and `example/simply_hook_executor/static/` each behind a plain
+`python3 -m http.server`, and used the system's headless `chromium --headless --screenshot=...`
+(no Playwright/Puppeteer available — no `node`/`npm` in this environment) to capture the login
+screens of all three for a direct visual diff. To see the authenticated dashboard (which needs a
+real signed login this environment has no browser-automation framework to drive), built a
+throwaway fixture: a scratch copy of `static/` with an inline `<script>` appended after
+`app.js` that stubs `window.fetch` with canned JSON and calls the real `tryLogin()`/
+`showMintedKey()`/`openReassignDialog()` — exercises the actual rendering code paths, not a
+hand-built mockup. Nothing in this fixture technique touched the real `static/` files; it only
+ever ran against a `/tmp` scratch copy.
+
+The login-screen comparison confirmed the token/component port from session 9 landed correctly —
+card shape, logo gradient, button/input styling, and the new "API base path override" field all
+matched `simply_ip_vault`'s and `simply_hook_executor`'s live rendering closely. The full-dashboard
+fixture screenshot surfaced three real bugs, none visible from reading the CSS source alone:
+
+1. **`.font-mono { word-break: break-all }` applied globally** broke short identifiers like
+   `ENDPOINT_UPDATE` in the audit log's ACTION column into `ENDPOINT_UPDAT` + `E` across two lines
+   the moment the column got narrow — break-all is only actually wanted for the genuinely long,
+   space-free tokens (feed URLs, a minted API key/signing secret) that would otherwise overflow
+   their container. Split into a plain `.font-mono` (font-family only) and a separate `.break-all`
+   utility, applied only where content is actually a long unbroken token (`static/app.js`'s feed-URL
+   cell, `static/index.html`'s `#minted-api-key`/`#minted-signing-secret`).
+2. **The reassignment `<dialog>` opened pinned to the viewport's top-left corner instead of
+   centered**, with no visible backdrop dimming. Root cause, confirmed empirically via
+   `getComputedStyle(dialog).margin` logged from the fixture page (`margin: 0px`, not `auto`): the
+   session-9 harmonization pass ported vault's `*, *::before, *::after { margin: 0; padding: 0; }`
+   reset verbatim, and that reset zeroes out the UA stylesheet's `margin: auto` on `dialog:modal` —
+   the entire mechanism native `<dialog>` centering depends on (`position: fixed; inset: 0;
+   margin: auto;`). Vault never hit this because it doesn't use a native `<dialog>` at all (its own
+   modals are plain `.modal-overlay` divs, positioned with flexbox, not auto-margins) — this bug
+   was specific to porting the reset onto a page that still relies on native dialog centering. Fixed
+   by restoring `margin: auto` explicitly on the `dialog` rule. Also removed `transform:
+   translateY(10px)` from `.container.hidden`'s reveal transition — harmless on its own, but a
+   `transform` on an ancestor (even transiently, mid-transition) creates a containing block for any
+   `position: fixed` descendant, which would have reintroduced the exact same mispositioning for
+   any dialog opened while that transition is still in flight.
+3. **A toast notification overlapped the header** (identity badge, logout button) instead of
+   appearing below it — `.toast-container`'s `top: 1.5rem` (copied from vault) sits above where
+   this page's header content actually ends (`.container`'s `2rem` top padding plus the header's
+   own height), since vault's page chrome above that offset differs from this crate's. Bumped to
+   `top: 6rem`, clearing the header with room to spare; verified with a second fixture exercising
+   `showToast()` directly.
+
+All three fixes are in `static/style.css` only (`app.js`/`index.html` only gained the two
+`break-all` class additions) — verified with the same fixture screenshots post-fix (dialog now
+centers with a dimmed backdrop, toast clears the header, ACTION column no longer wraps mid-word),
+then a full gate re-run.
+
+### Verification performed
+
+- `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`: clean.
+- `cargo test`: 147 passed, 0 failed (unchanged from session 9 — this was a CSS-only fix, no new
+  source-hygiene coverage needed).
+- `./scripts/verify_convergence.sh`: all 13 named checks pass.
+- `./scripts/test_e2e.sh`: 100/100 checks pass.
+- Manual: screenshot diff of exporter/vault/hook_executor login screens; a fixture-driven
+  full-dashboard render (endpoints/keys/audit tables, minted-key card, reassignment dialog, both
+  toast variants) before and after each fix.
+
 ## 2026-08-24 (session 9) — Frontend CSS/HTML harmonization + reverse-proxy subpath resolution
 
 Two related frontend tasks landed together since both touch `static/app.js`/`static/index.html`.

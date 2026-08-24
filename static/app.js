@@ -280,7 +280,7 @@ async function loadEndpoints() {
     const feedUrl = window.location.origin + REQUEST_BASE + ep.feed_path;
     tr.innerHTML = `
       <td>${escapeHtml(ep.name)}<div class="text-muted text-sm">${escapeHtml(ep.vault_groups)}</div></td>
-      <td class="font-mono">${escapeHtml(feedUrl)}</td>
+      <td class="font-mono break-all">${escapeHtml(feedUrl)}</td>
       <td>${ep.ttl_seconds}s</td>
       <td>${[ep.filter_rfc1918 && 'RFC1918', ep.filter_bogons && 'Bogons', ep.filter_loopback && 'Loopback'].filter(Boolean).join(', ') || '—'}</td>
       <td>${ep.last_synced_at || 'never'}</td>
