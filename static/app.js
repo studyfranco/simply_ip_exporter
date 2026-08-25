@@ -432,7 +432,9 @@ async function loadKeys() {
       <td><span class="badge badge-tier ${tierClass}">${k.is_master ? 'MASTER' : 'DAUGHTER'}</span></td>
       <td>${k.can_manage_keys ? 'Yes' : 'No'}</td>
       <td class="row">
-        ${k.is_master ? '' : `<button class="btn btn-secondary btn-sm" data-rotate-key="${k.id}">Rotate</button>
+        <button class="btn btn-secondary btn-sm" data-edit-key="${k.id}">Edit</button>
+        ${k.is_master ? '' : `<button class="btn btn-secondary btn-sm" data-regenerate-key="${k.id}" title="Replace BOTH the API key and its signing secret">Regenerate</button>
+        <button class="btn btn-secondary btn-sm" data-rotate-secret-key="${k.id}" title="Replace only the signing secret; the API key stays the same">Rotate Secret</button>
         <button class="btn btn-danger btn-sm" data-delete-key="${k.id}">Delete</button>`}
       </td>`;
     tbody.appendChild(tr);
@@ -443,11 +445,34 @@ async function loadKeys() {
       await deleteKey(btn.dataset.deleteKey, keys);
     });
   });
-  tbody.querySelectorAll('[data-rotate-key]').forEach((btn) => {
+  tbody.querySelectorAll('[data-edit-key]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const target = keys.find((k) => k.id === btn.dataset.editKey);
+      if (target) openEditKeyModal(target);
+    });
+  });
+  // "Regenerate": replaces BOTH the API key and its signing secret (POST .../rotate) — the
+  // original, wider rotation this crate already had, renamed to match example/simply_ip_vault's
+  // own terminology for the same operation.
+  tbody.querySelectorAll('[data-regenerate-key]').forEach((btn) => {
     btn.addEventListener('click', async () => {
-      if (!confirm('Rotate this key? Its previous secret stops working immediately.')) return;
-      const minted = await apiCall('POST', `/api/keys/${btn.dataset.rotateKey}/rotate`);
+      if (!confirm('Regenerate this key? Both the API key and its signing secret change — the previous credentials stop working immediately.')) {
+        return;
+      }
+      const minted = await apiCall('POST', `/api/keys/${btn.dataset.regenerateKey}/rotate`);
       showMintedKey(minted);
+      await loadKeys();
+    });
+  });
+  // "Rotate Secret": replaces ONLY the signing secret (POST .../rotate-secret) — the API key,
+  // name, and can_manage_keys are left untouched. Narrower and lower-blast-radius than Regenerate.
+  tbody.querySelectorAll('[data-rotate-secret-key]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      if (!confirm('Rotate this key\'s signing secret? The API key and its permissions stay the same, but the current signing secret stops working immediately.')) {
+        return;
+      }
+      const rotated = await apiCall('POST', `/api/keys/${btn.dataset.rotateSecretKey}/rotate-secret`);
+      showMintedKey({ signing_secret: rotated.signing_secret });
       await loadKeys();
     });
   });
@@ -560,10 +585,19 @@ function openReassignDialog(keyId, ownedEndpoints, allKeys) {
   modal.classList.remove('hidden');
 }
 
+// `minted.api_key` is present for a create/regenerate (both credential halves are new) and
+// absent for a secret-only rotation — the "API Key" row is hidden in the latter case rather than
+// shown empty, since there's nothing new there to copy.
 function showMintedKey(minted) {
-  el('minted-key-box').classList.remove('hidden');
-  el('minted-api-key').textContent = minted.api_key;
+  const apiKeyRow = el('minted-api-key-row');
+  if (minted.api_key) {
+    apiKeyRow.classList.remove('hidden');
+    el('minted-api-key').textContent = minted.api_key;
+  } else {
+    apiKeyRow.classList.add('hidden');
+  }
   el('minted-signing-secret').textContent = minted.signing_secret;
+  el('minted-key-box').classList.remove('hidden');
 }
 
 async function createKey(event) {
@@ -580,6 +614,52 @@ async function createKey(event) {
     await loadKeys();
   } catch (e) {
     showError('key-error', e.message);
+  }
+}
+
+// Opens the Edit Key modal, pre-filled from the already-fetched key list (no extra round-trip).
+// On the Master key, name and can_manage_keys are disabled and a note explains why — AGENT.MD:
+// the Master key is immutable through the API except for its own bound_ips — rather than hiding
+// those fields, so the operator can see they exist without being offered a change that would 403.
+function openEditKeyModal(target) {
+  hideError('edit-key-error');
+  el('edit-key-id').value = target.id;
+  el('edit-key-name').value = target.name;
+  el('edit-key-bound-ips').value = target.bound_ips || '';
+  el('edit-key-can-manage-keys').checked = target.can_manage_keys;
+
+  el('edit-key-name').disabled = target.is_master;
+  el('edit-key-can-manage-keys').disabled = target.is_master;
+  el('edit-key-master-note').classList.toggle('hidden', !target.is_master);
+
+  el('edit-key-modal').classList.remove('hidden');
+}
+
+function closeEditKeyModal() {
+  el('edit-key-modal').classList.add('hidden');
+}
+
+async function submitEditKey(event) {
+  event.preventDefault();
+  hideError('edit-key-error');
+  const id = el('edit-key-id').value;
+  const isMaster = el('edit-key-name').disabled;
+  try {
+    // On the Master key, name/can_manage_keys are omitted entirely (not sent as unchanged
+    // values) — guard_master_update refuses the update if either field is merely *present* in
+    // the payload, even carrying the key's own current value, so a no-op resubmission of those
+    // fields would still 403.
+    const payload = { bound_ips: el('edit-key-bound-ips').value || null };
+    if (!isMaster) {
+      payload.name = el('edit-key-name').value;
+      payload.can_manage_keys = el('edit-key-can-manage-keys').checked;
+    }
+    await apiCall('PUT', `/api/keys/${id}`, payload);
+    closeEditKeyModal();
+    showToast('Key updated', 'success');
+    await loadKeys();
+  } catch (e) {
+    showError('edit-key-error', e.message);
   }
 }
 
@@ -661,6 +741,14 @@ document.addEventListener('DOMContentLoaded', () => {
   });
   el('minted-key-dismiss').addEventListener('click', () => el('minted-key-box').classList.add('hidden'));
 
+  // Edit Key modal: same four close conventions as every other modal here.
+  el('edit-key-form').addEventListener('submit', submitEditKey);
+  el('edit-key-close').addEventListener('click', closeEditKeyModal);
+  el('edit-key-cancel').addEventListener('click', closeEditKeyModal);
+  el('edit-key-modal').addEventListener('click', (event) => {
+    if (event.target.id === 'edit-key-modal') closeEditKeyModal();
+  });
+
   el('audit-refresh-btn').addEventListener('click', () => {
     auditOffset = 0;
     loadAuditLogs();
@@ -699,6 +787,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (event.key !== 'Escape') return;
     if (!el('reassign-dialog').classList.contains('hidden')) closeReassignDialog();
     if (!el('create-endpoint-modal').classList.contains('hidden')) closeCreateEndpointModal();
+    if (!el('edit-key-modal').classList.contains('hidden')) closeEditKeyModal();
   });
 
   if (Session.isSet()) {

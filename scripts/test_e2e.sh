@@ -396,6 +396,20 @@ check_jq ".ip_list[0]" "192.168.1.50" "the private address round-trips through V
 api_call "$VAULT_URL" GET "/api/groups" "$VAULT_MASTER_KEY"
 PRIVATE_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.[] | select(.name=="pfBlocker_Private_Test") | .id')
 
+# A THIRD, entirely distinct group — proves simply_ip_exporter actually reads and combines
+# multiple Vault groups, rather than the §4 aggregation check coincidentally passing off content
+# that all happened to come from a single group (pfBlocker_Private_Test's own address is RFC1918
+# and gets filtered back out downstream, so it alone never demonstrates a second group's content
+# surviving into the aggregated feed). 9.9.9.0/24 (Quad9's real public anycast range) is used
+# instead of another 8.8.8.0/8 or 10.0.0.0/8 address specifically so it cannot be confused with, or
+# accidentally aggregated adjacent to, the pfBlocker_Blacklist fixtures above.
+log "Creating a third banlist group pfBlocker_Secondary_Test (proves multi-group aggregation, not just multi-group presence)..."
+api_call "$VAULT_URL" POST "/api/groups" "$VAULT_MASTER_KEY" '{"name":"pfBlocker_Secondary_Test"}'
+check "200" "pfBlocker_Secondary_Test group is created"
+SECONDARY_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
+api_call "$VAULT_URL" POST "/api/ban" "$VAULT_MASTER_KEY" '{"target_address":"9.9.9.0/24","group_name":"pfBlocker_Secondary_Test","cause":"cross-group aggregation test"}'
+check "200" "9.9.9.0/24 added to the secondary group"
+
 log "Seeding pfBlocker_Blacklist with a contiguous/overlapping pair and a CGN (bogon) address..."
 # 8.8.8.0/24 + 8.8.8.1/32 (a host fully inside that block) is the aggregation fixture: a
 # spec-compliant ipnet::IpNet::aggregate() must collapse them into the single block 8.8.8.0/24.
@@ -435,10 +449,13 @@ check "200" "can_read granted on pfBlocker_Blacklist"
 api_call "$VAULT_URL" POST "/api/keys/$EXPORTER_VAULT_KEY_ID/groups" "$VAULT_MASTER_KEY" \
     "{\"group_id\":\"$PRIVATE_GROUP_ID\",\"can_read\":true,\"can_write\":false,\"can_delete\":false}"
 check "200" "can_read granted on pfBlocker_Private_Test"
+api_call "$VAULT_URL" POST "/api/keys/$EXPORTER_VAULT_KEY_ID/groups" "$VAULT_MASTER_KEY" \
+    "{\"group_id\":\"$SECONDARY_GROUP_ID\",\"can_read\":true,\"can_write\":false,\"can_delete\":false}"
+check "200" "can_read granted on pfBlocker_Secondary_Test"
 
-api_call "$VAULT_URL" GET "/api/ips?groups=pfBlocker_Blacklist,pfBlocker_Private_Test" "$EXPORTER_VAULT_KEY"
-check "200" "the scoped Exporter key can read across both groups"
-check_jq "length" "5" "sees all 5 seeded records (restrict-not-reject: no group is silently rejected)"
+api_call "$VAULT_URL" GET "/api/ips?groups=pfBlocker_Blacklist,pfBlocker_Private_Test,pfBlocker_Secondary_Test" "$EXPORTER_VAULT_KEY"
+check "200" "the scoped Exporter key can read across all three groups"
+check_jq "length" "6" "sees all 6 seeded records (restrict-not-reject: no group is silently rejected)"
 
 # ── 3. Exporter configuration ───────────────────────────────────────────────
 
@@ -475,9 +492,9 @@ check_jq ".is_master" "true" "Exporter master key reports is_master=true"
 raw_call GET "$EXPORTER_URL/api/auth/me"
 check "401" "an unsigned admin API request is rejected"
 
-log "Creating the public feed endpoint (ttl_seconds=2, filter_rfc1918=true, filter_bogons=true)..."
+log "Creating the public feed endpoint (ttl_seconds=2, filter_rfc1918=true, filter_bogons=true), spanning all three Vault groups..."
 api_call "$EXPORTER_URL" POST "/api/endpoints" "$EXPORTER_MASTER_KEY" \
-    '{"name":"pfBlockerNG DMZ Feed","vault_groups":"pfBlocker_Blacklist,pfBlocker_Private_Test","ttl_seconds":2,"filter_rfc1918":true,"filter_bogons":true}'
+    '{"name":"pfBlockerNG DMZ Feed","vault_groups":"pfBlocker_Blacklist,pfBlocker_Private_Test,pfBlocker_Secondary_Test","ttl_seconds":2,"filter_rfc1918":true,"filter_bogons":true}'
 check "200" "the feed endpoint is created"
 check_jq ".filter_rfc1918" "true" "filter_rfc1918 is set as configured"
 check_jq ".filter_bogons" "true" "filter_bogons is set as configured"
@@ -486,8 +503,24 @@ FEED_PATH=$(echo "$RESP_BODY" | jq -r '.feed_path')
 FEED_ENDPOINT_ID=$(echo "$RESP_BODY" | jq -r '.id')
 log "Feed path: $FEED_PATH (endpoint id: $FEED_ENDPOINT_ID)"
 
-log "Waiting for the background sync worker (15s tick interval, endpoint is due for an immediate full sync)..."
-sleep 18
+# A second endpoint scoped to ONLY pfBlocker_Secondary_Test — the group-scoping counterpart to the
+# combined feed above. Proves simply_ip_exporter actually restricts a feed's content to the groups
+# named in its own vault_groups, rather than exposing every group its Vault key happens to be able
+# to read regardless of configuration (which the combined-feed check alone couldn't distinguish
+# from correct behavior, since it deliberately spans every group).
+log "Creating a second feed endpoint scoped to ONLY pfBlocker_Secondary_Test (group-scoping test)..."
+api_call "$EXPORTER_URL" POST "/api/endpoints" "$EXPORTER_MASTER_KEY" \
+    '{"name":"Secondary Group Only Feed","vault_groups":"pfBlocker_Secondary_Test","ttl_seconds":2}'
+check "200" "the secondary-group-only feed endpoint is created"
+SECONDARY_FEED_PATH=$(echo "$RESP_BODY" | jq -r '.feed_path')
+log "Secondary feed path: $SECONDARY_FEED_PATH"
+
+# sync_all_endpoints() (src/sync.rs) syncs every due endpoint sequentially within one 15s tick,
+# each a real HTTP round-trip to Vault — two endpoints due at once (as here) take measurably
+# longer than one, so the old 18s margin (15s tick + 3s slack, sized for a single endpoint) was
+# occasionally too tight under load. 20s leaves more headroom for both to complete in one pass.
+log "Waiting for the background sync worker (15s tick interval, both endpoints are due for an immediate full sync)..."
+sleep 20
 
 # ── 4. Feed verification & aggregation ──────────────────────────────────────
 
@@ -505,8 +538,27 @@ check_not_contains "$RESP_BODY" "8.8.8.1" "the host-route 8.8.8.1/32 no longer a
 check_contains "$RESP_BODY" "8.8.4.4/32" "8.8.4.4/32 (the §6 soft-delete fixture) is present and unaggregated (not adjacent to the 8.8.8.0/24 block)"
 check_not_contains "$RESP_BODY" "192.168.1.50" "the RFC1918 address is filtered out (filter_rfc1918=true)"
 check_not_contains "$RESP_BODY" "100.64.0.5" "the CGN bogon address is filtered out (filter_bogons=true)"
+# 9.9.9.0/24 comes from pfBlocker_Secondary_Test — a THIRD, distinct Vault group named in this
+# endpoint's vault_groups alongside pfBlocker_Blacklist/pfBlocker_Private_Test. Its presence here
+# is the actual proof that simply_ip_exporter reads and combines multiple Vault groups into one
+# aggregated feed, not merely that a multi-group vault_groups value is accepted at creation time.
+check_contains "$RESP_BODY" "9.9.9.0/24" "9.9.9.0/24 from the third, distinct Vault group (pfBlocker_Secondary_Test) is present — proves cross-group aggregation, not just a single group's content"
 LINE_COUNT=$(echo "$RESP_BODY" | grep -c . || true)
-check_local "$LINE_COUNT" "2" "exactly two lines remain after aggregation and filtering (8.8.8.0/24, 8.8.4.4/32)"
+check_local "$LINE_COUNT" "3" "exactly three lines remain after aggregation and filtering (8.8.8.0/24, 8.8.4.4/32, 9.9.9.0/24 — one per surviving group)"
+
+# Group-scoping counterpart: a feed whose vault_groups names ONLY pfBlocker_Secondary_Test must
+# see 9.9.9.0/24 and NOTHING from the other two groups, even though the same underlying Vault key
+# can read all three. If simply_ip_exporter ever regressed to ignoring vault_groups and just
+# returning everything its Vault key is scoped to, this is the check that would catch it — the
+# combined feed above spans every group, so it alone can't distinguish "grouped correctly" from
+# "returns everything regardless of vault_groups".
+raw_call GET "$EXPORTER_URL$SECONDARY_FEED_PATH" -H "X-Forwarded-For: 198.51.100.13"
+check "200" "the secondary-group-only feed is served"
+check_contains "$RESP_BODY" "9.9.9.0/24" "the secondary-group-only feed contains its own group's address"
+check_not_contains "$RESP_BODY" "8.8.8.0/24" "the secondary-group-only feed does NOT leak pfBlocker_Blacklist's content"
+check_not_contains "$RESP_BODY" "8.8.4.4" "the secondary-group-only feed does NOT leak pfBlocker_Blacklist's content"
+SECONDARY_LINE_COUNT=$(echo "$RESP_BODY" | grep -c . || true)
+check_local "$SECONDARY_LINE_COUNT" "1" "exactly one line — only this endpoint's own group's content"
 
 # ── 5. HTTP optimizations & anti-DoS ────────────────────────────────────────
 
@@ -552,9 +604,11 @@ api_call "$VAULT_URL" DELETE "/api/ips/$SOFT_DELETE_RECORD_ID" "$VAULT_MASTER_KE
 check "200" "the soft-delete request succeeds"
 check_jq ".deleted" "soft" "the deletion is soft (deleted_at set), not permanent"
 
+# Both the DMZ feed and §4's secondary-group-only feed have ttl_seconds=2, so both are due and
+# sync sequentially in the same pass here too — same margin reasoning as §3/§4's wait above.
 log "Waiting for the next differential sync (ttl_seconds=2, tick interval 15s) to observe it via \
     since=<last_synced_at>&include_deleted=true..."
-sleep 17
+sleep 19
 
 raw_call GET "$EXPORTER_URL$FEED_PATH" -H "X-Forwarded-For: 198.51.100.22"
 check "200" "feed is served after the soft-delete"
@@ -650,8 +704,11 @@ check "200" "the pre-restart Daughter key STILL authenticates: its signing_secre
 raw_call GET "$EXPORTER_URL$FEED_PATH" -H "X-Forwarded-For: 198.51.100.41"
 check "200" "the original feed endpoint's token still resolves after restart (the endpoint row persisted)"
 
+# Three endpoints exist by this point (the DMZ feed, §4's secondary-group-only feed, and §8's
+# bound_ips-restricted feed) and all sync sequentially in the same post-restart pass — same
+# reasoning as the 20s margin above, just with a third endpoint added to the pass.
 log "Waiting for the in-memory IP cache (cleared on restart) to re-hydrate from Vault via the sync worker's first tick..."
-sleep 18
+sleep 20
 
 raw_call GET "$EXPORTER_URL$FEED_PATH" -H "X-Forwarded-For: 198.51.100.42"
 check "200" "feed served again after cache rehydration"
@@ -888,8 +945,10 @@ fi
 
 # The audit trail is written to the same SQLite database as everything else, so it must have
 # survived §9's restart intact — entries from both before and after the restart should be present.
+# Three endpoints are created before the restart: the main DMZ feed, §8's bound_ips-restricted
+# "Restricted Feed", and §4's group-scoping "Secondary Group Only Feed".
 PRE_RESTART_COUNT=$(echo "$RESP_BODY" | jq --arg a "ENDPOINT_CREATE" '[.[] | select(.action == $a)] | length')
-check_local "$PRE_RESTART_COUNT" "2" "both ENDPOINT_CREATE entries (the main feed and the bound_ips-restricted one, both created before the restart) survived it"
+check_local "$PRE_RESTART_COUNT" "3" "all three ENDPOINT_CREATE entries (created before the restart) survived it"
 
 log "Confirming a Daughter key cannot read the audit log..."
 api_call "$EXPORTER_URL" GET "/api/audit-logs" "$DAUGHTER_KEY"

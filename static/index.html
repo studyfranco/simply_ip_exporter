@@ -117,8 +117,10 @@
         </form>
 
         <div id="minted-key-box" class="key-reveal hidden">
-          <p class="key-reveal-label">API Key (copy now):</p>
-          <code id="minted-api-key" class="key-reveal-value"></code>
+          <div id="minted-api-key-row">
+            <p class="key-reveal-label">API Key (copy now):</p>
+            <code id="minted-api-key" class="key-reveal-value"></code>
+          </div>
           <p class="key-reveal-label">Signing Secret (copy now — required to sign requests):</p>
           <code id="minted-signing-secret" class="key-reveal-value"></code>
           <div class="row mt-2">
@@ -171,6 +173,47 @@
         <div id="audit-error" class="message error hidden"></div>
       </section>
     </main>
+  </div>
+
+  <!-- Edit API Key Modal — name/bound_ips/can_manage_keys via PUT /api/keys/{id}, matching
+       example/simply_ip_vault's #edit-key-modal. On the Master key, only bound_ips is editable
+       (AGENT.MD: the Master key is immutable through the API except for its own bound_ips) — name
+       and the can_manage_keys checkbox are disabled and a note is shown instead of hiding them,
+       so the operator sees the field exists and why it can't be changed here. -->
+  <div id="edit-key-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="edit-key-modal-title">
+    <div class="modal-card modal-card-form card">
+      <div class="modal-header">
+        <h3 id="edit-key-modal-title">Edit API Key</h3>
+        <button type="button" id="edit-key-close" class="btn-modal-close" aria-label="Close">&times;</button>
+      </div>
+      <form id="edit-key-form">
+        <input type="hidden" id="edit-key-id" />
+        <div class="form-group">
+          <label for="edit-key-name">Name <span>*</span></label>
+          <input type="text" id="edit-key-name" class="input-field" required />
+        </div>
+        <div class="form-group">
+          <label for="edit-key-bound-ips">Bound IPs (comma-separated CIDR, optional)</label>
+          <input type="text" id="edit-key-bound-ips" class="input-field" />
+        </div>
+        <div class="permissions-grid mt-2 mb-4">
+          <label class="checkbox-container">
+            <input type="checkbox" id="edit-key-can-manage-keys" />
+            <span class="checkmark"></span>
+            Can manage keys
+          </label>
+        </div>
+        <p class="rbac-note mt-2 mb-4 hidden" id="edit-key-master-note">
+          The Master key's name and scopes are fixed at bootstrap and cannot be changed here — only
+          its <em>Bound IPs</em> may be edited.
+        </p>
+        <div class="modal-actions mt-4">
+          <button type="button" id="edit-key-cancel" class="btn btn-cancel">Cancel</button>
+          <button type="submit" class="btn btn-primary">Save Changes</button>
+        </div>
+        <div id="edit-key-error" class="message error hidden"></div>
+      </form>
+    </div>
   </div>
 
   <!-- Create Endpoint Modal — opened from the "+ Add Endpoint" toolbar button, matching

@@ -1,5 +1,105 @@
 # Agent Worklog — `simply_ip_exporter`
 
+## 2026-08-25 (session 13) — Narrower key-secret rotation, Edit Key modal, e2e cross-group aggregation proof
+
+Three asks: (1) confirm convergence work targets this crate's own pages, not `example/simply_ip_vault`
+itself — no peer file was ever touched, only run standalone or copied into `/tmp` scratch dirs for
+screenshots, consistent with every prior session; (2) prove `simply_ip_exporter` actually reads and
+aggregates *multiple, distinct* Vault groups, not just that a multi-group `vault_groups` value is
+accepted; (3) port vault's fuller key-management surface — "scope" editing and the
+regenerate/rotate-secret split — which this crate only had half of.
+
+### `POST /api/keys/{id}/rotate-secret` — the narrower rotation vault already had
+
+This crate's existing `POST /api/keys/{id}/rotate` already matched vault's own "Regenerate"
+(replaces the API key **and** signing secret together) exactly, including the route name. What was
+missing was vault's other, narrower operation: `POST /api/keys/{id}/rotate-secret`, which replaces
+**only** the signing secret — the API key, name, and `can_manage_keys` are left untouched. Ported
+`rotate_signing_secret` and its `RotateSigningSecretResponse { id, name, signing_secret }` near-verbatim
+from `example/simply_ip_vault/src/api/keys.rs` (down to the audit action name, `KEY_SECRET_ROTATE`),
+adapted to this crate's simpler Master-only guard (`require_master` + the existing
+`guard_master_delete_or_rotate`, shared with the wider `/rotate` — the Master key's credential stays
+API-unreachable through either route, for the reason `guards.rs`'s doc comment already gives).
+
+New integration tests (not just response-shape assertions): `rotating_the_signing_secret_alone_
+leaves_the_api_key_and_scopes_unchanged` actually authenticates with the pre- and post-rotation
+secret pairs — confirms the *old* secret stops working, the *new* one paired with the *unchanged*
+API key succeeds, and `can_manage_keys` survives — and
+`the_master_key_cannot_rotate_its_own_signing_secret_through_the_api` pins the guard on this specific
+route rather than relying on it being true by implication from the wider route's own test. Needed a
+small new test fixture, `common::reseal_key` (rebuilds a `SeededKey` around a different credential
+pair while keeping the same DB row — `signed_request` never reads `model`, only
+`plaintext_key`/`signing_secret`, so this is safe even after the row's own columns have since changed).
+
+### Edit Key modal — "scope" editing vault has and this crate's UI didn't expose
+
+`PUT /api/keys/{id}` (name/`bound_ips`/`can_manage_keys`) already existed server-side but had no
+frontend at all. Added `#edit-key-modal` (vault's own `.modal-card-form` structure) wired to it, plus
+"Regenerate" (renamed from the old bare "Rotate" button, to match vault's terminology for the same
+wider operation) and "Rotate Secret" buttons per Daughter row. On the Master row, only an "Edit"
+button is offered, and inside it the Name field and "Can manage keys" checkbox are `disabled` with an
+`.rbac-note` explaining why (`AGENT.MD`: Master is immutable through the API except its own
+`bound_ips`) — rather than a guaranteed-403 submission. `showMintedKey` was generalized to hide its
+"API Key" row when the response has no `api_key` field (the secret-only rotation's response shape),
+instead of showing an empty one.
+
+**Real bug found and fixed while building this**: `.mt-4`/`.mb-4` utility classes were used
+throughout `index.html` since session 11 (`table-container mt-4`, `modal-actions mt-4`,
+`permissions-grid mt-2 mb-4`, …) but were **never defined** in `style.css` — only `.mt-2` was. Every
+`mt-4`/`mb-4` in the markup had silently done nothing since it was introduced. Added both rules.
+Also added `.input-field:disabled` (browser-default disabled styling wasn't visually distinct enough
+to read as "this field is intentionally locked" rather than "this field happens to be empty").
+
+### e2e: proving cross-group aggregation, not just multi-group acceptance
+
+The existing `test_e2e.sh` fixture combined `pfBlocker_Blacklist` + `pfBlocker_Private_Test` into one
+endpoint's `vault_groups`, but `pfBlocker_Private_Test`'s only seeded address is RFC1918 and gets
+filtered back out downstream (`filter_rfc1918=true` on that same endpoint) — so no existing assertion
+ever proved a *second* group's content actually flows into the aggregated feed output; §4 could pass
+even if `vault_groups` silently collapsed to "whichever group is listed first." Added a third,
+genuinely distinct Vault group (`pfBlocker_Secondary_Test`, seeded with `9.9.9.0/24` — a real public
+range chosen specifically so it can't be confused with, or accidentally aggregated adjacent to, the
+existing `8.8.8.0/8` fixtures) and two new assertions:
+
+- The combined DMZ feed (now spanning all three groups) must contain `9.9.9.0/24` alongside the
+  existing `8.8.8.0/24`/`8.8.4.4/32` — direct proof of cross-group aggregation.
+- A **second, new endpoint** scoped to *only* `pfBlocker_Secondary_Test` must contain `9.9.9.0/24`
+  and **must not** contain anything from `pfBlocker_Blacklist` — the group-scoping counterpart the
+  combined feed alone can't prove, since it deliberately spans every group. This is the check that
+  would actually catch a regression to "return everything the Vault key can read, ignore
+  `vault_groups`."
+
+`scripts/test_e2e.sh` grew from 100 to 110 checks (10 new: group creation/grant/seed in §2, the two
+new endpoint creations, and the cross-group + group-scoping assertions in §4). One pre-existing §14
+assertion's expected count needed updating (`ENDPOINT_CREATE` entries surviving the §9 restart: 2 → 3,
+since the new group-scoping endpoint is a third endpoint created before that restart) — not a defect,
+just an expected-value drift from adding a third endpoint to an existing fixture window.
+
+**A real, if intermittent, timing regression this introduced and then fixed**: the new
+group-scoping endpoint shares every existing fixed `sleep N` "wait for the sync tick" window with
+at least one other endpoint. `sync_all_endpoints()` (`src/sync.rs`) syncs every due endpoint
+*sequentially* within one 15s tick, each a real HTTP round-trip to Vault — those waits were sized
+(15s tick + a few seconds' slack) for however many endpoints needed syncing *when they were
+written*, which was fewer than after this session's addition. A run partway through this session
+came back 108/110 with no other change in between; three consecutive re-runs afterward passed
+110/110, which pointed at a timing margin rather than a logic bug. Bumped the three affected waits
+(§3→§4's 18s→20s, §6's 17s→19s, §9's 18s→20s) rather than switching to a poll loop — small, targeted
+margin increases, each with a comment naming exactly how many endpoints now share that window and
+why. Confirmed with three consecutive clean 110/110 runs after the fix, immediately back to back
+(the conditions most likely to reproduce a timing flake, if one remained).
+
+### Verification performed
+
+- `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`: clean.
+- `cargo test`: 149 passed, 0 failed (147 → 149: two new integration tests for
+  `rotate-secret`/its Master guard).
+- `./scripts/verify_convergence.sh`: all 13 named checks pass.
+- `./scripts/test_e2e.sh`: 110/110 checks pass (100 → 110, all new checks genuinely exercised
+  against a live `simply_ip_vault`, not stubbed).
+- Manual: fixture-driven screenshots of the Keys tab's new action buttons (Master: Edit only;
+  Daughter: Edit/Regenerate/Rotate Secret/Delete), the Edit modal on both a Daughter (all fields
+  live) and the Master (Name/scope disabled + note), confirming both render as intended.
+
 ## 2026-08-25 (session 12) — Real-render convergence pass against a live `simply_ip_vault`, endpoint-creation modal
 
 Session 11 converged the API Keys/Audit Logs pages and login screen against vault by *reading*

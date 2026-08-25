@@ -110,7 +110,7 @@ the system, so a scoped Daughter key seeing them would be an RBAC leak regardles
 | `api_key_name` | String | NOT NULL | The acting key's name, denormalized at write time. Survives the key's deletion, unlike `api_key_id`. |
 | `api_key_prefix` | String | NOT NULL | The acting key's prefix, denormalized for the same reason as `api_key_name`. |
 | `client_ip` | String | NOT NULL | The caller's resolved client IP (see `middleware::ClientIp`), as text. |
-| `action` | String | NOT NULL, INDEXED (`idx_audit_logs_action`) | Operation type: `KEY_CREATE`, `KEY_UPDATE`, `KEY_DELETE`, `KEY_ROTATE`, `ENDPOINT_CREATE`, `ENDPOINT_UPDATE`, `ENDPOINT_DELETE`, `ENDPOINT_OWNER_REASSIGN`. |
+| `action` | String | NOT NULL, INDEXED (`idx_audit_logs_action`) | Operation type: `KEY_CREATE`, `KEY_UPDATE`, `KEY_DELETE`, `KEY_ROTATE`, `KEY_SECRET_ROTATE`, `ENDPOINT_CREATE`, `ENDPOINT_UPDATE`, `ENDPOINT_DELETE`, `ENDPOINT_OWNER_REASSIGN`. |
 | `target_resource` | String | NULLABLE | The resource the action targeted, rendered as `kind:id (name)` (e.g. `endpoint:3f2a... (pfBlockerNG DMZ Feed)`). |
 | `details` | Text | NULLABLE | Additional context — which fields changed on an update, or a short human-readable summary. |
 | `timestamp` | DateTimeUtc | NOT NULL, INDEXED (`idx_audit_logs_timestamp`) | Log entry creation timestamp (UTC). |

@@ -472,6 +472,14 @@ body {
     color: #64686e;
 }
 
+/* A field that's disabled rather than merely read-only (the Master key's Name/scopes in the Edit
+   Key modal) — visually distinct from a normal-but-empty field, not just a slightly duller focus
+   ring the browser default alone doesn't reliably provide. */
+.input-field:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
 .input-field.input-error {
     border-color: var(--danger);
     box-shadow: 0 0 0 2px rgba(231, 76, 60, 0.15);
@@ -825,6 +833,29 @@ input[type='checkbox']:checked::after {
     border-top: 1px solid var(--border);
 }
 
+/* Explanatory text shown in place of a Master-only field the operator may not use — e.g. the
+   Master key's name/scopes in the Edit Key modal. Styled as guidance rather than an error: nothing
+   has gone wrong, the control simply isn't editable here. */
+.rbac-note {
+    padding: 0.7rem 0.9rem;
+    border-radius: 8px;
+    background-color: rgba(61, 174, 233, 0.07);
+    border: 1px solid rgba(61, 174, 233, 0.22);
+    border-left: 3px solid var(--highlight);
+    color: var(--text-muted);
+    font-size: 0.85rem;
+    line-height: 1.5;
+}
+
+.rbac-note strong {
+    color: var(--text-main);
+}
+
+.rbac-note em {
+    color: var(--highlight);
+    font-style: normal;
+}
+
 /* ─── Pagination ────────────────────────────────────────── */
 
 .pagination {
@@ -1080,6 +1111,14 @@ input[type='checkbox']:checked::after {
 
 .mt-2 {
     margin-top: 0.5rem;
+}
+
+.mt-4 {
+    margin-top: 1rem;
+}
+
+.mb-4 {
+    margin-bottom: 1rem;
 }
 
 /* ─── Responsive ─────────────────────────────────────────── */

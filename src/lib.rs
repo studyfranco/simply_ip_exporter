@@ -50,6 +50,7 @@ pub fn create_app(state: AppState) -> Router {
         .route("/keys/{id}", put(api::update_api_key))
         .route("/keys/{id}", delete(api::delete_api_key))
         .route("/keys/{id}/rotate", post(api::rotate_api_key))
+        .route("/keys/{id}/rotate-secret", post(api::rotate_signing_secret))
         .route("/endpoints", post(api::create_endpoint))
         .route("/endpoints", get(api::list_endpoints))
         .route("/endpoints/{id}", put(api::update_endpoint))

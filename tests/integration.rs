@@ -430,6 +430,93 @@ async fn key_update_rotate_and_delete_each_write_their_own_audit_entry() {
     assert!(update_entry["details"].as_str().unwrap().contains("name"));
 }
 
+/// `POST /api/keys/{id}/rotate-secret` is narrower than `POST /api/keys/{id}/rotate`: it must
+/// replace only the HMAC signing secret, leaving the X-API-Key itself (and every other field)
+/// exactly as they were — verified here by actually authenticating with the pre- and
+/// post-rotation secret pairs, not just inspecting the response body.
+#[tokio::test]
+async fn rotating_the_signing_secret_alone_leaves_the_api_key_and_scopes_unchanged() {
+    let db = setup_test_db().await;
+    let master = insert_key(&db, true, true).await;
+    let state = test_state(&db).with_pinned_master(master.model.id);
+    let app = create_app(state);
+
+    let create = app
+        .clone()
+        .oneshot(signed_request(
+            "POST",
+            "/api/keys",
+            &master,
+            r#"{"name":"Rotatable Key","can_manage_keys":true}"#,
+        ))
+        .await
+        .unwrap();
+    let minted = body_json(create).await;
+    let key_id = minted["id"].as_str().unwrap().to_owned();
+    let api_key = minted["api_key"].as_str().unwrap().to_owned();
+    let old_secret = minted["signing_secret"].as_str().unwrap().to_owned();
+    let old_seeded = common::reseal_key(&master, api_key.clone(), old_secret.clone());
+
+    // The pre-rotation credentials work right after minting.
+    let pre = app.clone().oneshot(signed_request("GET", "/api/auth/me", &old_seeded, "")).await.unwrap();
+    assert_eq!(pre.status(), StatusCode::OK);
+
+    let rotate = app
+        .clone()
+        .oneshot(signed_request("POST", &format!("/api/keys/{key_id}/rotate-secret"), &master, ""))
+        .await
+        .unwrap();
+    assert_eq!(rotate.status(), StatusCode::OK);
+    let rotated = body_json(rotate).await;
+    assert_eq!(rotated["id"], key_id, "the id must be unchanged");
+    assert_eq!(rotated["name"], "Rotatable Key", "the name must be unchanged");
+    assert!(rotated.get("api_key").is_none(), "the response must not carry an api_key field — it never changes");
+    let new_secret = rotated["signing_secret"].as_str().unwrap().to_owned();
+    assert_ne!(new_secret, old_secret, "a real rotation must actually produce a different secret");
+
+    // The OLD signing secret no longer authenticates...
+    let stale = app.clone().oneshot(signed_request("GET", "/api/auth/me", &old_seeded, "")).await.unwrap();
+    assert_eq!(stale.status(), StatusCode::UNAUTHORIZED, "the pre-rotation signing secret must stop working");
+
+    // ...but the SAME X-API-Key, now paired with the NEW secret, does — proving the key itself
+    // was never touched, only the signing half of the credential.
+    let new_seeded = common::reseal_key(&master, api_key, new_secret);
+    let fresh = app.clone().oneshot(signed_request("GET", "/api/auth/me", &new_seeded, "")).await.unwrap();
+    assert_eq!(fresh.status(), StatusCode::OK);
+    let identity = body_json(fresh).await;
+    assert_eq!(identity["name"], "Rotatable Key");
+    assert_eq!(identity["can_manage_keys"], true, "can_manage_keys must survive a secret-only rotation");
+
+    let logs = fetch_audit_logs(app, &master).await;
+    assert!(
+        logs.iter().any(|l| l["action"] == "KEY_SECRET_ROTATE"
+            && l["target_resource"].as_str().is_some_and(|t| t.contains(&key_id))),
+        "expected a KEY_SECRET_ROTATE audit entry for key {key_id}, got: {logs:#?}"
+    );
+}
+
+/// The Master key's credential must stay unreachable through the API via *either* rotation route
+/// — `guard_master_delete_or_rotate` is shared by both, but this pins the narrower endpoint's own
+/// behavior rather than relying on that being true by implication.
+#[tokio::test]
+async fn the_master_key_cannot_rotate_its_own_signing_secret_through_the_api() {
+    let db = setup_test_db().await;
+    let master = insert_key(&db, true, true).await;
+    let state = test_state(&db).with_pinned_master(master.model.id);
+    let app = create_app(state);
+
+    let response = app
+        .oneshot(signed_request(
+            "POST",
+            &format!("/api/keys/{}/rotate-secret", master.model.id),
+            &master,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
 #[tokio::test]
 async fn endpoint_create_update_delete_and_owner_reassign_each_write_an_audit_entry() {
     let db = setup_test_db().await;

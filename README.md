@@ -171,7 +171,8 @@ Two tiers, per `AGENT.MD`:
 | `GET /api/keys` | Master | List every local API key (never returns secrets). |
 | `PUT /api/keys/{id}` | Master | Rename, rebind IPs, or grant/revoke `can_manage_keys`. |
 | `DELETE /api/keys/{id}` | Master | Delete a key (not the Master itself). |
-| `POST /api/keys/{id}/rotate` | Master | Re-mint a key's secret + signing secret. |
+| `POST /api/keys/{id}/rotate` | Master | Re-mint a key's secret + signing secret (both halves change). |
+| `POST /api/keys/{id}/rotate-secret` | Master | Re-mint only the signing secret — the API key, name, and `can_manage_keys` are untouched. |
 | `POST /api/endpoints` | any authenticated key | Create a feed endpoint, owned by the caller. |
 | `GET /api/endpoints` | any authenticated key | List endpoints (Master sees all; a Daughter sees only its own). |
 | `PUT /api/endpoints/{id}` | owner or Master | Update an endpoint's configuration. |
@@ -254,7 +255,7 @@ orchestrators, load balancers) cannot compute an HMAC signature.
 ```sh
 cargo check --all-targets
 cargo clippy --all-targets -- -D warnings
-cargo test                     # 102 unit + 4 main.rs unit + 28 integration + 13 source-hygiene tests
+cargo test                     # 102 unit + 4 main.rs unit + 30 integration + 13 source-hygiene tests
 ./scripts/verify_convergence.sh  # source hygiene (raw SQL, unwrap/expect, frontend syntax/DOM refs) + clippy -D warnings + cargo test, one gate
 ./scripts/test_e2e.sh          # full live E2E against a real simply_ip_vault + simply_ip_exporter pair
 ```

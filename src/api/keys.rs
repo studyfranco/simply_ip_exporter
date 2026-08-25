@@ -349,3 +349,67 @@ pub async fn rotate_api_key(
 
     Ok(Json(MintedKeyResponse { key: updated.into(), api_key: plaintext_key, signing_secret }))
 }
+
+/// Response after rotating only an API key's HMAC signing secret. Deliberately narrower than
+/// [`MintedKeyResponse`]: no `api_key`, since this operation never changes it.
+#[derive(Serialize)]
+pub struct RotateSigningSecretResponse {
+    /// Key ID — unchanged by this operation.
+    id: Uuid,
+    /// Key name — unchanged by this operation, echoed back so the caller can confirm which key it
+    /// just re-keyed without a second lookup.
+    name: String,
+    /// The new signing secret, in plaintext. Returned only here: the stored copy is encrypted at
+    /// rest when `EXPORTER_ENCRYPTION_KEY` is set, and no read endpoint ever echoes it.
+    signing_secret: String,
+}
+
+/// `POST /api/keys/{id}/rotate-secret` — replaces a key's HMAC signing secret in place, leaving
+/// its `X-API-Key`, name, `bound_ips`, and `can_manage_keys` untouched.
+///
+/// Distinct from [`rotate_api_key`] (`POST /api/keys/{id}/rotate`), which replaces *both*
+/// credential halves and therefore invalidates the API key too. This narrower operation exists
+/// because the two secrets have different blast radii: rotating `X-API-Key` forces every client to
+/// be reconfigured with a new identity, whereas rotating only the signing secret re-keys the HMAC
+/// while the key's id, name, `bound_ips`, and `can_manage_keys` stay exactly as they were — the
+/// right tool for routine credential hygiene. Ported from `simply_ip_vault`'s identical
+/// `rotate_signing_secret` handler and its own `RotateSigningSecretResponse`.
+///
+/// The previous signing secret stops working the instant this returns — the column is
+/// overwritten, not versioned — so callers must be updated in lockstep.
+pub async fn rotate_signing_secret(
+    State(state): State<AppState>,
+    Extension(caller): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
+    StrictPath(id): StrictPath,
+) -> Result<impl IntoResponse, AppError> {
+    require_master(&caller)?;
+
+    let existing = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    guard_master_delete_or_rotate(&existing, "rotated")?;
+
+    let signing_secret = generate_signing_secret();
+    let name = existing.name.clone();
+
+    // Only `signing_secret` (and the bookkeeping `updated_at`) is touched: `key_hash`, `prefix`,
+    // `name`, `bound_ips`, and `can_manage_keys` are left untouched by construction.
+    let mut active: api_key::ActiveModel = existing.into();
+    active.signing_secret = Set(Some(state.cipher.seal(&signing_secret).map_err(|e| {
+        tracing::error!("Failed to seal signing secret: {e}");
+        AppError::Internal
+    })?));
+    active.updated_at = Set(Utc::now().naive_utc());
+    let updated = active.update(&state.db).await?;
+
+    create_audit_log(
+        &state.db,
+        &caller,
+        client_ip.0,
+        "KEY_SECRET_ROTATE",
+        Some(describe_resource("api_key", updated.id, &updated.name)),
+        Some("signing secret rotated".to_owned()),
+    )
+    .await?;
+
+    Ok(Json(RotateSigningSecretResponse { id: updated.id, name, signing_secret }))
+}

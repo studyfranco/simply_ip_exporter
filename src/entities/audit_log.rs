@@ -22,7 +22,8 @@ pub struct Model {
     /// The caller's resolved client IP (see `middleware::ClientIp`).
     pub client_ip: String,
     /// Operation type, e.g. `KEY_CREATE`, `KEY_UPDATE`, `KEY_DELETE`, `KEY_ROTATE`,
-    /// `ENDPOINT_CREATE`, `ENDPOINT_UPDATE`, `ENDPOINT_DELETE`, `ENDPOINT_OWNER_REASSIGN`.
+    /// `KEY_SECRET_ROTATE`, `ENDPOINT_CREATE`, `ENDPOINT_UPDATE`, `ENDPOINT_DELETE`,
+    /// `ENDPOINT_OWNER_REASSIGN`.
     pub action: String,
     /// The resource the action targeted, e.g. `api_key:<id> (<name>)` or `endpoint:<id> (<name>)`.
     pub target_resource: Option<String>,

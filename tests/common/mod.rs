@@ -58,6 +58,16 @@ pub async fn insert_key(db: &DatabaseConnection, is_master: bool, can_manage_key
     SeededKey { plaintext_key, signing_secret, model: inserted }
 }
 
+/// Rebuilds a `SeededKey` around a different `X-API-Key`/signing-secret pair while keeping the
+/// same database row — for tests that need to sign as a key whose credentials were rotated
+/// mid-test (e.g. verifying a *pre-rotation* secret is rejected, or a *post-rotation* one is
+/// accepted). `signed_request`/`signed_request_at` only ever read `plaintext_key`/`signing_secret`
+/// off a `SeededKey`, never `model`, so cloning it here is safe even though the row's own
+/// `key_hash`/`signing_secret` columns have since changed.
+pub fn reseal_key(base: &SeededKey, plaintext_key: String, signing_secret: String) -> SeededKey {
+    SeededKey { plaintext_key, signing_secret, model: base.model.clone() }
+}
+
 fn sign(secret: &str, method: &str, target: &str, timestamp: &str, body: &[u8]) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("any length key");
     mac.update(method.as_bytes());

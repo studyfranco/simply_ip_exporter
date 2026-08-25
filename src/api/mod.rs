@@ -21,4 +21,6 @@ pub use audit::list_audit_logs;
 pub use auth::get_me;
 pub use endpoints::{create_endpoint, delete_endpoint, list_endpoints, reassign_endpoint_owner, update_endpoint};
 pub use health::{health_check, readiness_check};
-pub use keys::{create_api_key, delete_api_key, list_api_keys, rotate_api_key, update_api_key};
+pub use keys::{
+    create_api_key, delete_api_key, list_api_keys, rotate_api_key, rotate_signing_secret, update_api_key,
+};

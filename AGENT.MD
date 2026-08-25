@@ -174,9 +174,11 @@ To protect the underlying storage hardware, **IP records are kept strictly in-me
    - **Immutable through the API** beyond its own `bound_ips`: `PUT /api/keys/{id}` refuses any
      request touching `name` or `can_manage_keys` when the target is the Master
      (`api::guards::guard_master_update`), and deletion/rotation are refused outright
-     (`api::guards::guard_master_delete_or_rotate`). `is_master` itself needs no separate guard — it
-     is not a field on `CreateKeyPayload`/`UpdateKeyPayload` at all, so no request body can name it
-     regardless of which key is targeted.
+     (`api::guards::guard_master_delete_or_rotate`, shared by both `POST /api/keys/{id}/rotate`
+     — replaces the API key *and* signing secret — and the narrower `POST
+     /api/keys/{id}/rotate-secret`, which replaces only the signing secret). `is_master` itself
+     needs no separate guard — it is not a field on `CreateKeyPayload`/`UpdateKeyPayload` at all, so
+     no request body can name it regardless of which key is targeted.
 2. **Daughter Keys:** Created by the Master key (`can_manage_keys = false`).
    - May create, edit, and delete their own endpoints/feeds.
    - May **NEVER** create, modify, or list other API keys.
