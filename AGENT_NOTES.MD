@@ -1,5 +1,88 @@
 # Agent Worklog — `simply_ip_exporter`
 
+## 2026-08-25 (session 15) — Per-key Vault-group read permissions: the feature scoped in session 14
+
+Session 14 ended by asking the user to confirm scope on a real M:N permission layer before building
+it, rather than assuming — it would reverse AGENT.MD's own documented "two tiers, not three"
+reasoning if built the wrong way. The user confirmed full enforcement, with four specific design
+constraints that shaped the implementation below.
+
+### The four constraints, and how each landed
+
+1. **"You create a table with the Key ID and the ID group from ip_vault... don't create a table
+   for the ip group."** One new table, `vault_group_permissions` (`api_key_id`, `vault_group_id`,
+   `vault_group_name`, `created_at`) — no local mirror/cache table of Vault's groups themselves.
+   `vault_group_id` references Vault's own group id but is **not** a local foreign key: Vault is a
+   separate service/database, reachable only over HTTP, so this database cannot enforce referential
+   integrity against it the way `example/simply_ip_vault`'s own `api_key_group_permissions` enforces
+   against its local `ip_groups`. See `SCHEMA.MD` §4 and `AGENT.MD`'s new "Per-key Vault-group read
+   permissions" section for why this is narrower than vault's own model, not a reversal of "two
+   tiers, not three" — one right (read) instead of vault's four, and a scope on one external
+   dependency rather than a second axis of control over endpoint ownership.
+2. **"This ID is usefull for the endpoint too... simply_ip_exporter have to a[n] endpoint to list
+   the group in the ip vault."** New `GET /api/vault-groups` (Master-only, live `VaultClient::
+   list_groups()` — added alongside the existing `fetch_ips`, both now sharing a `signed_get<T>`
+   helper). The Edit Key modal's new "Vault Group Access" section and both endpoint forms' new
+   group-hint both consume this same live listing/the local grants it backs.
+3. **"In web UI show the name with ID in ()."** Every place a group is displayed — the Edit Key
+   modal's grant checkboxes — reads `name (id)`.
+4. **"If in the vault they remove a group, you don't care, and keep the group reference... create a
+   recuring task who clean the database (1 time per month, but check before the connexion to the
+   vault. Don't remove group if they have no connexion)."** `groups::spawn_group_permission_cleanup_
+   worker` — a second background loop (once at boot, then every 30 days) alongside the existing
+   sync worker. Lists Vault's current groups; a grant whose `vault_group_id` isn't among them is
+   deleted — but **only** after that listing call actually succeeds. `state.vault_client.is_none()`
+   or a failed/unreachable call skips the cycle entirely, touching nothing, rather than treating
+   "couldn't ask" as "doesn't exist."
+
+### Enforcement
+
+`api::endpoints::validate_group_access`, called from both `create_endpoint` and `update_endpoint`
+whenever `vault_groups` is being set: a no-op for Master ("master can see all group[s]" — the user's
+own framing), but for a Daughter, every comma-separated group name must have a grant
+(`api::groups::granted_group_names`, matched against each grant's snapshotted `vault_group_name` —
+no live Vault call on the request path). Naming even one ungranted group refuses the *entire*
+request, not just the ungranted part — a partial grant is not a partial pass, verified by
+`a_daughter_can_use_a_group_once_granted_but_not_others`.
+
+Granting itself (`POST /api/keys/{id}/groups`) takes only `vault_group_id` in the payload — its
+name is resolved from a **fresh** Vault call, never trusted from the client, so a grant can never
+record a name that doesn't actually match the id, and a nonexistent id is refused outright (caught
+at grant time, not discovered later as a silently-broken reference). Idempotent: granting an
+already-granted group returns the existing row rather than a conflict.
+
+### A pre-existing-test ripple, fixed forward
+
+Four existing integration tests created an endpoint as a Daughter key with no group grant at all —
+correct under the old rules, now correctly refused under the new ones. Rather than weakening the
+new enforcement, added `common::grant_group` (a direct-DB-insert fixture helper, the same trade
+`insert_key` already makes for `api_keys` — the real `POST /api/keys/{id}/groups` route needs a
+live Vault to independently verify the group exists, which most of this suite's `test_state()`
+instances don't have) and granted the relevant group in each of the four tests before endpoint
+creation. Also added `common::test_state_with_vault` for the handful of new tests that *do* need a
+real (mocked) Vault — `granting_and_revoking_group_access_round_trips_through_a_live_vault` boots a
+throwaway `GET /api/groups` server and drives the full list → grant (rejecting a bogus id first) →
+use the group → revoke → the group is unusable again → both audit entries cycle end-to-end.
+
+### Verification performed
+
+- `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`: clean.
+- `cargo test`: 161 passed, 0 failed (149 → 161: 4 new `vault_client`/`groups` unit tests plus the
+  cleanup worker's own 4-test suite, 7 new integration tests, all four ripple-fixed).
+- `./scripts/verify_convergence.sh`: all 13 named checks pass.
+- `./scripts/test_e2e.sh`: 110/110 checks pass, unchanged — every endpoint `test_e2e.sh` creates as
+  a Daughter key only ever calls `GET /api/auth/me`/a rejected `GET /api/audit-logs`; every actual
+  `POST /api/endpoints` in that script is Master's, which the new enforcement never touches. Not
+  extended with a dedicated live-Vault e2e scenario for this feature this session — the mocked-Vault
+  integration test above is the round-trip coverage; a real `test_e2e.sh` section would be a
+  reasonable follow-up if this feature turns out to need it, not added speculatively here.
+- Manual: fixture-driven screenshot of the Edit Key modal's new "Vault Group Access" section,
+  cross-checked against `getComputedStyle`/`getBoundingClientRect()` output (not just the
+  screenshot pixels — an unchecked/checked pair of 18×18px checkboxes on a dark background is easy
+  to misjudge by eye at screenshot resolution) confirming the checked (`fail2ban`, granted) and
+  unchecked (`pfBlocker_Blacklist`, not granted) rows render with the correct accent-green vs.
+  bg-input background respectively.
+
 ## 2026-08-25 (session 14) — Human-readable/compact audit rows, Edit Endpoint modal + Bound IPs everywhere
 
 Four asks; the first three landed, the fourth (a per-API-key, per-Vault-group read-permission

@@ -10,7 +10,11 @@ use sea_orm::{ActiveModelTrait, ActiveValue::Set, Database, DatabaseConnection};
 use sea_orm_migration::MigratorTrait;
 use sha2::Sha256;
 use simply_ip_exporter::{
-    api::support::hash_key, config::RuntimeConfig, crypto::SecretCipher, entities::api_key, migration,
+    api::support::hash_key,
+    config::RuntimeConfig,
+    crypto::SecretCipher,
+    entities::{api_key, vault_group_permission},
+    migration,
     state::AppState,
 };
 use uuid::Uuid;
@@ -25,6 +29,19 @@ pub async fn setup_test_db() -> DatabaseConnection {
 /// Builds application state around a database handle, with plaintext secret storage.
 pub fn test_state(db: &DatabaseConnection) -> AppState {
     AppState::new(db.clone(), Arc::new(RuntimeConfig::default()), Arc::new(SecretCipher::Plaintext))
+}
+
+/// As [`test_state`], but with a `VaultClient` configured against `vault_base_url` — for tests
+/// that exercise a route needing a live (mocked) Vault, e.g. `POST /api/keys/{id}/groups`
+/// independently re-verifying the group exists before granting it.
+pub fn test_state_with_vault(db: &DatabaseConnection, vault_base_url: String) -> AppState {
+    let config = RuntimeConfig {
+        vault_base_url: Some(vault_base_url),
+        vault_api_key: Some("vault-key".to_owned()),
+        vault_signing_secret: Some("vault-signing-secret".to_owned()),
+        ..RuntimeConfig::default()
+    };
+    AppState::new(db.clone(), Arc::new(config), Arc::new(SecretCipher::Plaintext))
 }
 
 /// A seeded key: its plaintext secret, signing secret, and database row.
@@ -66,6 +83,25 @@ pub async fn insert_key(db: &DatabaseConnection, is_master: bool, can_manage_key
 /// `key_hash`/`signing_secret` columns have since changed.
 pub fn reseal_key(base: &SeededKey, plaintext_key: String, signing_secret: String) -> SeededKey {
     SeededKey { plaintext_key, signing_secret, model: base.model.clone() }
+}
+
+/// Directly inserts a `vault_group_permissions` row — the test-fixture equivalent of `insert_key`
+/// for group grants. `POST /api/keys/{id}/groups` (the real API route) requires a live, configured
+/// `VaultClient` to independently verify the group actually exists before granting it (see
+/// `api::groups::grant_key_group`'s own doc comment), which most of this suite's `test_state()`
+/// instances don't have — they run against an in-memory database with no Vault to call. Bypassing
+/// the API here is the same trade this whole file already makes for `api_keys` themselves.
+pub async fn grant_group(db: &DatabaseConnection, api_key_id: Uuid, group_name: &str) -> Uuid {
+    let vault_group_id = Uuid::new_v4();
+    let model = vault_group_permission::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        api_key_id: Set(api_key_id),
+        vault_group_id: Set(vault_group_id),
+        vault_group_name: Set(group_name.to_owned()),
+        created_at: Set(Utc::now().naive_utc()),
+    };
+    model.insert(db).await.expect("insert succeeds");
+    vault_group_id
 }
 
 fn sign(secret: &str, method: &str, target: &str, timestamp: &str, body: &[u8]) -> String {

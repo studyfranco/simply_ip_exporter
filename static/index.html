@@ -215,6 +215,17 @@
           The Master key's name and scopes are fixed at bootstrap and cannot be changed here — only
           its <em>Bound IPs</em> may be edited.
         </p>
+        <!-- Master-only; hidden entirely when editing the Master key itself (it bypasses group
+             grants, so there is nothing to assign). Each checkbox grants/revokes immediately on
+             toggle — a separate action from "Save Changes" above, which only ever touches
+             name/bound_ips/can_manage_keys. -->
+        <div class="form-group" id="edit-key-groups-section">
+          <label>Vault Group Access</label>
+          <div id="edit-key-groups-list" class="permissions-grid mt-2 mb-4">
+            <span class="text-muted text-sm">Loading…</span>
+          </div>
+          <div id="edit-key-groups-error" class="message error hidden"></div>
+        </div>
         <div class="modal-actions mt-4">
           <button type="button" id="edit-key-cancel" class="btn btn-cancel">Cancel</button>
           <button type="submit" class="btn btn-primary">Save Changes</button>
@@ -244,6 +255,7 @@
         <div class="form-group">
           <label for="ep-groups">Vault groups (comma-separated) <span>*</span></label>
           <input type="text" id="ep-groups" class="input-field" placeholder="fail2ban,sshd" required />
+          <small class="field-hint" id="ep-groups-hint"></small>
         </div>
         <div class="form-group">
           <label for="ep-ttl">TTL seconds</label>
@@ -288,6 +300,7 @@
         <div class="form-group">
           <label for="edit-ep-groups">Vault groups (comma-separated) <span>*</span></label>
           <input type="text" id="edit-ep-groups" class="input-field" required />
+          <small class="field-hint" id="edit-ep-groups-hint"></small>
         </div>
         <div class="form-group">
           <label for="edit-ep-ttl">TTL seconds</label>

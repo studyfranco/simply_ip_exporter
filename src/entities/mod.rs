@@ -12,3 +12,5 @@ pub mod api_key;
 pub mod audit_log;
 /// The `endpoints` table: public feed route configuration.
 pub mod endpoint;
+/// The `vault_group_permissions` table: which local API keys may reference which Vault groups.
+pub mod vault_group_permission;

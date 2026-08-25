@@ -206,6 +206,37 @@ exactly the checks a two-tier model actually needs (`require_master`,
 `guard_master_delete_or_rotate`, `guard_master_update`) — not a scaffold for tiers this crate does
 not have.
 
+### Per-key Vault-group read permissions — narrower than it looks, not a third tier
+
+`vault_group_permissions` (added at the user's explicit request) is an M:N table — a Daughter key's
+`vault_groups` on `POST`/`PUT /api/endpoints` is refused unless every named group is one the key
+holds a grant for (`api::endpoints::validate_group_access`); Master is exempt entirely (`api::groups`
+handles listing Vault's groups and granting/revoking access). Read next to the section above, this
+can look like exactly the M:N per-resource permission model that section says this crate doesn't
+need. It isn't, for two reasons:
+
+- **One right, not several.** `example/simply_ip_vault`'s `api_key_group_permissions` grants
+  `can_read`/`can_write`/`can_delete`/`can_manage` independently because its keys can mutate IP
+  groups. This crate never writes to Vault at all — it only ever reads and republishes — so there is
+  exactly one right to grant, and a grant's mere existence *is* the permission. No conjunction rules,
+  no verb hierarchy.
+- **It restricts what a Daughter may *read from Vault*, not who may administer what within this
+  crate.** Endpoint ownership is still the single, exclusive `owner_key_id` pointer the section above
+  describes — this table adds no second axis of control over an endpoint, no delegated-grant
+  mechanism between two local keys, and no Parent tier. It is a scope on one external dependency
+  (which Vault groups a key's own endpoints may name), layered onto the *existing* two-tier model,
+  not a third tier replacing it.
+
+A grant references Vault's own group by id, not by a local foreign key — Vault is a separate
+service/database, reachable only over HTTP, so this crate cannot enforce referential integrity
+against it the way vault enforces its own `ip_groups` FK. A grant therefore survives its Vault group
+being renamed or deleted with no signal at all; the only place that's ever reconciled is
+`groups::spawn_group_permission_cleanup_worker`, a background task (once at boot, then monthly) that
+removes a grant only after a live call to Vault's group list *succeeds* and shows the group is
+genuinely gone — an unreachable or failed Vault call skips that cycle entirely rather than deleting
+everything on the assumption an absent answer means an absent group. See `SCHEMA.MD` §4 for the full
+column reference.
+
 ### Endpoint ownership: transfer and the `DELETE /api/keys/{id}` conflict
 
 An endpoint's `owner_key_id` is a single, exclusive pointer, reassignable in two ways:

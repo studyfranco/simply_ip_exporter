@@ -5,9 +5,33 @@ mod common;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use common::{insert_key, setup_test_db, signed_request, signed_request_at, test_state, with_connect_info};
+use common::{
+    insert_key, setup_test_db, signed_request, signed_request_at, test_state, test_state_with_vault,
+    with_connect_info,
+};
 use simply_ip_exporter::create_app;
 use tower::ServiceExt;
+
+/// Boots a throwaway HTTP server on an OS-assigned loopback port that answers `GET /api/groups`
+/// with a fixed, unsigned JSON body — enough for `VaultClient::list_groups()` to parse, since this
+/// suite never verifies Vault's own auth (that's `simply_ip_vault`'s concern, not this crate's).
+async fn spawn_mock_vault_groups(groups: serde_json::Value) -> (String, tokio::task::JoinHandle<()>) {
+    use axum::{Router, routing::get};
+
+    let app = Router::new().route(
+        "/api/groups",
+        get(move || {
+            let groups = groups.clone();
+            async move { axum::Json(groups) }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback bind always succeeds");
+    let addr = listener.local_addr().expect("a bound listener has a local address");
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}"), handle)
+}
 
 async fn body_json(response: axum::response::Response) -> serde_json::Value {
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("body reads");
@@ -159,6 +183,7 @@ async fn a_daughter_key_can_manage_only_its_own_endpoints() {
     let master = insert_key(&db, true, true).await;
     let owner = insert_key(&db, false, false).await;
     let other = insert_key(&db, false, false).await;
+    common::grant_group(&db, owner.model.id, "fail2ban").await;
     let state = test_state(&db).with_pinned_master(master.model.id);
     let app = create_app(state);
 
@@ -517,6 +542,299 @@ async fn the_master_key_cannot_rotate_its_own_signing_secret_through_the_api() {
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
 
+// ── Vault-group read permissions ────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_daughter_cannot_name_an_ungranted_group_in_a_new_endpoint() {
+    let db = setup_test_db().await;
+    let master = insert_key(&db, true, true).await;
+    let daughter = insert_key(&db, false, false).await;
+    let state = test_state(&db).with_pinned_master(master.model.id);
+    let app = create_app(state);
+
+    let response = app
+        .oneshot(signed_request(
+            "POST",
+            "/api/endpoints",
+            &daughter,
+            r#"{"name":"Unauthorized Feed","vault_groups":"fail2ban"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = body_json(response).await;
+    assert!(
+        body["error"].as_str().is_some_and(|s| s.contains("fail2ban")),
+        "the error should name the ungranted group: {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_daughter_can_use_a_group_once_granted_but_not_others() {
+    let db = setup_test_db().await;
+    let master = insert_key(&db, true, true).await;
+    let daughter = insert_key(&db, false, false).await;
+    common::grant_group(&db, daughter.model.id, "fail2ban").await;
+    let state = test_state(&db).with_pinned_master(master.model.id);
+    let app = create_app(state);
+
+    let granted = app
+        .clone()
+        .oneshot(signed_request(
+            "POST",
+            "/api/endpoints",
+            &daughter,
+            r#"{"name":"Authorized Feed","vault_groups":"fail2ban"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(granted.status(), StatusCode::OK, "the granted group must be accepted");
+
+    // Naming a second, ungranted group alongside the granted one is refused in full — a partial
+    // grant is not a partial pass.
+    let mixed = app
+        .oneshot(signed_request(
+            "POST",
+            "/api/endpoints",
+            &daughter,
+            r#"{"name":"Mixed Feed","vault_groups":"fail2ban,sshd"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(mixed.status(), StatusCode::FORBIDDEN);
+    let body = body_json(mixed).await;
+    assert!(body["error"].as_str().is_some_and(|s| s.contains("sshd")), "the error should name sshd: {body:?}");
+    assert!(
+        !body["error"].as_str().is_some_and(|s| s.contains("fail2ban")),
+        "fail2ban is granted and must not be listed as missing: {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn updating_an_endpoint_to_an_ungranted_group_is_refused_and_changes_nothing() {
+    let db = setup_test_db().await;
+    let master = insert_key(&db, true, true).await;
+    let daughter = insert_key(&db, false, false).await;
+    common::grant_group(&db, daughter.model.id, "fail2ban").await;
+    let state = test_state(&db).with_pinned_master(master.model.id);
+    let app = create_app(state);
+
+    let create = app
+        .clone()
+        .oneshot(signed_request(
+            "POST",
+            "/api/endpoints",
+            &daughter,
+            r#"{"name":"My Feed","vault_groups":"fail2ban"}"#,
+        ))
+        .await
+        .unwrap();
+    let id = body_json(create).await["id"].as_str().unwrap().to_owned();
+
+    let update = app
+        .clone()
+        .oneshot(signed_request(
+            "PUT",
+            &format!("/api/endpoints/{id}"),
+            &daughter,
+            r#"{"vault_groups":"sshd"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(update.status(), StatusCode::FORBIDDEN);
+
+    let list = app.oneshot(signed_request("GET", "/api/endpoints", &daughter, "")).await.unwrap();
+    let endpoints = body_json(list).await;
+    let ep = endpoints.as_array().unwrap().iter().find(|e| e["id"] == id).expect("the endpoint still exists");
+    assert_eq!(ep["vault_groups"], "fail2ban", "the refused update must not have changed vault_groups");
+}
+
+/// "Master can see all groups" (the user's own framing) — the enforcement in
+/// `endpoints::validate_group_access` is a no-op for a Master caller, matching every other
+/// Master-bypasses-restriction rule already in this crate.
+#[tokio::test]
+async fn the_master_key_is_never_restricted_by_vault_group_grants() {
+    let db = setup_test_db().await;
+    let master = insert_key(&db, true, true).await;
+    let state = test_state(&db).with_pinned_master(master.model.id);
+    let app = create_app(state);
+
+    let response = app
+        .oneshot(signed_request(
+            "POST",
+            "/api/endpoints",
+            &master,
+            r#"{"name":"Master Feed","vault_groups":"anything_at_all"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_daughter_may_view_only_its_own_group_grants() {
+    let db = setup_test_db().await;
+    let master = insert_key(&db, true, true).await;
+    let daughter = insert_key(&db, false, false).await;
+    let other = insert_key(&db, false, false).await;
+    common::grant_group(&db, daughter.model.id, "fail2ban").await;
+    let state = test_state(&db).with_pinned_master(master.model.id);
+    let app = create_app(state);
+
+    let own = app
+        .clone()
+        .oneshot(signed_request("GET", &format!("/api/keys/{}/groups", daughter.model.id), &daughter, ""))
+        .await
+        .unwrap();
+    assert_eq!(own.status(), StatusCode::OK);
+    let grants = body_json(own).await;
+    assert_eq!(grants.as_array().unwrap().len(), 1);
+    assert_eq!(grants[0]["vault_group_name"], "fail2ban");
+
+    let someone_elses = app
+        .clone()
+        .oneshot(signed_request("GET", &format!("/api/keys/{}/groups", daughter.model.id), &other, ""))
+        .await
+        .unwrap();
+    assert_eq!(someone_elses.status(), StatusCode::FORBIDDEN);
+
+    // Master may view any key's grants.
+    let as_master = app
+        .oneshot(signed_request("GET", &format!("/api/keys/{}/groups", daughter.model.id), &master, ""))
+        .await
+        .unwrap();
+    assert_eq!(as_master.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn listing_vault_groups_requires_master_and_a_configured_vault() {
+    let db = setup_test_db().await;
+    let master = insert_key(&db, true, true).await;
+    let daughter = insert_key(&db, false, false).await;
+    let state = test_state(&db).with_pinned_master(master.model.id);
+    let app = create_app(state);
+
+    let as_daughter = app.clone().oneshot(signed_request("GET", "/api/vault-groups", &daughter, "")).await.unwrap();
+    assert_eq!(as_daughter.status(), StatusCode::FORBIDDEN);
+
+    // test_state() configures no Vault at all — Master still gets a clean, typed error, not a
+    // panic or an opaque 500.
+    let as_master = app.oneshot(signed_request("GET", "/api/vault-groups", &master, "")).await.unwrap();
+    assert_eq!(as_master.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// End-to-end against a mocked Vault: list → grant (rejecting a nonexistent group id first) →
+/// the newly granted Daughter can now use the group → revoke → audit entries for both halves.
+#[tokio::test]
+async fn granting_and_revoking_group_access_round_trips_through_a_live_vault() {
+    let db = setup_test_db().await;
+    let master = insert_key(&db, true, true).await;
+    let daughter = insert_key(&db, false, false).await;
+
+    let group_id = uuid::Uuid::new_v4();
+    let (vault_url, _server) = spawn_mock_vault_groups(serde_json::json!([
+        {"id": group_id, "name": "pfBlocker_Blacklist", "group_type": "banlist", "owner_key_id": null, "created_at": "2026-08-11T10:00:00"}
+    ]))
+    .await;
+    let state = test_state_with_vault(&db, vault_url).with_pinned_master(master.model.id);
+    let app = create_app(state);
+
+    let listed = app.clone().oneshot(signed_request("GET", "/api/vault-groups", &master, "")).await.unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    let groups = body_json(listed).await;
+    assert_eq!(groups.as_array().unwrap().len(), 1);
+    assert_eq!(groups[0]["name"], "pfBlocker_Blacklist");
+
+    // A grant naming a group id Vault doesn't have is refused, not silently recorded.
+    let bogus = app
+        .clone()
+        .oneshot(signed_request(
+            "POST",
+            &format!("/api/keys/{}/groups", daughter.model.id),
+            &master,
+            &format!(r#"{{"vault_group_id":"{}"}}"#, uuid::Uuid::new_v4()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(bogus.status(), StatusCode::BAD_REQUEST);
+
+    let grant = app
+        .clone()
+        .oneshot(signed_request(
+            "POST",
+            &format!("/api/keys/{}/groups", daughter.model.id),
+            &master,
+            &format!(r#"{{"vault_group_id":"{group_id}"}}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(grant.status(), StatusCode::OK);
+    let grant_body = body_json(grant).await;
+    assert_eq!(grant_body["vault_group_name"], "pfBlocker_Blacklist");
+    let permission_id = grant_body["id"].as_str().unwrap().to_owned();
+
+    // Granting the same group again is idempotent, not a conflict. A distinct timestamp (not
+    // `signed_request`'s "now", which a fast test can easily collide with the grant call above
+    // within the same second) — otherwise this would be a byte-identical repeat of that request,
+    // which the anti-replay guard correctly rejects as a replay rather than as a real second call.
+    let regrant = app
+        .clone()
+        .oneshot(signed_request_at(
+            "POST",
+            &format!("/api/keys/{}/groups", daughter.model.id),
+            &master,
+            &format!(r#"{{"vault_group_id":"{group_id}"}}"#),
+            chrono::Utc::now().timestamp() + 1,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(regrant.status(), StatusCode::OK);
+
+    let use_it = app
+        .clone()
+        .oneshot(signed_request(
+            "POST",
+            "/api/endpoints",
+            &daughter,
+            r#"{"name":"Now Authorized","vault_groups":"pfBlocker_Blacklist"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(use_it.status(), StatusCode::OK, "the newly granted group must now be usable");
+
+    let revoke = app
+        .clone()
+        .oneshot(signed_request(
+            "DELETE",
+            &format!("/api/keys/{}/groups/{permission_id}", daughter.model.id),
+            &master,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(revoke.status(), StatusCode::NO_CONTENT);
+
+    let now_refused = app
+        .clone()
+        .oneshot(signed_request(
+            "POST",
+            "/api/endpoints",
+            &daughter,
+            r#"{"name":"Revoked Now","vault_groups":"pfBlocker_Blacklist"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(now_refused.status(), StatusCode::FORBIDDEN, "the revoked group must no longer be usable");
+
+    let logs = fetch_audit_logs(app, &master).await;
+    for expected_action in ["KEY_GROUP_GRANT", "KEY_GROUP_REVOKE"] {
+        assert!(
+            logs.iter().any(|l| l["action"] == expected_action),
+            "expected a {expected_action} audit entry, got: {logs:#?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn endpoint_create_update_delete_and_owner_reassign_each_write_an_audit_entry() {
     let db = setup_test_db().await;
@@ -864,6 +1182,7 @@ async fn deleting_a_key_that_owns_endpoints_without_reassign_to_returns_409_with
     let db = setup_test_db().await;
     let master = insert_key(&db, true, true).await;
     let owner = insert_key(&db, false, false).await;
+    common::grant_group(&db, owner.model.id, "g1").await;
     let state = test_state(&db).with_pinned_master(master.model.id);
     let app = create_app(state);
 
@@ -904,6 +1223,7 @@ async fn deleting_a_key_with_reassign_to_atomically_moves_its_endpoints_and_dele
     let master = insert_key(&db, true, true).await;
     let owner = insert_key(&db, false, false).await;
     let new_owner = insert_key(&db, false, false).await;
+    common::grant_group(&db, owner.model.id, "g1").await;
     let state = test_state(&db).with_pinned_master(master.model.id);
     let app = create_app(state);
 
@@ -963,6 +1283,7 @@ async fn reassign_to_naming_a_nonexistent_key_is_rejected_and_changes_nothing() 
     let db = setup_test_db().await;
     let master = insert_key(&db, true, true).await;
     let owner = insert_key(&db, false, false).await;
+    common::grant_group(&db, owner.model.id, "g1").await;
     let state = test_state(&db).with_pinned_master(master.model.id);
     let app = create_app(state);
 

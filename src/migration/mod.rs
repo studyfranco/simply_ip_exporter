@@ -3,6 +3,7 @@ pub use sea_orm_migration::prelude::*;
 
 mod m20260811_115204_initial_schema;
 mod m20260811_152352_add_audit_logs;
+mod m20260825_075608_add_vault_group_permissions;
 
 /// The ordered set of all schema migrations for `simply_ip_exporter`.
 pub struct Migrator;
@@ -13,6 +14,7 @@ impl MigratorTrait for Migrator {
         vec![
             Box::new(m20260811_115204_initial_schema::Migration),
             Box::new(m20260811_152352_add_audit_logs::Migration),
+            Box::new(m20260825_075608_add_vault_group_permissions::Migration),
         ]
     }
 }

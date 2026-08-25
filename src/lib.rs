@@ -29,6 +29,7 @@ pub mod entities;
 pub mod error;
 pub mod extract;
 pub mod feed;
+pub mod groups;
 pub mod ipfilter;
 pub mod master;
 pub mod middleware;
@@ -57,6 +58,10 @@ pub fn create_app(state: AppState) -> Router {
         .route("/endpoints/{id}", delete(api::delete_endpoint))
         .route("/endpoints/{id}/owner", put(api::reassign_endpoint_owner))
         .route("/audit-logs", get(api::list_audit_logs))
+        .route("/vault-groups", get(api::list_vault_groups))
+        .route("/keys/{id}/groups", get(api::list_key_groups))
+        .route("/keys/{id}/groups", post(api::grant_key_group))
+        .route("/keys/{id}/groups/{permission_id}", delete(api::revoke_key_group))
         .layer(axum::middleware::from_fn_with_state(state.clone(), middleware::auth_middleware));
 
     Router::new()

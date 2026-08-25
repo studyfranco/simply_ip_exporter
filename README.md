@@ -162,7 +162,10 @@ Two tiers, per `AGENT.MD`:
   single database row for the life of the process (`src/master.rs`). Can manage every API key and
   every endpoint.
 - **Daughter** — created by Master (`can_manage_keys = false`), can create endpoints (which it
-  then owns) and manage only the endpoints it owns. Cannot manage API keys at all.
+  then owns) and manage only the endpoints it owns. Cannot manage API keys at all. Additionally
+  restricted to naming only Vault groups it holds a read grant for in its own endpoints'
+  `vault_groups` — Master grants these per key via `POST /api/keys/{id}/groups` and is itself
+  exempt from the restriction (see `AGENT.MD`'s "Per-key Vault-group read permissions").
 
 | Method & Path | Who | Purpose |
 | :--- | :--- | :--- |
@@ -179,6 +182,10 @@ Two tiers, per `AGENT.MD`:
 | `DELETE /api/endpoints/{id}` | owner or Master | Delete an endpoint and evict its in-memory cache. |
 | `PUT /api/endpoints/{id}/owner` | Master | Reassign an endpoint's owner. |
 | `GET /api/audit-logs` | Master | List the audit trail (most recent first), optionally filtered by `action` and paginated (`limit`/`offset`). |
+| `GET /api/vault-groups` | Master | List every group `simply_ip_vault` currently has (live, Vault-side scoped to this crate's own configured Vault key). |
+| `GET /api/keys/{id}/groups` | Master or the key itself | List a key's Vault-group read grants. |
+| `POST /api/keys/{id}/groups` | Master | Grant a key read access to a Vault group (by group id — independently re-verified against a fresh Vault call, not trusted from the request). Idempotent. |
+| `DELETE /api/keys/{id}/groups/{permission_id}` | Master | Revoke a previously granted Vault-group read right. |
 
 Every mutating route above (`POST`/`PUT`/`DELETE` on `/api/keys/*` and `/api/endpoints/*`) writes
 an entry to `audit_logs` after its write commits — see `SCHEMA.MD` §3. The write is not
@@ -255,14 +262,14 @@ orchestrators, load balancers) cannot compute an HMAC signature.
 ```sh
 cargo check --all-targets
 cargo clippy --all-targets -- -D warnings
-cargo test                     # 102 unit + 4 main.rs unit + 30 integration + 13 source-hygiene tests
+cargo test                     # 107 unit + 4 main.rs unit + 37 integration + 13 source-hygiene tests
 ./scripts/verify_convergence.sh  # source hygiene (raw SQL, unwrap/expect, frontend syntax/DOM refs) + clippy -D warnings + cargo test, one gate
 ./scripts/test_e2e.sh          # full live E2E against a real simply_ip_vault + simply_ip_exporter pair
 ```
 
 `scripts/test_e2e.sh` builds and boots both services against throwaway SQLite databases with
 deterministic bootstrap keys, provisions Vault, configures an exporter endpoint, and asserts —
-across 100 checks in 14 sections — the feed pipeline (aggregation, filtering, ETag/304, rate
+across 110 checks in 14 sections — the feed pipeline (aggregation, filtering, ETag/304, rate
 limiting), Vault soft-delete propagation via differential sync, hot-reload of endpoint config with
 no restart, `bound_ips` client-IP restriction, a full graceful-restart-with-encryption cycle
 (Master key, a Daughter key's encrypted secret, and the endpoint row all surviving a `SIGTERM` and

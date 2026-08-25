@@ -12,6 +12,8 @@ pub mod endpoints;
 /// Authorization decisions shared by more than one handler — Master-key immutability and the
 /// generic administrative check every route already inlined before this module existed.
 pub mod guards;
+/// Vault-group listing and which local API keys may reference which group.
+pub mod groups;
 /// CRUD for `api_keys`.
 pub mod keys;
 /// Shared key-minting/hashing helpers and the audit-log writer.
@@ -20,6 +22,7 @@ pub mod support;
 pub use audit::list_audit_logs;
 pub use auth::get_me;
 pub use endpoints::{create_endpoint, delete_endpoint, list_endpoints, reassign_endpoint_owner, update_endpoint};
+pub use groups::{grant_key_group, list_key_groups, list_vault_groups, revoke_key_group};
 pub use health::{health_check, readiness_check};
 pub use keys::{
     create_api_key, delete_api_key, list_api_keys, rotate_api_key, rotate_signing_secret, update_api_key,

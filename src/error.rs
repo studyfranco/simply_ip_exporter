@@ -64,6 +64,18 @@ pub enum AppError {
     /// Internal server error.
     #[error("Internal Server Error")]
     Internal,
+
+    /// `GET /api/vault-groups` (or a grant that needs a fresh group lookup) was called without
+    /// `VAULT_BASE_URL`/`VAULT_API_KEY`/`VAULT_SIGNING_SECRET` configured — there is no Vault to
+    /// ask. Distinct from [`Self::Internal`]: this is an operator configuration state, not a bug.
+    #[error("simply_ip_vault is not configured")]
+    VaultNotConfigured,
+
+    /// A live call to Vault (listing groups) failed — network error, timeout, or a non-2xx
+    /// response. `502 Bad Gateway`: this service is a client of Vault for this request, and the
+    /// upstream it depends on did not answer usably.
+    #[error("simply_ip_vault is unreachable")]
+    VaultUnreachable,
 }
 
 impl IntoResponse for AppError {
@@ -98,6 +110,13 @@ impl IntoResponse for AppError {
             AppError::BodyRejected(status, msg) => (status, msg),
             AppError::Internal => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "An internal server error occurred".to_owned())
+            }
+            AppError::VaultNotConfigured => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "simply_ip_vault sync is not configured on this instance".to_owned(),
+            ),
+            AppError::VaultUnreachable => {
+                (StatusCode::BAD_GATEWAY, "Could not reach simply_ip_vault".to_owned())
             }
         };
 

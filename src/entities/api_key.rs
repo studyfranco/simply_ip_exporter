@@ -45,11 +45,20 @@ pub enum Relation {
     /// Endpoints owned by this key.
     #[sea_orm(has_many = "super::endpoint::Entity")]
     Endpoint,
+    /// This key's Vault-group read-access grants.
+    #[sea_orm(has_many = "super::vault_group_permission::Entity")]
+    VaultGroupPermission,
 }
 
 impl Related<super::endpoint::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Endpoint.def()
+    }
+}
+
+impl Related<super::vault_group_permission::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::VaultGroupPermission.def()
     }
 }
 

@@ -92,6 +92,35 @@ fn validate_groups(raw: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Refuses a non-Master caller's `vault_groups` if it names any group the caller hasn't been
+/// granted read access to (`vault_group_permissions`, see `api::groups`). A no-op for Master —
+/// "master can see all groups" — so both call sites below can call this unconditionally rather
+/// than branching on `caller.is_master` themselves.
+async fn validate_group_access(
+    db: &sea_orm::DatabaseConnection,
+    caller: &api_key::Model,
+    vault_groups: &str,
+) -> Result<(), AppError> {
+    if caller.is_master {
+        return Ok(());
+    }
+    let granted = crate::api::groups::granted_group_names(db, caller.id).await?;
+    let ungranted: Vec<&str> = vault_groups
+        .split(',')
+        .map(str::trim)
+        .filter(|g| !g.is_empty())
+        .filter(|g| !granted.contains(*g))
+        .collect();
+    if !ungranted.is_empty() {
+        return Err(AppError::Forbidden(format!(
+            "You do not have read access to Vault group(s): {} — ask the Master to grant it via \
+             POST /api/keys/{{id}}/groups",
+            ungranted.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 /// `POST /api/endpoints` — creates a new public feed endpoint, owned by the caller.
 pub async fn create_endpoint(
     State(state): State<AppState>,
@@ -103,6 +132,7 @@ pub async fn create_endpoint(
         return Err(AppError::InvalidInput("name must not be empty".to_owned()));
     }
     validate_groups(&payload.vault_groups)?;
+    validate_group_access(&state.db, &caller, &payload.vault_groups).await?;
     let bound_ips = payload.bound_ips.filter(|s| !s.trim().is_empty());
     if let Some(raw) = &bound_ips {
         validate_bound_ips(raw).map_err(AppError::InvalidInput)?;
@@ -208,6 +238,7 @@ pub async fn update_endpoint(
     }
     if let Some(vault_groups) = payload.vault_groups {
         validate_groups(&vault_groups)?;
+        validate_group_access(&state.db, &caller, &vault_groups).await?;
         active.vault_groups = Set(vault_groups);
         changed.push("vault_groups");
     }

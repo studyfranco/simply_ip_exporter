@@ -25,23 +25,23 @@ This document defines the official database schema, SeaORM entity models, relati
 | can_manage_keys   |       | filter_rfc1918            |
 | parent_key_id     |       | filter_bogons             |
 | owner_key_id      |       | filter_loopback           |
-+---------+---------+       | last_synced_at            |
-          | 1                +---------------------------+
-          |
-          | M
-+---------+---------+
-|     audit_logs    |
-+--------------------+
-| id (UUID)          |
-| api_key_id (UUID)  |
-| api_key_name       |
-| api_key_prefix     |
-| client_ip          |
-| action             |
-| target_resource    |
-| details            |
-| timestamp          |
-+--------------------+
++----+---------+----+       | last_synced_at            |
+     | 1        \            +---------------------------+
+     |           \ 1
+     | M           \
++----+--------+   +-+-----------------------+
+| audit_logs  |   | vault_group_permissions |
++-------------+   +--------------------------+
+| id (UUID)   |   | id (UUID)                |
+| api_key_id  |   | api_key_id (UUID)         |
+| api_key_name|   | vault_group_id (UUID)     |  <- Vault's own group id; not a
+| api_key_prfx|   | vault_group_name          |     local FK (Vault is a
+| client_ip   |   | created_at                |     separate service/database)
+| action      |   +---------------------------+
+| target_rsrc |
+| details     |
+| timestamp   |
++-------------+
 ```
 
 ---
@@ -129,11 +129,43 @@ inseparable: if the audit write fails, the request fails too.
 
 ---
 
+### 4. `vault_group_permissions`
+Which local API keys may reference which `simply_ip_vault` groups in their own endpoints'
+`vault_groups`. A Daughter key's `POST`/`PUT /api/endpoints` is refused if it names a group the key
+holds no grant for (`api::endpoints::validate_group_access`); the Master key is exempt entirely.
+There is exactly one right to grant — read — so a grant's mere existence *is* the permission; unlike
+`example/simply_ip_vault`'s own `api_key_group_permissions`, there is no `can_read`/`can_write`/
+`can_delete`/`can_manage` column set, because this crate never writes back to Vault.
+
+| Field | Type | Constraints | Description |
+| :--- | :--- | :--- | :--- |
+| `id` | UUID / String | PRIMARY KEY | Unique identifier for the grant. |
+| `api_key_id` | UUID / String | NOT NULL, FOREIGN KEY (`api_keys.id` ON DELETE CASCADE) | The local key this grant applies to. |
+| `vault_group_id` | UUID / String | NOT NULL | The Vault group's own id, exactly as Vault assigned it. **Not** a local foreign key — Vault is a separate service reachable only over HTTP, so this database cannot enforce referential integrity against it. |
+| `vault_group_name` | String | NOT NULL | The group's name as observed at grant time (or the cleanup worker's last successful refresh) — used for both display and `vault_groups` enforcement without a live Vault call on every use. |
+| `created_at` | DateTimeUtc | NOT NULL | Grant timestamp (UTC). |
+
+Unique index on (`api_key_id`, `vault_group_id`): one grant per (key, group) pair — granting an
+already-granted group is idempotent, not a duplicate row.
+
+#### Grants outlive the Vault group they reference — deliberately
+Because `vault_group_id` cannot be a real foreign key, a grant survives a group being renamed or
+deleted in Vault with no signal at all — this crate never re-validates a grant against a live Vault
+call on ordinary use. The only place a stale grant is ever removed is
+`groups::spawn_group_permission_cleanup_worker`, a background task that runs once at boot and then
+monthly: it lists Vault's current groups and deletes any local grant whose `vault_group_id` isn't
+among them — but **only** after a live call to Vault actually succeeds. A failed or unreachable
+Vault call skips that cycle's cleanup entirely rather than treating "couldn't ask" as "doesn't
+exist" and deleting every grant.
+
+---
+
 ## 🔗 SeaORM Entity Relations
 
 - **`ApiKey` -> `Endpoint`**: HasMany (`owner_key_id`)
 - **`ApiKey` -> `ApiKey` (Parent)**: BelongsTo (`parent_key_id`)
 - **`ApiKey` -> `AuditLog`**: HasMany (`api_key_id`)
+- **`ApiKey` -> `VaultGroupPermission`**: HasMany (`api_key_id`)
 
 ---
 
@@ -143,11 +175,13 @@ inseparable: if the audit write fails, the request fails too.
 | :--- | :--- | :--- | :--- |
 | `endpoints` | `owner_key_id` | `api_keys.id` | **`SET NULL`** |
 | `audit_logs` | `api_key_id` | `api_keys.id` | **`SET NULL`** |
+| `vault_group_permissions` | `api_key_id` | `api_keys.id` | **`CASCADE`** |
 
 ### Lineage & Ownership
 - `parent_key_id` on `api_keys` is deliberately unconstrained at the database level to prevent recursive CASCADE drops of whole key subtrees outside §6's pre-flight inventory.
 - Deleting an API key sets `endpoints.owner_key_id` to `NULL`, transferring lifecycle control over the endpoint route to Master alone.
 - Deleting an API key sets `audit_logs.api_key_id` to `NULL` too, but never deletes the audit rows themselves — `api_key_name`/`api_key_prefix` keep them attributable regardless.
+- Deleting an API key **cascades** to its `vault_group_permissions` rows — unlike the other two, a permission grant has no meaning once the key it was granted to no longer exists, so nothing worth preserving survives the delete.
 
 ---
 
@@ -161,6 +195,7 @@ inseparable: if the audit write fails, the request fails too.
 6. `audit_logs.action`: Fast filtering by operation type on `GET /api/audit-logs?action=...`.
 7. `audit_logs.timestamp`: Fast ordering/pagination of the audit trail (most recent first).
 8. `audit_logs.api_key_id`: Fast lookup of a given key's audit history.
+9. `vault_group_permissions.(api_key_id, vault_group_id)`: Unique index — one grant per (key, group) pair, and the lookup `validate_group_access` and the cleanup worker both use.
 
 ---
 

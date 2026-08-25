@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use chrono::NaiveDateTime;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
+use uuid::Uuid;
 
 use crate::crypto::{canonical_v1_payload, compute_signature};
 
@@ -28,6 +30,18 @@ pub struct VaultApiRecord {
     /// Whether this is a soft-deleted tombstone (only present with `include_deleted=true`).
     #[serde(default)]
     pub is_deleted: bool,
+}
+
+/// One group as returned by Vault's `GET /api/groups` contract. Only the two fields this crate
+/// actually uses (grant enforcement matches by name; display shows both) — Vault's own response
+/// carries more (`group_type`, `description`, `owner_key_id`, `created_at`), silently ignored.
+#[derive(Debug, Clone, Deserialize)]
+pub struct VaultGroup {
+    /// The group's id, exactly as Vault assigned it.
+    pub id: Uuid,
+    /// The group's name, used both for display and for matching against a grant's
+    /// `vault_group_name` snapshot.
+    pub name: String,
 }
 
 /// Failure modes for a Vault sync request.
@@ -81,9 +95,24 @@ impl VaultClient {
                 urlencode(&since.and_utc().timestamp().to_string())
             ));
         }
+        self.signed_get(&path_and_query).await
+    }
 
+    /// Lists every group Vault currently has, restricted (Vault-side) to what this crate's own
+    /// Vault key can read. Used both to populate the Master-only "grant a key read access to a
+    /// group" UI and by `groups::spawn_group_permission_cleanup_worker` to find grants whose
+    /// group Vault no longer has.
+    pub async fn list_groups(&self) -> Result<Vec<VaultGroup>, VaultError> {
+        self.signed_get("/api/groups").await
+    }
+
+    /// Signs and sends one `CANONICAL_V1` `GET` request, deserializing a successful body as `T`.
+    /// Shared by every read this client makes — `fetch_ips` and `list_groups` differ only in path
+    /// and response shape, not in how a request gets signed or a non-2xx/malformed body is turned
+    /// into a [`VaultError`].
+    async fn signed_get<T: DeserializeOwned>(&self, path_and_query: &str) -> Result<T, VaultError> {
         let timestamp = chrono::Utc::now().timestamp().to_string();
-        let payload = canonical_v1_payload("GET", &path_and_query, &timestamp, b"");
+        let payload = canonical_v1_payload("GET", path_and_query, &timestamp, b"");
         let signature = compute_signature(&self.signing_secret, &payload)
             .ok_or(VaultError::Status(reqwest::StatusCode::INTERNAL_SERVER_ERROR))?;
 
@@ -101,7 +130,7 @@ impl VaultClient {
             return Err(VaultError::Status(response.status()));
         }
 
-        Ok(response.json::<Vec<VaultApiRecord>>().await?)
+        Ok(response.json::<T>().await?)
     }
 }
 
@@ -164,21 +193,32 @@ mod tests {
         VaultClient::from_config(&config).expect("fully configured")
     }
 
-    /// Boots a throwaway HTTP server on an OS-assigned loopback port that answers every request
-    /// with a fixed status and JSON body, and returns its base URL alongside the task handle.
+    /// Boots a throwaway HTTP server on an OS-assigned loopback port that answers `/api/ips` and
+    /// `/api/groups` with the same fixed status and JSON body, and returns its base URL alongside
+    /// the task handle.
     async fn spawn_mock_vault(
         status: axum::http::StatusCode,
         body: serde_json::Value,
     ) -> (String, tokio::task::JoinHandle<()>) {
         use axum::{Router, routing::get};
 
-        let app = Router::new().route(
-            "/api/ips",
-            get(move || {
-                let body = body.clone();
-                async move { (status, axum::Json(body)) }
-            }),
-        );
+        let ips_body = body.clone();
+        let groups_body = body;
+        let app = Router::new()
+            .route(
+                "/api/ips",
+                get(move || {
+                    let body = ips_body.clone();
+                    async move { (status, axum::Json(body)) }
+                }),
+            )
+            .route(
+                "/api/groups",
+                get(move || {
+                    let body = groups_body.clone();
+                    async move { (status, axum::Json(body)) }
+                }),
+            );
         let listener =
             tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback bind always succeeds");
         let addr = listener.local_addr().expect("a bound listener has a local address");
@@ -246,6 +286,23 @@ mod tests {
         let records = client.fetch_ips("g1", None).await.expect("a valid 200 body must parse");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].target_address, "8.8.8.8/32");
+    }
+
+    #[tokio::test]
+    async fn list_groups_parses_a_successful_response() {
+        let group_id = Uuid::new_v4();
+        let (url, _server) = spawn_mock_vault(
+            axum::http::StatusCode::OK,
+            serde_json::json!([
+                {"id": group_id, "name": "pfBlocker_Blacklist", "group_type": "banlist", "owner_key_id": null, "created_at": "2026-08-11T10:00:00"}
+            ]),
+        )
+        .await;
+        let client = client_at(url);
+        let groups = client.list_groups().await.expect("a valid 200 body must parse");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].id, group_id);
+        assert_eq!(groups[0].name, "pfBlocker_Blacklist");
     }
 
     /// Total connection failure — nothing listening at all — is the other end of the spectrum

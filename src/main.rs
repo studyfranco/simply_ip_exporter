@@ -4,7 +4,9 @@
 use std::net::SocketAddr;
 
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
-use simply_ip_exporter::{api, config, config::RuntimeConfig, create_app, crypto, db, entities, state::AppState, sync};
+use simply_ip_exporter::{
+    api, config, config::RuntimeConfig, create_app, crypto, db, entities, groups, state::AppState, sync,
+};
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
@@ -238,6 +240,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let sync_handle = sync::spawn_sync_worker(state.clone());
+    // Same Vault-configured-or-not gate as the sync worker above: with no Vault client, every
+    // cleanup pass is a no-op anyway (see `groups::cleanup_stale_group_permissions`), so the
+    // worker is still spawned (cheap: it just sleeps) rather than conditionally started, matching
+    // this crate's existing preference for one code path over a start/don't-start branch.
+    let group_cleanup_handle = groups::spawn_group_permission_cleanup_worker(state.clone());
 
     let app = create_app(state);
 
@@ -251,6 +258,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     sync_handle.abort();
+    group_cleanup_handle.abort();
     tracing::info!("Graceful shutdown complete.");
     Ok(())
 }

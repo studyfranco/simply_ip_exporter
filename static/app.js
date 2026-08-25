@@ -330,12 +330,35 @@ async function loadEndpoints() {
   });
 }
 
+// Fills a field-hint with the CALLER's own granted Vault groups — Master bypasses group
+// enforcement entirely (AGENT.MD/the user's own framing: "master can see all groups"), so a
+// Daughter is the only case with anything to list. Shared by both the create and edit endpoint
+// modals, since `vault_groups` enforcement (src/api/endpoints.rs::validate_group_access) applies
+// identically to both `POST /api/endpoints` and `PUT /api/endpoints/{id}`.
+async function loadOwnGroupHint(hintElId) {
+  const hintEl = el(hintElId);
+  if (!me) return;
+  if (me.is_master) {
+    hintEl.textContent = 'As Master, you may use any Vault group.';
+    return;
+  }
+  try {
+    const grants = await apiCall('GET', `/api/keys/${me.id}/groups`);
+    hintEl.textContent = grants.length > 0
+      ? `Groups you have access to: ${grants.map((g) => g.vault_group_name).join(', ')}`
+      : 'You have not been granted read access to any Vault group yet — ask the Master.';
+  } catch (e) {
+    hintEl.textContent = '';
+  }
+}
+
 // Opens/closes the "New Endpoint" modal — matches example/simply_ip_vault's own
 // "+ Add IP / Grant Access" → #manage-ip-modal pattern: the creation form isn't permanently
 // inline, it's revealed by the toolbar button and dismissed the same way every other modal here
 // is (×, Cancel, backdrop click, or Escape).
 function openCreateEndpointModal() {
   hideError('endpoint-error');
+  loadOwnGroupHint('ep-groups-hint');
   el('create-endpoint-modal').classList.remove('hidden');
 }
 
@@ -380,6 +403,7 @@ function openEditEndpointModal(target) {
   el('edit-ep-filter-rfc1918').checked = target.filter_rfc1918;
   el('edit-ep-filter-bogons').checked = target.filter_bogons;
   el('edit-ep-filter-loopback').checked = target.filter_loopback;
+  loadOwnGroupHint('edit-ep-groups-hint');
   el('edit-endpoint-modal').classList.remove('hidden');
 }
 
@@ -690,7 +714,76 @@ function openEditKeyModal(target) {
   el('edit-key-can-manage-keys').disabled = target.is_master;
   el('edit-key-master-note').classList.toggle('hidden', !target.is_master);
 
+  loadKeyGroupAccess(target);
   el('edit-key-modal').classList.remove('hidden');
+}
+
+// Populates the Edit Key modal's "Vault Group Access" section: one checkbox per group Vault
+// currently has (fetched live), pre-checked against this key's current grants. Hidden entirely
+// for the Master key — it bypasses group enforcement, so there is nothing to assign
+// ("master can see all groups" — the user's own framing). Each checkbox grants/revokes
+// immediately on toggle (POST/DELETE /api/keys/{id}/groups), independent of the modal's own
+// Save Changes button, which only ever touches name/bound_ips/can_manage_keys.
+async function loadKeyGroupAccess(target) {
+  const section = el('edit-key-groups-section');
+  if (target.is_master) {
+    section.classList.add('hidden');
+    return;
+  }
+  section.classList.remove('hidden');
+  const list = el('edit-key-groups-list');
+  list.innerHTML = '<span class="text-muted text-sm">Loading…</span>';
+  hideError('edit-key-groups-error');
+
+  let allGroups;
+  let grants;
+  try {
+    [allGroups, grants] = await Promise.all([
+      apiCall('GET', '/api/vault-groups'),
+      apiCall('GET', `/api/keys/${target.id}/groups`),
+    ]);
+  } catch (e) {
+    list.innerHTML = '';
+    showError('edit-key-groups-error', e.message);
+    return;
+  }
+
+  if (allGroups.length === 0) {
+    list.innerHTML = '<span class="text-muted text-sm">Vault has no groups.</span>';
+    return;
+  }
+
+  const permissionIdByGroupId = new Map(grants.map((g) => [g.vault_group_id, g.id]));
+  list.innerHTML = allGroups
+    .map((g) => `
+      <label class="checkbox-container">
+        <input type="checkbox" data-group-id="${g.id}" data-group-name="${escapeHtml(g.name)}" ${permissionIdByGroupId.has(g.id) ? 'checked' : ''} />
+        <span class="checkmark"></span>
+        ${escapeHtml(g.name)} <span class="text-muted text-sm">(${g.id})</span>
+      </label>`)
+    .join('');
+
+  list.querySelectorAll('input[type="checkbox"]').forEach((cb) => {
+    cb.addEventListener('change', async () => {
+      cb.disabled = true;
+      hideError('edit-key-groups-error');
+      try {
+        if (cb.checked) {
+          await apiCall('POST', `/api/keys/${target.id}/groups`, { vault_group_id: cb.dataset.groupId });
+          showToast(`Granted read access to ${cb.dataset.groupName}`, 'success');
+        } else {
+          const permissionId = permissionIdByGroupId.get(cb.dataset.groupId);
+          await apiCall('DELETE', `/api/keys/${target.id}/groups/${permissionId}`);
+          showToast(`Revoked read access to ${cb.dataset.groupName}`, 'success');
+        }
+        await loadKeyGroupAccess(target);
+      } catch (e) {
+        cb.checked = !cb.checked;
+        cb.disabled = false;
+        showError('edit-key-groups-error', e.message);
+      }
+    });
+  });
 }
 
 function closeEditKeyModal() {
