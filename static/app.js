@@ -251,12 +251,27 @@ async function tryLogin(apiKey, signingSecret) {
   }
 }
 
+// Strict parity with example/simply_ip_vault's own header (the user's explicit instruction): a
+// role badge only, no key name or prefix — those identify the *credential*, not something vault's
+// header shows either.
 function renderIdentity() {
-  el('identity-name').textContent = me.name;
-  el('identity-prefix').textContent = me.prefix;
   const badge = el('identity-badge');
   badge.textContent = me.is_master ? 'MASTER' : 'DAUGHTER';
   badge.className = 'badge badge-tier ' + (me.is_master ? 'badge-tier-master' : 'badge-tier-daughter');
+}
+
+// Reloads whichever tab is currently active, without a full page reload (so scroll position, the
+// other tabs' already-fetched data, and the session all survive) and without re-authenticating —
+// tryLogin() is only ever called once at login/session-restore. Each tab's own load*() function is
+// already idempotent (called once at login, and again on every tab switch's worth of manual data
+// staleness this button exists to fix), so this just re-invokes the same one.
+async function refreshActiveTab() {
+  const active = document.querySelector('.tab-panel.active');
+  if (!active) return;
+  const tab = active.id.replace('tab-', '');
+  if (tab === 'endpoints') await loadEndpoints();
+  else if (tab === 'keys' && me && me.is_master) await loadKeys();
+  else if (tab === 'audit' && me && me.is_master) await loadAuditLogs();
 }
 
 // Switches the active tab: one .tab-btn/.tab-panel pair gains `.active`, every other pair loses
@@ -330,26 +345,59 @@ async function loadEndpoints() {
   });
 }
 
-// Fills a field-hint with the CALLER's own granted Vault groups — Master bypasses group
-// enforcement entirely (AGENT.MD/the user's own framing: "master can see all groups"), so a
-// Daughter is the only case with anything to list. Shared by both the create and edit endpoint
-// modals, since `vault_groups` enforcement (src/api/endpoints.rs::validate_group_access) applies
-// identically to both `POST /api/endpoints` and `PUT /api/endpoints/{id}`.
-async function loadOwnGroupHint(hintElId) {
+// Populates a Vault-group checkbox grid (WEB UI => ENDPOINT GROUP LIST EXPORTER => ENDPOINT GROUP
+// LIST VAULT, per the user's own framing) for the create/edit endpoint modals' `vault_groups`
+// field, pre-checking whichever names `selectedRaw` (the endpoint's current comma-separated
+// vault_groups string) already names.
+//
+// Master sees every group Vault has (GET /api/vault-groups). A Daughter cannot call that
+// Master-only endpoint, and has no use for it anyway — "master can see all groups" (AGENT.MD), so
+// a Daughter's picker is populated from its OWN granted groups only (GET /api/keys/{id}/groups):
+// this is the "hide" half of "disable/hide ungranted groups", and avoids exposing Vault's full
+// group list to a key with no rights over any group it doesn't already hold.
+async function loadGroupPicker(listElId, hintElId, errorElId, selectedRaw) {
+  const list = el(listElId);
   const hintEl = el(hintElId);
-  if (!me) return;
-  if (me.is_master) {
-    hintEl.textContent = 'As Master, you may use any Vault group.';
+  const selected = new Set((selectedRaw || '').split(',').map((s) => s.trim()).filter(Boolean));
+  list.innerHTML = '<span class="text-muted text-sm">Loading…</span>';
+  hintEl.textContent = '';
+  hideError(errorElId);
+
+  let groups;
+  try {
+    groups = me.is_master
+      ? await apiCall('GET', '/api/vault-groups')
+      : (await apiCall('GET', `/api/keys/${me.id}/groups`)).map((g) => ({ id: g.vault_group_id, name: g.vault_group_name }));
+  } catch (e) {
+    list.innerHTML = '';
+    showError(errorElId, e.message);
     return;
   }
-  try {
-    const grants = await apiCall('GET', `/api/keys/${me.id}/groups`);
-    hintEl.textContent = grants.length > 0
-      ? `Groups you have access to: ${grants.map((g) => g.vault_group_name).join(', ')}`
+
+  if (groups.length === 0) {
+    list.innerHTML = '';
+    hintEl.textContent = me.is_master
+      ? 'Vault has no groups.'
       : 'You have not been granted read access to any Vault group yet — ask the Master.';
-  } catch (e) {
-    hintEl.textContent = '';
+    return;
   }
+
+  list.innerHTML = groups
+    .map((g) => `
+      <label class="checkbox-container">
+        <input type="checkbox" value="${escapeHtml(g.name)}" ${selected.has(g.name) ? 'checked' : ''} />
+        <span class="checkmark"></span>
+        ${escapeHtml(g.name)} <span class="text-muted text-sm">(${g.id})</span>
+      </label>`)
+    .join('');
+}
+
+/** Reads a group picker's checked boxes back into the comma-separated `vault_groups` string the
+ * API expects. */
+function readGroupPicker(listElId) {
+  return Array.from(document.querySelectorAll(`#${listElId} input[type="checkbox"]:checked`))
+    .map((cb) => cb.value)
+    .join(',');
 }
 
 // Opens/closes the "New Endpoint" modal — matches example/simply_ip_vault's own
@@ -358,7 +406,7 @@ async function loadOwnGroupHint(hintElId) {
 // is (×, Cancel, backdrop click, or Escape).
 function openCreateEndpointModal() {
   hideError('endpoint-error');
-  loadOwnGroupHint('ep-groups-hint');
+  loadGroupPicker('ep-groups-list', 'ep-groups-hint', 'ep-groups-error', '');
   el('create-endpoint-modal').classList.remove('hidden');
 }
 
@@ -373,7 +421,7 @@ async function createEndpoint(event) {
     await apiCall('POST', '/api/endpoints', {
       name: el('ep-name').value,
       description: el('ep-description').value || null,
-      vault_groups: el('ep-groups').value,
+      vault_groups: readGroupPicker('ep-groups-list'),
       ttl_seconds: parseInt(el('ep-ttl').value, 10) || 3600,
       bound_ips: el('ep-bound-ips').value || null,
       filter_rfc1918: el('ep-filter-rfc1918').checked,
@@ -397,13 +445,12 @@ function openEditEndpointModal(target) {
   el('edit-ep-id').value = target.id;
   el('edit-ep-name').value = target.name;
   el('edit-ep-description').value = target.description || '';
-  el('edit-ep-groups').value = target.vault_groups;
   el('edit-ep-ttl').value = target.ttl_seconds;
   el('edit-ep-bound-ips').value = target.bound_ips || '';
   el('edit-ep-filter-rfc1918').checked = target.filter_rfc1918;
   el('edit-ep-filter-bogons').checked = target.filter_bogons;
   el('edit-ep-filter-loopback').checked = target.filter_loopback;
-  loadOwnGroupHint('edit-ep-groups-hint');
+  loadGroupPicker('edit-ep-groups-list', 'edit-ep-groups-hint', 'edit-ep-groups-error', target.vault_groups);
   el('edit-endpoint-modal').classList.remove('hidden');
 }
 
@@ -424,7 +471,7 @@ async function submitEditEndpoint(event) {
       // field to null here would make clearing Bound IPs — the one way to lift an endpoint back
       // to unrestricted after it was set — silently do nothing.
       description: el('edit-ep-description').value,
-      vault_groups: el('edit-ep-groups').value,
+      vault_groups: readGroupPicker('edit-ep-groups-list'),
       ttl_seconds: parseInt(el('edit-ep-ttl').value, 10) || 3600,
       bound_ips: el('edit-ep-bound-ips').value,
       filter_rfc1918: el('edit-ep-filter-rfc1918').checked,
@@ -500,19 +547,39 @@ async function loadKeys() {
     if (!currentIds.has(id)) selectedKeyIds.delete(id);
   }
 
+  // One badge-scope pill per granted Vault group, fetched per Daughter key (Master bypasses group
+  // enforcement entirely — "master can see all groups" — so there is nothing to fetch or show for
+  // it). Read-only by design (AGENT.MD: this crate never writes to Vault, so a grant's mere
+  // existence *is* the permission — there is no separate "R"/"RW" distinction to render).
+  const daughterKeys = keys.filter((k) => !k.is_master);
+  const grantsByKeyId = new Map();
+  await Promise.all(
+    daughterKeys.map(async (k) => {
+      try {
+        grantsByKeyId.set(k.id, await apiCall('GET', `/api/keys/${k.id}/groups`));
+      } catch (e) {
+        grantsByKeyId.set(k.id, []);
+      }
+    })
+  );
+
   const tbody = el('keys-body');
   tbody.innerHTML = '';
   if (keys.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="5" class="table-empty">No keys yet.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="4" class="table-empty">No keys yet.</td></tr>';
   }
   for (const k of keys) {
     const tr = document.createElement('tr');
     const tierClass = k.is_master ? 'badge-tier-master' : 'badge-tier-daughter';
+    const scopeBadges = [`<span class="badge badge-tier ${tierClass}">${k.is_master ? 'MASTER' : 'DAUGHTER'}</span>`];
+    if (k.can_manage_keys) scopeBadges.push('<span class="badge badge-scope">MANAGE KEYS</span>');
+    for (const grant of grantsByKeyId.get(k.id) || []) {
+      scopeBadges.push(`<span class="badge badge-scope">${escapeHtml(grant.vault_group_name)}: R</span>`);
+    }
     tr.innerHTML = `
       <td>${k.is_master ? '' : `<input type="checkbox" class="row-select" data-id="${k.id}" />`}</td>
       <td>${escapeHtml(k.name)}<div class="text-muted font-mono text-sm">${escapeHtml(k.prefix)}…</div></td>
-      <td><span class="badge badge-tier ${tierClass}">${k.is_master ? 'MASTER' : 'DAUGHTER'}</span></td>
-      <td>${k.can_manage_keys ? 'Yes' : 'No'}</td>
+      <td class="row">${scopeBadges.join('')}</td>
       <td class="row">
         <button class="btn btn-secondary btn-sm" data-edit-key="${k.id}">Edit</button>
         ${k.is_master ? '' : `<button class="btn btn-secondary btn-sm" data-regenerate-key="${k.id}" title="Replace BOTH the API key and its signing secret">Regenerate</button>
@@ -875,16 +942,19 @@ function escapeHtml(str) {
 }
 
 // Renders a server timestamp (chrono::NaiveDateTime, no timezone marker — always UTC in this
-// crate) in the viewer's own locale/timezone via toLocaleString(), matching
-// example/simply_ip_vault's own formatTimestamp exactly. Ported verbatim rather than
-// reimplemented: same timezone-inference rule (append 'Z' only if nothing already marks one) and
-// the same fallback to the raw string if it doesn't parse as a date at all.
+// crate) in the viewer's own timezone, formatted as DD/MM/YYYY, HH:MM:SS. The timezone-inference
+// rule (append 'Z' only if nothing already marks one) and the raw-string fallback for anything
+// that doesn't parse as a date at all are ported from example/simply_ip_vault's own
+// formatTimestamp; the format itself deliberately does NOT use vault's bare toLocaleString() (its
+// output is locale-dependent — e.g. M/D/YYYY in a US-locale browser — so copying that call would
+// not actually reproduce a stable DD/MM/YYYY, HH:MM:SS display). 'en-GB' is what produces that
+// exact format regardless of the viewer's own locale.
 function formatTimestamp(raw) {
   if (!raw) return '—';
   const hasTimezone = /[zZ]|[+-]\d{2}:?\d{2}$/.test(raw);
   const date = new Date(hasTimezone ? raw : `${raw}Z`);
   if (Number.isNaN(date.getTime())) return raw;
-  return date.toLocaleString();
+  return date.toLocaleString('en-GB');
 }
 
 // ── Wiring ───────────────────────────────────────────────────────────────────
@@ -899,7 +969,8 @@ document.addEventListener('DOMContentLoaded', () => {
     Session.setApiBaseOverride(el('login-api-base').value);
     tryLogin(el('login-api-key').value.trim(), el('login-signing-secret').value.trim());
   });
-  el('logout-btn').addEventListener('click', logout);
+  el('btn-logout').addEventListener('click', logout);
+  el('btn-refresh').addEventListener('click', () => refreshActiveTab());
   el('endpoint-form').addEventListener('submit', createEndpoint);
   el('key-form').addEventListener('submit', createKey);
 

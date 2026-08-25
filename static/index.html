@@ -50,10 +50,9 @@
           <h1>simply_ip_exporter</h1>
         </div>
         <div id="header-actions" class="header-actions hidden">
-          <span id="identity-name" class="text-muted"></span>
           <span id="identity-badge" class="badge badge-tier"></span>
-          <span id="identity-prefix" class="text-muted font-mono text-sm"></span>
-          <button id="logout-btn" class="btn btn-logout btn-sm">Log out</button>
+          <button id="btn-refresh" type="button" class="btn btn-secondary btn-sm">Refresh</button>
+          <button id="btn-logout" type="button" class="btn btn-logout btn-sm">Logout</button>
         </div>
       </header>
 
@@ -95,12 +94,12 @@
         <form id="key-form" class="admin-form">
           <div class="form-grid">
             <div class="form-group">
-              <label for="key-name">Name <span>*</span></label>
+              <label for="key-name">Name <span class="required-marker">*</span></label>
               <input type="text" id="key-name" class="input-field" required />
             </div>
             <div class="form-group">
-              <label for="key-bound-ips">Bound IPs (comma-separated CIDR, optional)</label>
-              <input type="text" id="key-bound-ips" class="input-field" />
+              <label for="key-bound-ips">Bound IPs (comma-separated CIDR, IP, or hostname, optional)</label>
+              <input type="text" id="key-bound-ips" class="input-field" placeholder="203.0.113.0/24, vpn.internal" />
             </div>
           </div>
           <div class="permissions-grid mt-2 mb-4">
@@ -137,7 +136,7 @@
             <thead>
               <tr>
                 <th><input type="checkbox" id="select-all-keys" title="Select all" /></th>
-                <th>Name / Prefix</th><th>Tier</th><th>Can manage keys</th><th></th>
+                <th>Name / Prefix</th><th>Global Permissions / Scopes</th><th></th>
               </tr>
             </thead>
             <tbody id="keys-body"></tbody>
@@ -151,9 +150,11 @@
     <!-- ═══════════════════════════════════════ -->
     <main id="tab-audit" class="tab-panel">
       <section class="card audit-section" id="audit-card">
-        <h2>Audit Logs</h2>
-        <p class="subtitle">Recent mutating actions across the system. Visible to Master keys only.</p>
         <div class="list-header">
+          <div>
+            <h2>Audit Logs</h2>
+            <p class="subtitle">Recent mutating actions across the system. Visible to Master keys only.</p>
+          </div>
           <div class="filters">
             <input type="text" id="audit-action-filter" class="input-field" placeholder="Filter by action (e.g. KEY_CREATE)" />
             <button type="button" id="audit-refresh-btn" class="btn btn-secondary btn-sm">Refresh</button>
@@ -169,7 +170,7 @@
               <col style="width: 22%" />
               <col style="width: 22%" />
             </colgroup>
-            <thead><tr><th>Time</th><th>Actor</th><th>Client IP</th><th>Action</th><th>Target</th><th>Details</th></tr></thead>
+            <thead><tr><th>Timestamp</th><th>API Key</th><th>Client IP</th><th>Action</th><th>Target</th><th>Details</th></tr></thead>
             <tbody id="audit-body"></tbody>
           </table>
         </div>
@@ -197,12 +198,12 @@
       <form id="edit-key-form">
         <input type="hidden" id="edit-key-id" />
         <div class="form-group">
-          <label for="edit-key-name">Name <span>*</span></label>
+          <label for="edit-key-name">Name <span class="required-marker">*</span></label>
           <input type="text" id="edit-key-name" class="input-field" required />
         </div>
         <div class="form-group">
-          <label for="edit-key-bound-ips">Bound IPs (comma-separated CIDR, optional)</label>
-          <input type="text" id="edit-key-bound-ips" class="input-field" />
+          <label for="edit-key-bound-ips">Bound IPs (comma-separated CIDR, IP, or hostname, optional)</label>
+          <input type="text" id="edit-key-bound-ips" class="input-field" placeholder="203.0.113.0/24, vpn.internal" />
         </div>
         <div class="permissions-grid mt-2 mb-4">
           <label class="checkbox-container">
@@ -245,7 +246,7 @@
       </div>
       <form id="endpoint-form" class="admin-form">
         <div class="form-group">
-          <label for="ep-name">Name <span>*</span></label>
+          <label for="ep-name">Name <span class="required-marker">*</span></label>
           <input type="text" id="ep-name" class="input-field" required />
         </div>
         <div class="form-group">
@@ -253,23 +254,29 @@
           <input type="text" id="ep-description" class="input-field" />
         </div>
         <div class="form-group">
-          <label for="ep-groups">Vault groups (comma-separated) <span>*</span></label>
-          <input type="text" id="ep-groups" class="input-field" placeholder="fail2ban,sshd" required />
+          <label for="ep-groups-list">Vault groups <span class="required-marker">*</span></label>
+          <div class="permissions-grid" id="ep-groups-list"></div>
           <small class="field-hint" id="ep-groups-hint"></small>
+          <div id="ep-groups-error" class="message error hidden"></div>
         </div>
         <div class="form-group">
           <label for="ep-ttl">TTL seconds</label>
           <input type="number" id="ep-ttl" class="input-field" value="3600" min="1" />
         </div>
         <div class="form-group">
-          <label for="ep-bound-ips">Bound IPs (comma-separated CIDR, optional)</label>
-          <input type="text" id="ep-bound-ips" class="input-field" placeholder="203.0.113.0/24" />
+          <label for="ep-bound-ips">Bound IPs (comma-separated CIDR, IP, or hostname, optional)</label>
+          <input type="text" id="ep-bound-ips" class="input-field" placeholder="203.0.113.0/24, vpn.internal" />
           <small class="field-hint">Restricts which client IPs may fetch this feed. Leave blank
             for no restriction (the default) — every client can fetch it.</small>
         </div>
-        <div class="checkbox-row"><input type="checkbox" id="ep-filter-rfc1918" /><label for="ep-filter-rfc1918">Filter RFC 1918</label></div>
-        <div class="checkbox-row"><input type="checkbox" id="ep-filter-bogons" /><label for="ep-filter-bogons">Filter bogons</label></div>
-        <div class="checkbox-row"><input type="checkbox" id="ep-filter-loopback" /><label for="ep-filter-loopback">Filter loopback</label></div>
+        <div class="form-group">
+          <label>Filters</label>
+          <div class="permissions-grid">
+            <label class="checkbox-container"><input type="checkbox" id="ep-filter-rfc1918" /><span class="checkmark"></span>Filter RFC 1918</label>
+            <label class="checkbox-container"><input type="checkbox" id="ep-filter-bogons" /><span class="checkmark"></span>Filter bogons</label>
+            <label class="checkbox-container"><input type="checkbox" id="ep-filter-loopback" /><span class="checkmark"></span>Filter loopback</label>
+          </div>
+        </div>
         <div class="modal-actions mt-4">
           <button type="button" id="create-endpoint-cancel" class="btn btn-cancel">Cancel</button>
           <button type="submit" class="btn btn-primary">Create endpoint</button>
@@ -290,7 +297,7 @@
       <form id="edit-endpoint-form">
         <input type="hidden" id="edit-ep-id" />
         <div class="form-group">
-          <label for="edit-ep-name">Name <span>*</span></label>
+          <label for="edit-ep-name">Name <span class="required-marker">*</span></label>
           <input type="text" id="edit-ep-name" class="input-field" required />
         </div>
         <div class="form-group">
@@ -298,23 +305,29 @@
           <input type="text" id="edit-ep-description" class="input-field" />
         </div>
         <div class="form-group">
-          <label for="edit-ep-groups">Vault groups (comma-separated) <span>*</span></label>
-          <input type="text" id="edit-ep-groups" class="input-field" required />
+          <label for="edit-ep-groups-list">Vault groups <span class="required-marker">*</span></label>
+          <div class="permissions-grid" id="edit-ep-groups-list"></div>
           <small class="field-hint" id="edit-ep-groups-hint"></small>
+          <div id="edit-ep-groups-error" class="message error hidden"></div>
         </div>
         <div class="form-group">
           <label for="edit-ep-ttl">TTL seconds</label>
           <input type="number" id="edit-ep-ttl" class="input-field" min="1" />
         </div>
         <div class="form-group">
-          <label for="edit-ep-bound-ips">Bound IPs (comma-separated CIDR, optional)</label>
-          <input type="text" id="edit-ep-bound-ips" class="input-field" placeholder="203.0.113.0/24" />
+          <label for="edit-ep-bound-ips">Bound IPs (comma-separated CIDR, IP, or hostname, optional)</label>
+          <input type="text" id="edit-ep-bound-ips" class="input-field" placeholder="203.0.113.0/24, vpn.internal" />
           <small class="field-hint">Restricts which client IPs may fetch this feed. Clear to
             remove the restriction.</small>
         </div>
-        <div class="checkbox-row"><input type="checkbox" id="edit-ep-filter-rfc1918" /><label for="edit-ep-filter-rfc1918">Filter RFC 1918</label></div>
-        <div class="checkbox-row"><input type="checkbox" id="edit-ep-filter-bogons" /><label for="edit-ep-filter-bogons">Filter bogons</label></div>
-        <div class="checkbox-row"><input type="checkbox" id="edit-ep-filter-loopback" /><label for="edit-ep-filter-loopback">Filter loopback</label></div>
+        <div class="form-group">
+          <label>Filters</label>
+          <div class="permissions-grid">
+            <label class="checkbox-container"><input type="checkbox" id="edit-ep-filter-rfc1918" /><span class="checkmark"></span>Filter RFC 1918</label>
+            <label class="checkbox-container"><input type="checkbox" id="edit-ep-filter-bogons" /><span class="checkmark"></span>Filter bogons</label>
+            <label class="checkbox-container"><input type="checkbox" id="edit-ep-filter-loopback" /><span class="checkmark"></span>Filter loopback</label>
+          </div>
+        </div>
         <div class="modal-actions mt-4">
           <button type="button" id="edit-endpoint-cancel" class="btn btn-cancel">Cancel</button>
           <button type="submit" class="btn btn-primary">Save Changes</button>

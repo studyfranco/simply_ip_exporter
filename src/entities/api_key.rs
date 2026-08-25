@@ -22,7 +22,8 @@ pub struct Model {
     /// [`crate::crypto::SecretCipher`]). Never returned by any read endpoint.
     #[sea_orm(column_type = "Text", nullable)]
     pub signing_secret: Option<String>,
-    /// Comma-separated CIDR ranges permitted to use this key. Empty/`None` means unrestricted.
+    /// Comma-separated CIDR ranges, bare IPs, and/or hostnames (resolved at request time, see
+    /// `bound_ips`) permitted to use this key. Empty/`None` means unrestricted.
     #[sea_orm(column_type = "Text", nullable)]
     pub bound_ips: Option<String>,
     /// Bypasses all local RBAC checks. Bootstrap-only; never settable through request payloads.

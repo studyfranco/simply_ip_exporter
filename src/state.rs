@@ -7,6 +7,7 @@ use sea_orm::DatabaseConnection;
 use crate::cache::IpCache;
 use crate::config::RuntimeConfig;
 use crate::crypto::SecretCipher;
+use crate::dns_cache::DnsResolver;
 use crate::master::MasterPin;
 use crate::ratelimit::RateLimiter;
 use crate::replay::ReplayGuard;
@@ -32,6 +33,11 @@ pub struct AppState {
     pub rate_limiter: Arc<RateLimiter>,
     /// Signed HTTP client for `simply_ip_vault`, or `None` when sync is not configured.
     pub vault_client: Option<Arc<VaultClient>>,
+    /// Cached DNS resolution for hostname `bound_ips` entries — the same [`DnsResolver`] instance
+    /// backing `config.trusted_proxies`'s own hostname matchers, so a name referenced by both
+    /// resolves through one shared cache rather than two (`AGENT_NOTES.MD`: "Multi-Database &
+    /// Domain Resolution").
+    pub dns_resolver: DnsResolver,
 }
 
 impl AppState {
@@ -39,6 +45,7 @@ impl AppState {
     pub fn new(db: DatabaseConnection, config: Arc<RuntimeConfig>, cipher: Arc<SecretCipher>) -> Self {
         let replay_guard = Arc::new(ReplayGuard::new(config.signature_max_age_seconds));
         let vault_client = VaultClient::from_config(&config).map(Arc::new);
+        let dns_resolver = config.trusted_proxies.dns_resolver();
         Self {
             db,
             config,
@@ -48,6 +55,7 @@ impl AppState {
             ip_cache: IpCache::new(),
             rate_limiter: Arc::new(RateLimiter::new()),
             vault_client,
+            dns_resolver,
         }
     }
 

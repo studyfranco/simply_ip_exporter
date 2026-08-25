@@ -9,7 +9,8 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::api::guards::{guard_master_delete_or_rotate, guard_master_update, require_master};
-use crate::api::support::{create_audit_log, describe_resource, generate_random_key, hash_key, validate_bound_ips};
+use crate::api::support::{create_audit_log, describe_resource, generate_random_key, hash_key};
+use crate::bound_ips::validate_bound_ips;
 use crate::crypto::generate_signing_secret;
 use crate::entities::{api_key, endpoint, prelude::ApiKey, prelude::Endpoint};
 use crate::error::AppError;

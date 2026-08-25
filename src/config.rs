@@ -7,13 +7,13 @@
 //! design (positive/negative DNS caching, a boot grace period, background retry) rather than the
 //! simpler fail-hard-on-unresolvable-hostname scheme an earlier draft of this change used.
 
-use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ipnet::IpNet;
-use tokio::sync::RwLock;
+
+use crate::dns_cache::{DnsResolver, hostname_rejection, normalize_ip};
 
 /// Default listen address: every interface.
 const DEFAULT_BIND_HOST: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
@@ -27,21 +27,6 @@ pub const TRUSTED_PROXIES_ENV: &str = "TRUSTED_PROXIES";
 
 /// One entry of `TRUSTED_PROXIES`: a literal address or CIDR range.
 pub type ProxySpec = IpNet;
-
-/// How long a *successful* hostname resolution is trusted before being re-checked.
-///
-/// Short enough that a container restart which moves a trusted name to a new address is picked up
-/// promptly, long enough that steady-state request handling essentially never pays for a DNS
-/// lookup. 30s matches `example/simply_ip_vault`'s identical constant.
-const POSITIVE_TTL: Duration = Duration::from_secs(30);
-
-/// How long a *failed* resolution is remembered before being retried — negative caching.
-///
-/// Deliberately much shorter than [`POSITIVE_TTL`] (a name that is failing is usually being fixed),
-/// but deliberately non-zero: without it, every request arriving while a configured hostname is
-/// unresolvable triggers its own DNS lookup, turning a dead name behind a hot path into a
-/// resolution amplifier against both the resolver and this process's own latency.
-const NEGATIVE_TTL: Duration = Duration::from_secs(5);
 
 /// How long after boot an initially-unresolvable hostname is given before the failure is reported
 /// as persistent.
@@ -118,64 +103,22 @@ pub struct InvalidTrustedProxies {
     pub entries: Vec<InvalidProxyEntry>,
 }
 
-/// One hostname's last resolution attempt.
-#[derive(Clone)]
-struct HostnameState {
-    /// What the name resolved to, empty when the lookup failed.
-    addresses: Vec<IpNet>,
-    /// When the attempt ran.
-    attempted_at: Instant,
-    /// Whether it produced at least one address.
-    resolved: bool,
-}
-
-impl HostnameState {
-    /// Whether this attempt may still be reused, per the positive/negative TTL split.
-    fn is_fresh(&self, positive: Duration, negative: Duration) -> bool {
-        let ttl = if self.resolved { positive } else { negative };
-        self.attempted_at.elapsed() < ttl
-    }
-}
-
-/// The merged view every request is matched against, plus the per-hostname state behind it.
-#[derive(Default)]
-struct ResolutionCache {
-    /// Literal networks merged with whatever the hostnames currently resolve to.
-    snapshot: Arc<Vec<IpNet>>,
-    /// Per-hostname attempt state — what makes negative caching per-name rather than all-or-
-    /// nothing: one dead entry must not force healthy ones to be re-resolved on its short retry.
-    hosts: HashMap<String, HostnameState>,
-    /// Whether `snapshot` reflects the current `hosts` map.
-    built: bool,
-}
-
-impl std::fmt::Debug for ResolutionCache {
-    /// Renders nothing of substance: a `{:?}` of application state should describe what the
-    /// operator configured, not which addresses a name happened to resolve to a moment ago.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("<resolution cache>")
-    }
-}
-
 /// The set of peers whose `X-Forwarded-For` / `X-Real-IP` headers are believed.
 ///
-/// Holds the parsed `TRUSTED_PROXIES` specification plus a short-lived cache of resolved
-/// hostnames. Cloning shares the cache (every field is `Arc`-backed), so every handler sees one
-/// resolution rather than each maintaining its own.
+/// Holds the parsed `TRUSTED_PROXIES` specification plus a [`DnsResolver`] resolving its hostname
+/// entries — the same cache/TTL machinery `bound_ips` hostname support shares (see
+/// [`Self::dns_resolver`] and `dns_cache`'s module docs). Cloning shares the cache (every field is
+/// `Arc`-backed), so every handler sees one resolution rather than each maintaining its own.
 #[derive(Clone, Debug, Default)]
 pub struct TrustedProxies {
     /// The configuration exactly as written, for logging.
     matchers: Arc<Vec<ProxyMatcher>>,
     /// Literal entries, precomputed. Also the complete answer when no hostnames are configured —
-    /// the common case, served for the cost of an `Arc` clone and no lock at all.
+    /// the common case, served for the cost of an `Arc` clone and no resolver call at all.
     networks: Arc<Vec<IpNet>>,
     /// Hostname entries awaiting resolution.
     hostnames: Arc<Vec<String>>,
-    /// Reuse window for a successful lookup.
-    positive_ttl: Duration,
-    /// Reuse window for a failed lookup.
-    negative_ttl: Duration,
-    cache: Arc<RwLock<ResolutionCache>>,
+    dns: DnsResolver,
 }
 
 impl TrustedProxies {
@@ -200,10 +143,16 @@ impl TrustedProxies {
             matchers: Arc::new(matchers),
             networks: Arc::new(networks),
             hostnames: Arc::new(hostnames),
-            positive_ttl: POSITIVE_TTL,
-            negative_ttl: NEGATIVE_TTL,
-            cache: Arc::new(RwLock::new(ResolutionCache::default())),
+            dns: DnsResolver::new(),
         }
+    }
+
+    /// The shared DNS cache backing this instance's hostname entries — cloned into `AppState` so
+    /// `bound_ips` hostname checks (`bound_ips::is_allowed`) resolve through the exact same
+    /// cache/TTL policy, and so a name referenced by both `TRUSTED_PROXIES` and some key's/
+    /// endpoint's `bound_ips` resolves once rather than twice.
+    pub fn dns_resolver(&self) -> DnsResolver {
+        self.dns.clone()
     }
 
     /// Reads and parses [`TRUSTED_PROXIES_ENV`], refusing to build if any entry is malformed.
@@ -241,8 +190,7 @@ impl TrustedProxies {
     /// that a re-resolution happened, nor 5 to observe that one was suppressed.
     #[cfg(test)]
     pub fn with_ttls(mut self, positive: Duration, negative: Duration) -> Self {
-        self.positive_ttl = positive;
-        self.negative_ttl = negative;
+        self.dns = DnsResolver::with_ttls(positive, negative);
         self
     }
 
@@ -256,12 +204,11 @@ impl TrustedProxies {
         &self.matchers
     }
 
-    /// The networks to match this request against, resolving hostnames when their cache entry has
-    /// expired.
+    /// The networks to match this request against, resolving hostnames through the shared
+    /// [`DnsResolver`] (reusing its cache entry when still fresh).
     ///
-    /// Returns an [`Arc`] rather than a fresh `Vec` so the steady-state cost is a refcount bump.
     /// The no-hostname case — every deployment that names its proxies by address — never touches
-    /// the lock or the resolver at all.
+    /// the resolver at all, just an `Arc` clone.
     ///
     /// Resolving the *whole set* into one flat list, rather than testing hostnames lazily per
     /// address, is what lets [`resolve_client_ip`] treat a hostname-identified proxy exactly like a
@@ -271,45 +218,11 @@ impl TrustedProxies {
             return Arc::clone(&self.networks);
         }
 
-        {
-            let cache = self.cache.read().await;
-            if cache.built
-                && self.hostnames.iter().all(|name| {
-                    cache.hosts.get(name).is_some_and(|s| s.is_fresh(self.positive_ttl, self.negative_ttl))
-                })
-            {
-                return Arc::clone(&cache.snapshot);
-            }
-        }
-
-        // Re-check under the write lock: several requests can queue behind one expiry, and only
-        // the first should pay for the lookup — the other half of the anti-amplification property,
-        // bounding retries across concurrent requests at one instant rather than only over time.
-        let mut cache = self.cache.write().await;
-        self.refresh_locked(&mut cache).await;
-        Arc::clone(&cache.snapshot)
-    }
-
-    /// Re-resolves every hostname whose cached attempt has expired, then rebuilds the snapshot.
-    async fn refresh_locked(&self, cache: &mut ResolutionCache) {
-        for name in self.hostnames.iter() {
-            if cache.hosts.get(name).is_some_and(|s| s.is_fresh(self.positive_ttl, self.negative_ttl)) {
-                continue;
-            }
-
-            let addresses = resolve_hostname(name).await;
-            let resolved = !addresses.is_empty();
-            cache.hosts.insert(name.clone(), HostnameState { addresses, attempted_at: Instant::now(), resolved });
-        }
-
         let mut merged = (*self.networks).clone();
         for name in self.hostnames.iter() {
-            if let Some(state) = cache.hosts.get(name) {
-                merged.extend(state.addresses.iter().copied());
-            }
+            merged.extend(self.dns.resolve(name).await);
         }
-        cache.snapshot = Arc::new(merged);
-        cache.built = true;
+        Arc::new(merged)
     }
 
     /// Resolves every configured hostname once at boot, reporting the names that failed.
@@ -321,12 +234,14 @@ impl TrustedProxies {
             return Vec::new();
         }
 
-        let mut cache = self.cache.write().await;
-        // Force a real attempt rather than reusing whatever a concurrent request just cached.
-        cache.hosts.clear();
-        self.refresh_locked(&mut cache).await;
-
-        self.hostnames.iter().filter(|name| !cache.hosts.get(*name).is_some_and(|s| s.resolved)).cloned().collect()
+        let mut failed = Vec::new();
+        for name in self.hostnames.iter() {
+            // Force a real attempt rather than reusing whatever a concurrent request just cached.
+            if self.dns.force_resolve(name).await.is_empty() {
+                failed.push(name.clone());
+            }
+        }
+        failed
     }
 
     /// Primes the set at boot and, if anything failed to resolve, retries once after
@@ -388,40 +303,6 @@ impl TrustedProxies {
     }
 }
 
-/// Resolves one hostname to the host routes it currently names.
-///
-/// A failure yields nothing rather than propagating: an unresolvable name means "this proxy is not
-/// currently trusted", the safe direction to fail in. A DNS outage must never *widen* what the
-/// daemon believes, and a container that is down should stop being trusted rather than keep a
-/// stale grant alive.
-async fn resolve_hostname(hostname: &str) -> Vec<IpNet> {
-    // Port 0: `lookup_host` wants a socket address, but only the address half is used.
-    match tokio::net::lookup_host((hostname, 0u16)).await {
-        Ok(addrs) => {
-            let networks: Vec<IpNet> = addrs.map(|addr| IpNet::from(normalize_ip(addr.ip()))).collect();
-            if networks.is_empty() {
-                tracing::warn!(
-                    "TRUSTED_PROXIES hostname {hostname:?} resolved to no addresses; it is not \
-                     trusted until it does."
-                );
-            } else {
-                tracing::debug!(
-                    "TRUSTED_PROXIES hostname {hostname:?} resolved to {}",
-                    networks.iter().map(|n| n.addr().to_string()).collect::<Vec<_>>().join(", ")
-                );
-            }
-            networks
-        }
-        Err(e) => {
-            tracing::warn!(
-                "Could not resolve TRUSTED_PROXIES hostname {hostname:?}: {e}. It is not trusted \
-                 until resolution succeeds."
-            );
-            Vec::new()
-        }
-    }
-}
-
 /// Parses a `TRUSTED_PROXIES` value into matchers, or reports every entry that is unusable.
 ///
 /// Three spellings are accepted, tried in order: a CIDR range (`172.16.0.0/12`), a bare address
@@ -455,65 +336,10 @@ pub fn parse_trusted_proxies(raw: &str) -> Result<Vec<ProxyMatcher>, Vec<Invalid
     if invalid.is_empty() { Ok(matchers) } else { Err(invalid) }
 }
 
-/// Why `entry` cannot be a DNS name, or `None` when it is shaped like one.
-///
-/// Returns the *reason* rather than a bool because the reason is the entire value of this check to
-/// an operator: "not a valid hostname" sends them to the manual, "made only of digits and dots"
-/// sends them to the typo.
-///
-/// Deliberately strict about the two shapes that are *nearly* addresses. An entry reaching this
-/// point already failed to parse as an address and as a CIDR, and the ways that happens are a typo
-/// and a hostname:
-///
-/// - Anything containing `/` or `:` is refused, since those characters appear only in prefix and
-///   IPv6 syntax — a near-miss CIDR like `10.0.0.0/99` surfaces as the configuration error it is
-///   rather than a name that silently never matches.
-/// - Anything made only of digits and dots is refused for the same reason: `10.0.0.256` is a
-///   mistyped IPv4 literal, not a hostname, and treating it as one would hide the typo behind a
-///   perfectly quiet non-match.
-/// - The first and last characters must be alphanumeric — stricter than the RFC, which permits a
-///   trailing `.` to mark a fully-qualified name; the strictness is the point, since a trailing
-///   separator is far more often a stray comma-splice than a deliberate root anchor, and
-///   `tokio::net::lookup_host` treats `proxy.` and `proxy` identically anyway. Byte-for-byte the
-///   same rule `example/simply_ip_vault`'s and `example/simply_hook_executor`'s identical function
-///   apply, so all three services refuse exactly the same set.
-fn hostname_rejection(entry: &str) -> Option<&'static str> {
-    if entry.is_empty() {
-        return Some("empty");
-    }
-    if entry.len() > 253 {
-        return Some("longer than the 253-character limit on a DNS name");
-    }
-    if entry.contains('/') || entry.contains(':') {
-        return Some(
-            "contains '/' or ':', which appear only in CIDR and IPv6 syntax, so this is a \
-             malformed address rather than a hostname",
-        );
-    }
-    let bytes = entry.as_bytes();
-    let edges_are_alphanumeric = bytes
-        .first()
-        .zip(bytes.last())
-        .is_some_and(|(first, last)| first.is_ascii_alphanumeric() && last.is_ascii_alphanumeric());
-    if !edges_are_alphanumeric {
-        return Some("a hostname must begin and end with a letter or a digit");
-    }
-    if entry.chars().all(|c| c.is_ascii_digit() || c == '.') {
-        return Some("made only of digits and dots, so this is a malformed IPv4 literal");
-    }
-    if !entry.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_') {
-        return Some("contains characters that cannot appear in a DNS name");
-    }
-    None
-}
-
-/// Normalizes an IPv4-mapped IPv6 address (`::ffff:192.168.1.1`) down to its plain IPv4 form.
-pub fn normalize_ip(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
-        v4 => v4,
-    }
-}
+// `hostname_rejection` — the syntactic check backing the `else` branch above — now lives in
+// `dns_cache` (imported at the top of this module) so `bound_ips` hostname validation is
+// refused/accepted by the identical rule rather than a second, potentially-drifting definition of
+// "looks like a hostname". See its doc comment there for the full rationale.
 
 fn is_trusted(ip: IpAddr, trusted: &[IpNet]) -> bool {
     trusted.iter().any(|net| net.contains(&ip))

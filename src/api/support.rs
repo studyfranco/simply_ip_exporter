@@ -23,16 +23,6 @@ pub fn hash_key(key: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Parses a comma-separated `bound_ips` string, validating every entry is a CIDR or bare address.
-pub fn validate_bound_ips(raw: &str) -> Result<(), String> {
-    for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        if entry.parse::<ipnet::IpNet>().is_err() && entry.parse::<std::net::IpAddr>().is_err() {
-            return Err(format!("Invalid CIDR or IP address in bound_ips: {entry:?}"));
-        }
-    }
-    Ok(())
-}
-
 /// Renders a stable `kind:id (name)` reference for an audit log's `target_resource`.
 pub fn describe_resource(kind: &str, id: Uuid, name: &str) -> String {
     format!("{kind}:{id} ({name})")
@@ -95,13 +85,6 @@ mod tests {
     fn hash_is_deterministic() {
         assert_eq!(hash_key("abc"), hash_key("abc"));
         assert_ne!(hash_key("abc"), hash_key("abd"));
-    }
-
-    #[test]
-    fn bound_ips_validation() {
-        assert!(validate_bound_ips("10.0.0.0/8, ::1, 192.168.1.1").is_ok());
-        assert!(validate_bound_ips("").is_ok());
-        assert!(validate_bound_ips("not-an-ip").is_err());
     }
 
     #[test]

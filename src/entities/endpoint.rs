@@ -26,7 +26,8 @@ pub struct Model {
     pub vault_groups: String,
     /// In-memory cache retention duration and refresh interval, in seconds.
     pub ttl_seconds: i32,
-    /// Comma-separated allowed CIDR networks for client queries against this public feed.
+    /// Comma-separated allowed CIDR networks, bare IPs, and/or hostnames (resolved at request
+    /// time, see `bound_ips`) for client queries against this public feed.
     #[sea_orm(column_type = "Text", nullable)]
     pub bound_ips: Option<String>,
     /// Strip private IPv4 ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) from output.

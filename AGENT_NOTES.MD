@@ -1,5 +1,140 @@
 # Agent Worklog — `simply_ip_exporter`
 
+## 2026-08-25 (session 16) — Header/keys/audit UI parity, dynamic group picker, hostname `bound_ips`
+
+Six-task batch: strict-parity header simplification, an API Keys scopes column, Audit Logs header/
+timestamp/filter-bar polish, a dynamic Vault-group checkbox picker replacing the endpoint modals'
+free-text field, hostname/domain support in `bound_ips` sharing `TRUSTED_PROXIES`' DNS cache, and
+this entry.
+
+### Task 5 first: extracting `dns_cache::DnsResolver` out from under `TrustedProxies`
+
+The instruction was explicit — "ensure hostname resolution in bound_ips shares the cached DNS
+lookup mechanism introduced for TRUSTED_PROXIES" — which ruled out building a second, parallel
+cache for `bound_ips` even though the two settings' shapes differ: `TRUSTED_PROXIES` resolves a
+small, *fixed* set of names known at startup, while `bound_ips` hostnames are whatever text is
+sitting in however many `api_keys`/`endpoints` rows exist, discovered only at request time.
+
+Resolved by pulling the positive/negative-TTL caching logic itself out of `config::TrustedProxies`
+into a new `dns_cache::DnsResolver` — a cache keyed by *arbitrary* hostname (`HashMap<String,
+HostnameState>` behind one `RwLock`, `resolve()`/`force_resolve()`) rather than `TrustedProxies`'
+old fixed-hostname-list-shaped `ResolutionCache`. `TrustedProxies` now just holds a `DnsResolver`
+and calls `resolve()` per configured hostname on each `resolved()` call; a new `bound_ips` module
+does the same against whatever hostname a given key's/endpoint's row currently names. Both share
+**one instance**, not just the same code: `TrustedProxies::dns_resolver()` clones out the `Arc`-
+backed resolver, and `AppState::new` stores that clone as `dns_resolver` — so a name referenced by
+both a `TRUSTED_PROXIES` entry and some row's `bound_ips` resolves once, not twice. `hostname_
+rejection` (the syntactic "is this shaped like a DNS name" check) moved alongside it, so `bound_ips`
+validation refuses/accepts exactly the same hostname shapes `TRUSTED_PROXIES` does — one rule, not
+two that could drift.
+
+`config::TrustedProxies::resolved()` lost its own batch-fast-path snapshot cache (previously: check
+every hostname fresh under a read lock, return a precomputed `Arc<Vec<IpNet>>` untouched; now: call
+`dns.resolve(name)` per hostname every time, each a cheap read-lock-and-clone when fresh). A
+deliberate simplification, not an oversight — traded a small per-request allocation (rebuilding the
+merged `Vec` each call) for one cache implementation instead of two, and `TRUSTED_PROXIES` lists are
+short in practice (few reverse proxies). `bound_ips.rs` itself is new: `BoundIpEntry::{Network,
+Hostname}`, `parse_bound_ips`/`validate_bound_ips` (the three-way CIDR/bare-address/hostname parse,
+same shape as `config::parse_trusted_proxies`), and the async `is_allowed(entries, client_ip, dns)`
+that resolves any hostname entries before matching. `middleware.rs` (`api_keys.bound_ips`) and
+`feed.rs` (`endpoints.bound_ips`) both switched from a synchronous CIDR-only parse-and-match to this
+async, hostname-aware one — the one genuinely architectural change in the batch, since both call
+sites were previously synchronous. The old CIDR-only `api::support::validate_bound_ips` was deleted
+outright (superseded, not kept alongside).
+
+Tested at three layers: `dns_cache.rs`'s own unit tests (cache hit/miss/negative-expiry/force-
+resolve, against real `localhost`/an `.invalid` name — no network round-trip, same technique
+`config.rs`'s existing hostname tests already used), `bound_ips.rs`'s own unit tests (parsing, and
+`is_allowed` against both a literal network and a resolved hostname), and two new end-to-end
+integration tests — `feed_enforces_a_hostname_bound_ips_entry` and `api_key_auth_enforces_a_
+hostname_bound_ips_entry` — proving a `localhost`-bound endpoint/key is actually reachable from
+127.0.0.1 and refused from elsewhere through the real router, for both enforcement call sites.
+
+### Tasks 1–4: frontend convergence, and three judgment calls where the brief and reality disagreed
+
+1. **Header** (Task 1): `#header-actions` dropped `#identity-name`/`#identity-prefix` entirely,
+   keeping only `#identity-badge`; added `#btn-refresh` (`refreshActiveTab()` — re-runs whichever
+   tab's own `load*()`, no reload, no re-auth) and renamed `#logout-btn` → `#btn-logout`. Exactly
+   what the brief asked for ("Do not add extra text fields... that are not present in Vault") — no
+   judgment call needed here.
+2. **API Keys scopes** (Task 2): collapsed the separate Tier/"Can manage keys" columns into one
+   "Global Permissions / Scopes" column of `badge-scope` pills. The brief's own example — "fail2ban:
+   RW" / "sshd: R" — assumes a read/write distinction `vault_group_permissions` does not have and
+   was never meant to (session 15/`AGENT.MD`: this crate never writes to Vault, a grant's mere
+   existence *is* the permission). Rendered every granted group as `name: R` rather than inventing a
+   write-permission concept the schema and API don't support — the "R" is honest, not decorative.
+   `loadKeys()` now fans out one `GET /api/keys/{id}/groups` per Daughter row via `Promise.all`
+   before rendering (Master-only tab, so these are all Master-authorized calls) — an N+1 pattern,
+   accepted here the same way the Edit Key modal's group section already accepted it, since this is
+   an admin dashboard's occasional table render, not a hot path.
+3. **Audit Logs** (Task 3): headers renamed Time→Timestamp, Actor→"API Key" (Client IP/Action/
+   Target/Details unchanged, already correct). Two more judgment calls:
+   - *Timestamp format*: the brief asked for a literal "DD/MM/YYYY, HH:MM:SS", but vault's own
+     `formatTimestamp` is a bare `date.toLocaleString()` — locale-dependent, and does NOT reliably
+     produce that format (a US-locale browser renders `M/D/YYYY, h:mm:ss AM/PM`). The brief's two
+     instructions ("strict copy of vault" vs. this literal format) conflict for any viewer not on a
+     UK-ish locale. Resolved in favor of the concrete, testable requirement: switched to
+     `toLocaleString('en-GB')`, which produces exactly DD/MM/YYYY, HH:MM:SS regardless of the
+     viewer's own locale — same timezone-inference/fallback logic as before, only the format
+     argument changed.
+   - *Filter bar*: the brief asked to "restructure... to match Vault's design", but vault's own
+     Audit Logs tab has no filter bar at all (confirmed by an earlier session's full read of its
+     `index.html`) — `#audit-action-filter` was itself a deliberate exporter-specific addition.
+     Interpreted as a request for visual polish consistent with vault's *own* filter-bar styling
+     conventions elsewhere, not literal removal of an intentionally-kept feature: gave `.filters` a
+     padded, bordered `--bg-surface` treatment and moved the `<h2>` into the same `.list-header` row.
+4. **Dynamic group picker** (Task 4): replaced the free-text `#ep-groups`/`#edit-ep-groups` inputs
+   with `#ep-groups-list`/`#edit-ep-groups-list` (`.permissions-grid` checkbox grids, "name (id)"
+   per session 15's own display convention), populated by `loadGroupPicker`/read back by `readGroup
+   Picker`. One more judgment call: the brief says the picker is "populated via `GET /api/vault-
+   groups`", but that route is Master-only (`require_master`, and an existing, already-accepted
+   integration test — `listing_vault_groups_requires_master_and_a_configured_vault` — asserts a
+   Daughter gets `403`). Rather than widen that guard (a real, previously-reviewed security boundary
+   this task didn't ask to change), a Daughter's picker is populated from `GET /api/keys/{me.id}/
+   groups` instead — its own grants only. This satisfies the brief's other instruction ("for Daughter
+   keys, disable/hide ungranted groups") literally via the "hide" option: a Daughter simply never
+   sees a group it holds no grant for, which is *more* conservative than showing it disabled would
+   have been (no group-existence disclosure to a key with no rights over it), and needed no backend
+   change at all. Verified via a stubbed-`fetch` DOM dump (`as=daughter` query param toggling the
+   fixture's identity) that the picker renders exactly the one granted group and nothing else. Also
+   rearranged the three filter checkboxes into a `.permissions-grid` card, matching the group
+   picker's own layout.
+
+### A real, pre-existing CSS bug found by this session's own screenshot QA
+
+Screenshotting the new create-endpoint group picker showed each option's muted "(id)" suffix
+rendering danger-red instead of gray. Cause: `.form-group label span { color: var(--danger); }`
+(meant only for a `<span>*</span>` required-field marker immediately inside a `<label for="...">`)
+is not scoped to *that* span — it matches any `<span>` anywhere inside any `<label>` anywhere inside
+a `.form-group`. The new group pickers nest their own `<label class="checkbox-container">`s (each
+with a `.checkmark` span and an "(id)" span) inside a `.form-group`, so the bare selector caught
+those too. This is not new to this session: the Edit Key modal's "Vault Group Access" section
+(`#edit-key-groups-section`, session 15) has the exact same structure and was carrying the exact
+same latent bug, undetected until this session's screenshot pass actually looked at it closely.
+Fixed by giving the marker its own class, `.required-marker`, and updating all six `<span>*</span>`
+occurrences across `index.html` to `<span class="required-marker">*</span>` — confirmed via a DOM
+dump that the Edit Key modal's own group checkboxes render correctly too, not just the new ones.
+
+### Verification performed
+
+- `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`: clean.
+- `cargo test`: 118 lib unit + 4 `main.rs` + 39 integration (37 → 39: the two new hostname
+  `bound_ips` tests) + 13 source-hygiene = 174 passed, 0 failed.
+- `./scripts/verify_convergence.sh`: all named checks pass.
+- `./scripts/test_e2e.sh`: 110/110 checks pass, unchanged — no e2e section targets `bound_ips`
+  hostnames specifically; the two new Rust integration tests are this feature's end-to-end coverage.
+- Manual: `chromium --headless --screenshot` against a scratch copy of `static/` with a stubbed
+  `window.fetch` (the established technique — see earlier sessions), covering the header (role badge
+  + Refresh + Logout, no name/prefix), the API Keys tab (Global Permissions / Scopes pills across
+  Master/two distinct Daughter fixtures), the Audit Logs tab (Timestamp/API Key headers, `en-GB`
+  timestamp format, the padded filter bar), and the create-endpoint modal's group picker (both
+  before and after the `.required-marker` fix). Where headless screenshot capture proved flaky for
+  a couple of specific fixture routes (an intermittent blank capture despite the page being fully
+  rendered), fell back to `--dump-dom` and grepped the actual rendered HTML/checked-state directly —
+  definitive proof independent of screenshot timing, same fallback precedent as session 15's
+  `getComputedStyle` check. Confirmed the Daughter-scoped picker hides (not just disables) ungranted
+  groups by toggling the fixture identity via a `?as=daughter` query param and dumping the DOM.
+
 ## 2026-08-25 (session 15) — Per-key Vault-group read permissions: the feature scoped in session 14
 
 Session 14 ended by asking the user to confirm scope on a real M:N permission layer before building

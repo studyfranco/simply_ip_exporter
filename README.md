@@ -198,7 +198,7 @@ An `endpoints` row's fields:
 | :--- | :--- |
 | `vault_groups` | Comma-separated Vault group names/UUIDs this endpoint pulls from. |
 | `ttl_seconds` | Differential-sync interval and in-memory cache "freshness" window. |
-| `bound_ips` | Optional comma-separated CIDR allowlist for the *public* feed request (separate from any admin-API `bound_ips`). |
+| `bound_ips` | Optional comma-separated CIDR/IP/hostname allowlist for the *public* feed request (separate from any admin-API `bound_ips`). A hostname entry is resolved via DNS at request time (30s/5s positive/negative cache, shared with `TRUSTED_PROXIES`'s own resolver). |
 | `filter_rfc1918` | Strip `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`. |
 | `filter_bogons` | Strip CGN, TEST-NET, multicast, and other reserved/unallocated ranges. |
 | `filter_loopback` | Strip `127.0.0.0/8` and `::1`. |
@@ -219,8 +219,8 @@ GET /feed/v1/<token_secret>/list.txt
   revalidates on every fetch is never throttled for doing so.
 - Requests that *do* need a full body are throttled to one per source IP per 2 minutes; excess
   requests get `429 Too Many Requests` with a `Retry-After` header.
-- An optional per-endpoint `bound_ips` CIDR allowlist returns `403 Forbidden` for disallowed
-  source addresses.
+- An optional per-endpoint `bound_ips` CIDR/IP/hostname allowlist returns `403 Forbidden` for
+  disallowed source addresses.
 - An unknown token returns `404 Not Found`.
 
 ## pfSense / pfBlockerNG integration
@@ -262,7 +262,7 @@ orchestrators, load balancers) cannot compute an HMAC signature.
 ```sh
 cargo check --all-targets
 cargo clippy --all-targets -- -D warnings
-cargo test                     # 107 unit + 4 main.rs unit + 37 integration + 13 source-hygiene tests
+cargo test                     # 118 unit + 4 main.rs unit + 39 integration + 13 source-hygiene tests
 ./scripts/verify_convergence.sh  # source hygiene (raw SQL, unwrap/expect, frontend syntax/DOM refs) + clippy -D warnings + cargo test, one gate
 ./scripts/test_e2e.sh          # full live E2E against a real simply_ip_vault + simply_ip_exporter pair
 ```

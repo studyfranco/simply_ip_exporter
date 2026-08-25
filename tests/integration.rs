@@ -350,6 +350,105 @@ async fn feed_enforces_bound_ips() {
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
 
+/// `bound_ips` accepts a hostname alongside CIDR/IP entries (`AGENT_NOTES.MD`, 2026-08-25),
+/// resolved through the shared `DnsResolver` — proven end-to-end here against `localhost`, which
+/// resolves via `/etc/hosts` in every sandboxed test environment with no real network round-trip.
+#[tokio::test]
+async fn feed_enforces_a_hostname_bound_ips_entry() {
+    let db = setup_test_db().await;
+    let master = insert_key(&db, true, true).await;
+    let state = test_state(&db).with_pinned_master(master.model.id);
+
+    let create = create_app(state.clone())
+        .oneshot(signed_request(
+            "POST",
+            "/api/endpoints",
+            &master,
+            r#"{"name":"Hostname Restricted","vault_groups":"g1","bound_ips":"localhost"}"#,
+        ))
+        .await
+        .unwrap();
+    let created = body_json(create).await;
+    let token = created["token_secret"].as_str().unwrap().to_owned();
+
+    // A request from an address `localhost` does NOT resolve to is refused.
+    let refused = create_app(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri(format!("/feed/v1/{token}/list.txt"))
+                .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from(([9, 9, 9, 9], 9000))))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+
+    // A request from the resolved loopback address is allowed.
+    let allowed = create_app(state)
+        .oneshot(
+            Request::builder()
+                .uri(format!("/feed/v1/{token}/list.txt"))
+                .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 9000))))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(allowed.status(), StatusCode::OK);
+}
+
+/// Same hostname support, exercised through `auth_middleware`'s enforcement of an API key's own
+/// `bound_ips` rather than an endpoint's — the two call sites share `bound_ips::is_allowed`, but
+/// this proves the sharing actually holds at the HTTP layer for both.
+#[tokio::test]
+async fn api_key_auth_enforces_a_hostname_bound_ips_entry() {
+    let db = setup_test_db().await;
+    let master = insert_key(&db, true, true).await;
+    let state = test_state(&db).with_pinned_master(master.model.id);
+    let app = create_app(state);
+
+    // Every signed_request in this suite carries ConnectInfo 127.0.0.1:8080 (see
+    // common::with_connect_info), which "localhost" resolves to — the update must succeed. Note
+    // this request is itself authenticated against whatever bound_ips held *before* it runs (the
+    // master key's default, unrestricted), not the value it is about to set.
+    let allowed = app
+        .clone()
+        .oneshot(signed_request(
+            "PUT",
+            &format!("/api/keys/{}", master.model.id),
+            &master,
+            r#"{"bound_ips":"localhost"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(allowed.status(), StatusCode::OK);
+
+    // Still allowed: this request is authenticated against the "localhost" bound_ips the previous
+    // request just set, which the 127.0.0.1 peer resolves within — it then rewrites bound_ips to
+    // an unresolvable hostname.
+    let still_allowed = app
+        .clone()
+        .oneshot(signed_request(
+            "PUT",
+            &format!("/api/keys/{}", master.model.id),
+            &master,
+            r#"{"bound_ips":"this-name-does-not-exist.invalid"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(still_allowed.status(), StatusCode::OK);
+
+    // Now refused: this request is authenticated against the unresolvable hostname the previous
+    // request set, which resolves to no addresses and so allows nobody — including the very peer
+    // that set it.
+    let refused = app
+        .oneshot(signed_request("GET", "/api/auth/me", &master, ""))
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+}
+
 #[tokio::test]
 async fn an_unknown_feed_token_is_404() {
     let db = setup_test_db().await;

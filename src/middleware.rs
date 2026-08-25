@@ -2,10 +2,10 @@
 //! single-use anti-replay enforcement, and `bound_ips` CIDR restriction.
 
 use axum::{body::Body, extract::State, http::Request, middleware::Next, response::Response};
-use ipnet::IpNet;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use sha2::{Digest, Sha256};
 
+use crate::bound_ips;
 use crate::config::resolve_client_ip;
 use crate::crypto::{SignatureRejection, canonical_v1_payload, verify_signature};
 use crate::entities::prelude::ApiKey;
@@ -175,18 +175,12 @@ pub async fn auth_middleware(
     }
 
     let bound_ips_str = key_record.bound_ips.as_deref().unwrap_or("");
-    let networks: Vec<IpNet> = bound_ips_str
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| s.parse())
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| {
-            tracing::error!("Invalid CIDR in database: {:?}", key_record.bound_ips);
-            AppError::Internal
-        })?;
+    let entries = bound_ips::parse_bound_ips(bound_ips_str).map_err(|_| {
+        tracing::error!("Invalid bound_ips in database: {:?}", key_record.bound_ips);
+        AppError::Internal
+    })?;
 
-    let is_allowed = networks.is_empty() || networks.iter().any(|net| net.contains(&client_ip));
+    let is_allowed = entries.is_empty() || bound_ips::is_allowed(&entries, client_ip, &state.dns_resolver).await;
     if !is_allowed {
         tracing::warn!(
             key = %key_record.prefix,

@@ -19,6 +19,7 @@ use axum::{
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use sha2::{Digest, Sha256};
 
+use crate::bound_ips;
 use crate::config::resolve_client_ip;
 use crate::entities::{endpoint, prelude::Endpoint};
 use crate::error::AppError;
@@ -43,14 +44,12 @@ pub async fn serve_feed(
         .await?
         .ok_or(AppError::NotFound)?;
 
-    if let Some(bound_ips) = ep.bound_ips.as_deref().filter(|s| !s.trim().is_empty()) {
-        let networks: Vec<ipnet::IpNet> = bound_ips
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .filter_map(|s| s.parse().ok())
-            .collect();
-        if !networks.iter().any(|net| net.contains(&client_ip)) {
+    if let Some(raw) = ep.bound_ips.as_deref().filter(|s| !s.trim().is_empty()) {
+        let entries = bound_ips::parse_bound_ips(raw).map_err(|_| {
+            tracing::error!("Invalid bound_ips in database for endpoint {}: {:?}", ep.id, ep.bound_ips);
+            AppError::Internal
+        })?;
+        if !bound_ips::is_allowed(&entries, client_ip, &state.dns_resolver).await {
             return Err(AppError::Forbidden("Client IP not allowed for this endpoint".to_owned()));
         }
     }

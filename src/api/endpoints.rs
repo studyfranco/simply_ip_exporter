@@ -9,7 +9,8 @@ use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, Quer
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::api::support::{create_audit_log, describe_resource, validate_bound_ips};
+use crate::api::support::{create_audit_log, describe_resource};
+use crate::bound_ips::validate_bound_ips;
 use crate::entities::{api_key, endpoint, prelude::Endpoint};
 use crate::error::AppError;
 use crate::extract::{StrictJson, StrictPath};

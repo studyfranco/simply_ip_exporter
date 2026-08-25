@@ -444,9 +444,16 @@ body {
     margin-bottom: 0.35rem;
 }
 
-/* Required-field marker — a bare `<span>*</span>` inside a label, exactly as
-   example/simply_ip_vault marks its own required admin-form fields. */
-.form-group label span {
+/* Required-field marker — a `<span class="required-marker">*</span>` inside a label, exactly as
+   example/simply_ip_vault marks its own required admin-form fields.
+   Scoped to its own class rather than a bare `.form-group label span` (which this rule used until
+   2026-08-25): a checkbox picker's `.permissions-grid` living inside a `.form-group` — the Vault
+   Group Access section of the Edit Key modal, and the new endpoint create/edit group pickers —
+   nests its own `<label class="checkbox-container">`s with their own `<span>`s (the `.checkmark`
+   and each option's muted "(id)" suffix) as descendants of that same `.form-group`, and the bare
+   selector matched those too, tinting the checkmark and the id text danger-red instead of leaving
+   them alone. */
+.required-marker {
     color: var(--danger);
 }
 
@@ -821,6 +828,9 @@ input[type='checkbox']:checked::after {
     margin-bottom: 0;
 }
 
+/* A clean, padded bar around the audit table's filter input + button — matches
+   example/simply_ip_vault's own filter-bar treatment elsewhere (a bordered `--bg-surface` strip)
+   rather than bare, unstyled controls floating in the list-header. */
 .filters {
     display: flex;
     flex-wrap: wrap;
@@ -829,6 +839,10 @@ input[type='checkbox']:checked::after {
     flex: 1 1 auto;
     min-width: 0;
     justify-content: flex-end;
+    padding: 0.6rem 0.75rem;
+    background-color: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
 }
 
 .filters .input-field {

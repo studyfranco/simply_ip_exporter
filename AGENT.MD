@@ -120,7 +120,7 @@ To protect the underlying storage hardware, **IP records are kept strictly in-me
 ### 2. Public Feed Exposure (`/feed/v1/<token_secret>/list.txt`)
 
 - **Authentication:** Unauthenticated in terms of HTTP headers. Security is established via unique 128-bit entropy URL secret tokens (`<token_secret>`).
-- **Network Filtering (`bound_ips`):** Optional CIDR network filtering per endpoint. Requests originating from outside configured `bound_ips` receive `403 Forbidden`.
+- **Network Filtering (`bound_ips`):** Optional CIDR/IP/hostname filtering per endpoint (and, identically, per API key). Requests originating from outside configured `bound_ips` receive `403 Forbidden`. A hostname entry (2026-08-25, `bound_ips.rs`) is resolved at request time through the same `dns_cache::DnsResolver` cache `TRUSTED_PROXIES` hostnames use — one shared instance (`AppState::dns_resolver`, cloned from `TrustedProxies::dns_resolver()`), not a second implementation; see below and `AGENT_NOTES.MD`.
 - **In-Memory Anti-DoS / Rate Limiting:**
   - Restrict public queries per client source IP (e.g., maximum 1 request every 2 minutes per IP).
   - Track client IPs using an in-memory bounded LRU / map with a hard ceiling (`MAX_TRACKED_IPS = 10000`) to prevent memory exhaustion under IP spoofing attacks. Excess attempts receive `429 Too Many Requests`.
@@ -163,6 +163,11 @@ To protect the underlying storage hardware, **IP records are kept strictly in-me
   together, and the proxy's DNS record may not exist for the first few seconds), and thereafter on
   every request whose 30s/5s positive/negative cache entry has expired. Startup is never blocked
   waiting on DNS.
+- The positive/negative-TTL cache itself lives in `dns_cache::DnsResolver` (extracted 2026-08-25
+  from `config::TrustedProxies`, which now just holds one and calls `resolve()` per configured
+  hostname) precisely so `bound_ips` hostname support could reuse it rather than reimplement it —
+  `hostname_rejection` (the syntactic name-shape check) moved alongside it for the same reason, so
+  both settings accept exactly the same hostname shapes.
 
 ---
 

@@ -21,10 +21,12 @@ use tower_http::trace::TraceLayer;
 pub const MAX_REQUEST_BODY_BYTES: usize = 3 * 1024 * 1024;
 
 pub mod api;
+pub mod bound_ips;
 pub mod cache;
 pub mod config;
 pub mod crypto;
 pub mod db;
+pub mod dns_cache;
 pub mod entities;
 pub mod error;
 pub mod extract;
