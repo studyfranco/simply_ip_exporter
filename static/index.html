@@ -22,11 +22,11 @@
       <form id="login-form" class="login-form">
         <div class="form-group">
           <label for="login-api-key">X-API-Key</label>
-          <input type="password" id="login-api-key" class="input-field" autocomplete="off" required />
+          <input type="password" id="login-api-key" class="input-field" placeholder="Enter X-API-Key..." autocomplete="off" required />
         </div>
         <div class="form-group">
           <label for="login-signing-secret">Signing secret</label>
-          <input type="password" id="login-signing-secret" class="input-field" autocomplete="off" required />
+          <input type="password" id="login-signing-secret" class="input-field" placeholder="Enter HMAC signing secret..." autocomplete="off" required />
           <small class="field-hint">Used locally to sign every request (HMAC-SHA256). Never transmitted.</small>
         </div>
         <div class="form-group">
@@ -72,40 +72,15 @@
         <div class="list-header">
           <h2>Endpoints</h2>
         </div>
+        <div class="table-toolbar">
+          <button type="button" id="open-create-endpoint" class="btn btn-primary">+ Add Endpoint</button>
+        </div>
         <div class="table-container">
           <table class="data-table">
             <thead><tr><th>Name / Groups</th><th>Feed URL</th><th>TTL</th><th>Filters</th><th>Last synced</th><th></th></tr></thead>
             <tbody id="endpoints-body"></tbody>
           </table>
         </div>
-        <h2 class="section-subheading">New endpoint</h2>
-        <form id="endpoint-form" class="admin-form">
-          <div class="form-group">
-            <label for="ep-name">Name</label>
-            <input type="text" id="ep-name" class="input-field" required />
-          </div>
-          <div class="form-group">
-            <label for="ep-description">Description</label>
-            <input type="text" id="ep-description" class="input-field" />
-          </div>
-          <div class="form-group">
-            <label for="ep-groups">Vault groups (comma-separated)</label>
-            <input type="text" id="ep-groups" class="input-field" placeholder="fail2ban,sshd" required />
-          </div>
-          <div class="form-group">
-            <label for="ep-ttl">TTL seconds</label>
-            <input type="number" id="ep-ttl" class="input-field" value="3600" min="1" />
-          </div>
-          <div class="form-group">
-            <label for="ep-bound-ips">Bound IPs (comma-separated CIDR, optional)</label>
-            <input type="text" id="ep-bound-ips" class="input-field" placeholder="203.0.113.0/24" />
-          </div>
-          <div class="checkbox-row"><input type="checkbox" id="ep-filter-rfc1918" /><label for="ep-filter-rfc1918">Filter RFC 1918</label></div>
-          <div class="checkbox-row"><input type="checkbox" id="ep-filter-bogons" /><label for="ep-filter-bogons">Filter bogons</label></div>
-          <div class="checkbox-row"><input type="checkbox" id="ep-filter-loopback" /><label for="ep-filter-loopback">Filter loopback</label></div>
-          <div class="form-actions mt-2"><button type="submit" class="btn btn-primary">Create endpoint</button></div>
-          <div id="endpoint-error" class="message error hidden"></div>
-        </form>
       </section>
     </main>
 
@@ -120,7 +95,7 @@
         <form id="key-form" class="admin-form">
           <div class="form-grid">
             <div class="form-group">
-              <label for="key-name">Name</label>
+              <label for="key-name">Name <span>*</span></label>
               <input type="text" id="key-name" class="input-field" required />
             </div>
             <div class="form-group">
@@ -184,7 +159,7 @@
         </div>
         <div class="table-container">
           <table class="data-table">
-            <thead><tr><th>Time</th><th>Action</th><th>Target</th><th>Actor</th><th>Client IP</th><th>Details</th></tr></thead>
+            <thead><tr><th>Time</th><th>Actor</th><th>Client IP</th><th>Action</th><th>Target</th><th>Details</th></tr></thead>
             <tbody id="audit-body"></tbody>
           </table>
         </div>
@@ -196,6 +171,47 @@
         <div id="audit-error" class="message error hidden"></div>
       </section>
     </main>
+  </div>
+
+  <!-- Create Endpoint Modal — opened from the "+ Add Endpoint" toolbar button, matching
+       example/simply_ip_vault's "+ Add IP / Grant Access" → #manage-ip-modal pattern. -->
+  <div id="create-endpoint-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="create-endpoint-modal-title">
+    <div class="modal-card modal-card-form card">
+      <div class="modal-header">
+        <h3 id="create-endpoint-modal-title">New Endpoint</h3>
+        <button type="button" id="create-endpoint-close" class="btn-modal-close" aria-label="Close">&times;</button>
+      </div>
+      <form id="endpoint-form" class="admin-form">
+        <div class="form-group">
+          <label for="ep-name">Name <span>*</span></label>
+          <input type="text" id="ep-name" class="input-field" required />
+        </div>
+        <div class="form-group">
+          <label for="ep-description">Description</label>
+          <input type="text" id="ep-description" class="input-field" />
+        </div>
+        <div class="form-group">
+          <label for="ep-groups">Vault groups (comma-separated) <span>*</span></label>
+          <input type="text" id="ep-groups" class="input-field" placeholder="fail2ban,sshd" required />
+        </div>
+        <div class="form-group">
+          <label for="ep-ttl">TTL seconds</label>
+          <input type="number" id="ep-ttl" class="input-field" value="3600" min="1" />
+        </div>
+        <div class="form-group">
+          <label for="ep-bound-ips">Bound IPs (comma-separated CIDR, optional)</label>
+          <input type="text" id="ep-bound-ips" class="input-field" placeholder="203.0.113.0/24" />
+        </div>
+        <div class="checkbox-row"><input type="checkbox" id="ep-filter-rfc1918" /><label for="ep-filter-rfc1918">Filter RFC 1918</label></div>
+        <div class="checkbox-row"><input type="checkbox" id="ep-filter-bogons" /><label for="ep-filter-bogons">Filter bogons</label></div>
+        <div class="checkbox-row"><input type="checkbox" id="ep-filter-loopback" /><label for="ep-filter-loopback">Filter loopback</label></div>
+        <div class="modal-actions mt-4">
+          <button type="button" id="create-endpoint-cancel" class="btn btn-cancel">Cancel</button>
+          <button type="submit" class="btn btn-primary">Create endpoint</button>
+        </div>
+        <div id="endpoint-error" class="message error hidden"></div>
+      </form>
+    </div>
   </div>
 
   <!-- Reassignment Modal — shown when deleting a key that still owns endpoints. -->

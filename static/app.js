@@ -322,6 +322,19 @@ async function loadEndpoints() {
   });
 }
 
+// Opens/closes the "New Endpoint" modal — matches example/simply_ip_vault's own
+// "+ Add IP / Grant Access" → #manage-ip-modal pattern: the creation form isn't permanently
+// inline, it's revealed by the toolbar button and dismissed the same way every other modal here
+// is (×, Cancel, backdrop click, or Escape).
+function openCreateEndpointModal() {
+  hideError('endpoint-error');
+  el('create-endpoint-modal').classList.remove('hidden');
+}
+
+function closeCreateEndpointModal() {
+  el('create-endpoint-modal').classList.add('hidden');
+}
+
 async function createEndpoint(event) {
   event.preventDefault();
   hideError('endpoint-error');
@@ -337,6 +350,7 @@ async function createEndpoint(event) {
       filter_loopback: el('ep-filter-loopback').checked,
     });
     event.target.reset();
+    closeCreateEndpointModal();
     await loadEndpoints();
   } catch (e) {
     showError('endpoint-error', e.message);
@@ -602,12 +616,12 @@ async function loadAuditLogs() {
     for (const entry of logs) {
       const tr = document.createElement('tr');
       tr.innerHTML = `
-        <td class="text-muted">${escapeHtml(entry.timestamp)}</td>
-        <td><span class="font-mono">${escapeHtml(entry.action)}</span></td>
-        <td>${escapeHtml(entry.target_resource || '—')}</td>
-        <td>${escapeHtml(entry.api_key_name)}<div class="text-muted font-mono text-sm">${escapeHtml(entry.api_key_prefix)}…</div></td>
-        <td class="font-mono">${escapeHtml(entry.client_ip)}</td>
-        <td class="text-muted">${escapeHtml(entry.details || '—')}</td>`;
+        <td class="text-muted text-sm">${escapeHtml(entry.timestamp)}</td>
+        <td class="text-sm">${escapeHtml(entry.api_key_name)} <span class="text-muted text-sm">(${escapeHtml(entry.api_key_prefix)}...)</span></td>
+        <td class="font-mono text-sm">${escapeHtml(entry.client_ip)}</td>
+        <td><span class="badge badge-scope">${escapeHtml(entry.action)}</span></td>
+        <td class="font-mono text-sm">${escapeHtml(entry.target_resource || '-')}</td>
+        <td class="text-sm">${escapeHtml(entry.details || '-')}</td>`;
       tbody.appendChild(tr);
     }
   } catch (e) {
@@ -636,6 +650,15 @@ document.addEventListener('DOMContentLoaded', () => {
   el('logout-btn').addEventListener('click', logout);
   el('endpoint-form').addEventListener('submit', createEndpoint);
   el('key-form').addEventListener('submit', createKey);
+
+  // Create Endpoint modal: open from the toolbar button, close on the × button, Cancel, a
+  // backdrop click, or Escape — same conventions as the reassignment modal below.
+  el('open-create-endpoint').addEventListener('click', openCreateEndpointModal);
+  el('create-endpoint-close').addEventListener('click', closeCreateEndpointModal);
+  el('create-endpoint-cancel').addEventListener('click', closeCreateEndpointModal);
+  el('create-endpoint-modal').addEventListener('click', (event) => {
+    if (event.target.id === 'create-endpoint-modal') closeCreateEndpointModal();
+  });
   el('minted-key-dismiss').addEventListener('click', () => el('minted-key-box').classList.add('hidden'));
 
   el('audit-refresh-btn').addEventListener('click', () => {
@@ -675,6 +698,7 @@ document.addEventListener('DOMContentLoaded', () => {
   document.addEventListener('keydown', (event) => {
     if (event.key !== 'Escape') return;
     if (!el('reassign-dialog').classList.contains('hidden')) closeReassignDialog();
+    if (!el('create-endpoint-modal').classList.contains('hidden')) closeCreateEndpointModal();
   });
 
   if (Session.isSet()) {

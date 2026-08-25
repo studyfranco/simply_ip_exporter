@@ -1,5 +1,60 @@
 # Agent Worklog — `simply_ip_exporter`
 
+## 2026-08-25 (session 12) — Real-render convergence pass against a live `simply_ip_vault`, endpoint-creation modal
+
+Session 11 converged the API Keys/Audit Logs pages and login screen against vault by *reading*
+vault's markup/CSS. Asked to actually compare and converge further — so this time, booted a real
+`simply_ip_vault` binary (`cargo build` in `example/simply_ip_vault`, then run standalone against a
+throwaway sqlite DB, same env vars `scripts/test_e2e.sh` uses) and drove a real login through its
+own `FirewallClient` class from a scratch fixture page (`window.app.login(key, secret)`, with
+`window.fetch` wrapped to proxy `/api/...` calls to the running vault's port — a genuine
+cross-origin request, so also needed `chromium --disable-web-security` for this one-off local
+screenshot; nothing about the real dashboard's CSP or CORS posture changed). This produced actual
+rendered vault screenshots, not just a reading of its source, and found three concrete gaps reading
+the CSS alone had missed:
+
+1. **Audit table column order and ACTION styling.** Vault orders its audit columns Time → Actor →
+   Client IP → Action → Target → (Groups, N/A here) → Details; this crate had Time → Action →
+   Target → Actor → Client IP → Details. Reordered to match. Vault also renders the ACTION value as
+   `<span class="badge badge-scope">`, not plain `.font-mono` text — added `.badge-scope` (the exact
+   highlight-blue pill vault uses) and switched the row template to it. The actor cell's prefix
+   also moved from a stacked `<div>` onto vault's own single-line format:
+   `Name <span class="text-muted text-sm">(prefix...)</span>`.
+2. **Login field placeholders.** Vault's `#login-key`/`#login-secret` inputs carry
+   `placeholder="Enter X-API-Key..."` / `"Enter HMAC signing secret..."`; this crate's had none.
+   Added the matching placeholders.
+3. **Required-field markers.** Vault marks every `required` admin-form field with a
+   `<span>*</span>` in its label (styled `color: var(--danger)` via `.form-group label span`, a
+   rule this crate didn't have). Added the rule and the markers on every genuinely-`required` field
+   across the endpoint and key creation forms.
+
+### New: endpoint creation moved behind a button, matching vault's own "+ Add IP" pattern
+
+Explicitly asked for a checkbox/button gate on endpoint creation — "we need to click on a button to
+see it." Vault's own IP Records tab already does exactly this for its own primary create action:
+`#open-manage-ip` (a `.table-toolbar` button reading "+ Add IP / Grant Access") opens
+`#manage-ip-modal`, a `.modal-overlay`/`.modal-card-form`. The endpoint-creation form — previously a
+permanently inline `<form>` below the endpoints table — is now `#create-endpoint-modal`, opened by
+a new "+ Add Endpoint" `.table-toolbar` button and closed the same four ways every other modal in
+this crate now closes (×, Cancel, backdrop click, Escape — `openCreateEndpointModal`/
+`closeCreateEndpointModal` in `app.js`, wired identically to the existing reassignment modal's
+open/close pair). The Keys tab's create-key form was deliberately left inline — vault's own API
+Keys tab keeps its create-key form inline too (only IP Records uses the button+modal pattern), so
+this isn't an inconsistency, it's matching vault's own actual convention per-tab.
+
+### Verification performed
+
+- `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`: clean.
+- `cargo test`: 147 passed, 0 failed (`test_e2e.sh` drives endpoint creation via signed HTTP
+  directly, not through the UI, so moving the form into a modal didn't need new test coverage —
+  the API contract is unchanged).
+- `./scripts/verify_convergence.sh`: all 13 named checks pass.
+- `./scripts/test_e2e.sh`: 100/100 checks pass.
+- Manual: fresh fixture-driven screenshots of the reordered/re-styled Audit Logs table, the
+  required-field asterisks on both admin forms, the login screen's new placeholders, the Endpoints
+  tab with the inline form gone and the "+ Add Endpoint" button in its place, and the resulting
+  create-endpoint modal open — confirmed against the real vault screenshots taken this session.
+
 ## 2026-08-25 (session 11) — Tab-separated pages, API Keys/Audit Logs feature parity with ip_vault, div-based modal
 
 Five explicit asks, all against `example/simply_ip_vault`'s actual current markup/JS (read in full
