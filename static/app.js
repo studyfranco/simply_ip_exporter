@@ -293,7 +293,7 @@ async function loadEndpoints() {
   const tbody = el('endpoints-body');
   tbody.innerHTML = '';
   if (endpoints.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="6" class="table-empty">No endpoints yet — create one below.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="7" class="table-empty">No endpoints yet — create one below.</td></tr>';
   }
   for (const ep of endpoints) {
     const tr = document.createElement('tr');
@@ -303,8 +303,10 @@ async function loadEndpoints() {
       <td class="font-mono break-all">${escapeHtml(feedUrl)}</td>
       <td>${ep.ttl_seconds}s</td>
       <td>${[ep.filter_rfc1918 && 'RFC1918', ep.filter_bogons && 'Bogons', ep.filter_loopback && 'Loopback'].filter(Boolean).join(', ') || '—'}</td>
+      <td class="font-mono text-sm">${ep.bound_ips ? escapeHtml(ep.bound_ips) : '<span class="text-muted">Unrestricted</span>'}</td>
       <td>${ep.last_synced_at || 'never'}</td>
       <td class="row">
+        <button class="btn btn-secondary btn-sm" data-edit-endpoint="${ep.id}">Edit</button>
         <button class="btn btn-secondary btn-sm" data-copy="${escapeHtml(feedUrl)}">Copy URL</button>
         <button class="btn btn-danger btn-sm" data-delete-endpoint="${ep.id}">Delete</button>
       </td>`;
@@ -312,6 +314,12 @@ async function loadEndpoints() {
   }
   tbody.querySelectorAll('[data-copy]').forEach((btn) => {
     btn.addEventListener('click', () => navigator.clipboard.writeText(btn.dataset.copy));
+  });
+  tbody.querySelectorAll('[data-edit-endpoint]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const target = endpoints.find((ep) => ep.id === btn.dataset.editEndpoint);
+      if (target) openEditEndpointModal(target);
+    });
   });
   tbody.querySelectorAll('[data-delete-endpoint]').forEach((btn) => {
     btn.addEventListener('click', async () => {
@@ -354,6 +362,56 @@ async function createEndpoint(event) {
     await loadEndpoints();
   } catch (e) {
     showError('endpoint-error', e.message);
+  }
+}
+
+// Opens the Edit Endpoint modal, pre-filled from the already-fetched endpoint list (no extra
+// round-trip) — same fields as creation, including Bound IPs: every endpoint is IP-unrestricted
+// by default (bound_ips absent), and this is where that can be changed after the fact, not just
+// at creation time.
+function openEditEndpointModal(target) {
+  hideError('edit-endpoint-error');
+  el('edit-ep-id').value = target.id;
+  el('edit-ep-name').value = target.name;
+  el('edit-ep-description').value = target.description || '';
+  el('edit-ep-groups').value = target.vault_groups;
+  el('edit-ep-ttl').value = target.ttl_seconds;
+  el('edit-ep-bound-ips').value = target.bound_ips || '';
+  el('edit-ep-filter-rfc1918').checked = target.filter_rfc1918;
+  el('edit-ep-filter-bogons').checked = target.filter_bogons;
+  el('edit-ep-filter-loopback').checked = target.filter_loopback;
+  el('edit-endpoint-modal').classList.remove('hidden');
+}
+
+function closeEditEndpointModal() {
+  el('edit-endpoint-modal').classList.add('hidden');
+}
+
+async function submitEditEndpoint(event) {
+  event.preventDefault();
+  hideError('edit-endpoint-error');
+  const id = el('edit-ep-id').value;
+  try {
+    await apiCall('PUT', `/api/endpoints/${id}`, {
+      name: el('edit-ep-name').value,
+      // description/bound_ips are sent as-is, NOT `value || null`: PUT /api/endpoints/{id}
+      // treats a present-but-empty string as "clear this field" and an absent (null) field as
+      // "leave it unchanged" (src/api/endpoints.rs::update_endpoint). Coalescing an emptied
+      // field to null here would make clearing Bound IPs — the one way to lift an endpoint back
+      // to unrestricted after it was set — silently do nothing.
+      description: el('edit-ep-description').value,
+      vault_groups: el('edit-ep-groups').value,
+      ttl_seconds: parseInt(el('edit-ep-ttl').value, 10) || 3600,
+      bound_ips: el('edit-ep-bound-ips').value,
+      filter_rfc1918: el('edit-ep-filter-rfc1918').checked,
+      filter_bogons: el('edit-ep-filter-bogons').checked,
+      filter_loopback: el('edit-ep-filter-loopback').checked,
+    });
+    closeEditEndpointModal();
+    showToast('Endpoint updated', 'success');
+    await loadEndpoints();
+  } catch (e) {
+    showError('edit-endpoint-error', e.message);
   }
 }
 
@@ -649,7 +707,12 @@ async function submitEditKey(event) {
     // values) — guard_master_update refuses the update if either field is merely *present* in
     // the payload, even carrying the key's own current value, so a no-op resubmission of those
     // fields would still 403.
-    const payload = { bound_ips: el('edit-key-bound-ips').value || null };
+    //
+    // bound_ips is sent as-is, NOT `value || null`: PUT /api/keys/{id} treats a present-but-empty
+    // string as "clear this field" and an absent (null) field as "leave it unchanged"
+    // (src/api/keys.rs::update_api_key) — coalescing an emptied field to null would make clearing
+    // Bound IPs silently do nothing.
+    const payload = { bound_ips: el('edit-key-bound-ips').value };
     if (!isMaster) {
       payload.name = el('edit-key-name').value;
       payload.can_manage_keys = el('edit-key-can-manage-keys').checked;
@@ -695,13 +758,16 @@ async function loadAuditLogs() {
     }
     for (const entry of logs) {
       const tr = document.createElement('tr');
+      const actor = `${entry.api_key_name} (${entry.api_key_prefix}...)`;
+      const target = entry.target_resource || '-';
+      const details = entry.details || '-';
       tr.innerHTML = `
-        <td class="text-muted text-sm">${escapeHtml(entry.timestamp)}</td>
-        <td class="text-sm">${escapeHtml(entry.api_key_name)} <span class="text-muted text-sm">(${escapeHtml(entry.api_key_prefix)}...)</span></td>
+        <td class="text-muted text-sm" title="${escapeHtml(entry.timestamp)}">${escapeHtml(formatTimestamp(entry.timestamp))}</td>
+        <td class="text-sm" title="${escapeHtml(actor)}">${escapeHtml(entry.api_key_name)} <span class="text-muted text-sm">(${escapeHtml(entry.api_key_prefix)}...)</span></td>
         <td class="font-mono text-sm">${escapeHtml(entry.client_ip)}</td>
         <td><span class="badge badge-scope">${escapeHtml(entry.action)}</span></td>
-        <td class="font-mono text-sm">${escapeHtml(entry.target_resource || '-')}</td>
-        <td class="text-sm">${escapeHtml(entry.details || '-')}</td>`;
+        <td class="font-mono text-sm" title="${escapeHtml(target)}">${escapeHtml(target)}</td>
+        <td class="text-sm" title="${escapeHtml(details)}">${escapeHtml(details)}</td>`;
       tbody.appendChild(tr);
     }
   } catch (e) {
@@ -713,6 +779,19 @@ function escapeHtml(str) {
   const div = document.createElement('div');
   div.textContent = str == null ? '' : String(str);
   return div.innerHTML;
+}
+
+// Renders a server timestamp (chrono::NaiveDateTime, no timezone marker — always UTC in this
+// crate) in the viewer's own locale/timezone via toLocaleString(), matching
+// example/simply_ip_vault's own formatTimestamp exactly. Ported verbatim rather than
+// reimplemented: same timezone-inference rule (append 'Z' only if nothing already marks one) and
+// the same fallback to the raw string if it doesn't parse as a date at all.
+function formatTimestamp(raw) {
+  if (!raw) return '—';
+  const hasTimezone = /[zZ]|[+-]\d{2}:?\d{2}$/.test(raw);
+  const date = new Date(hasTimezone ? raw : `${raw}Z`);
+  if (Number.isNaN(date.getTime())) return raw;
+  return date.toLocaleString();
 }
 
 // ── Wiring ───────────────────────────────────────────────────────────────────
@@ -740,6 +819,14 @@ document.addEventListener('DOMContentLoaded', () => {
     if (event.target.id === 'create-endpoint-modal') closeCreateEndpointModal();
   });
   el('minted-key-dismiss').addEventListener('click', () => el('minted-key-box').classList.add('hidden'));
+
+  // Edit Endpoint modal: same four close conventions as every other modal here.
+  el('edit-endpoint-form').addEventListener('submit', submitEditEndpoint);
+  el('edit-endpoint-close').addEventListener('click', closeEditEndpointModal);
+  el('edit-endpoint-cancel').addEventListener('click', closeEditEndpointModal);
+  el('edit-endpoint-modal').addEventListener('click', (event) => {
+    if (event.target.id === 'edit-endpoint-modal') closeEditEndpointModal();
+  });
 
   // Edit Key modal: same four close conventions as every other modal here.
   el('edit-key-form').addEventListener('submit', submitEditKey);
@@ -788,6 +875,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!el('reassign-dialog').classList.contains('hidden')) closeReassignDialog();
     if (!el('create-endpoint-modal').classList.contains('hidden')) closeCreateEndpointModal();
     if (!el('edit-key-modal').classList.contains('hidden')) closeEditKeyModal();
+    if (!el('edit-endpoint-modal').classList.contains('hidden')) closeEditEndpointModal();
   });
 
   if (Session.isSet()) {

@@ -77,7 +77,7 @@
         </div>
         <div class="table-container">
           <table class="data-table">
-            <thead><tr><th>Name / Groups</th><th>Feed URL</th><th>TTL</th><th>Filters</th><th>Last synced</th><th></th></tr></thead>
+            <thead><tr><th>Name / Groups</th><th>Feed URL</th><th>TTL</th><th>Filters</th><th>Bound IPs</th><th>Last synced</th><th></th></tr></thead>
             <tbody id="endpoints-body"></tbody>
           </table>
         </div>
@@ -160,7 +160,15 @@
           </div>
         </div>
         <div class="table-container">
-          <table class="data-table">
+          <table class="data-table data-table-fixed">
+            <colgroup>
+              <col style="width: 10.5rem" />
+              <col style="width: 12%" />
+              <col style="width: 8rem" />
+              <col style="width: 13rem" />
+              <col style="width: 22%" />
+              <col style="width: 22%" />
+            </colgroup>
             <thead><tr><th>Time</th><th>Actor</th><th>Client IP</th><th>Action</th><th>Target</th><th>Details</th></tr></thead>
             <tbody id="audit-body"></tbody>
           </table>
@@ -244,6 +252,8 @@
         <div class="form-group">
           <label for="ep-bound-ips">Bound IPs (comma-separated CIDR, optional)</label>
           <input type="text" id="ep-bound-ips" class="input-field" placeholder="203.0.113.0/24" />
+          <small class="field-hint">Restricts which client IPs may fetch this feed. Leave blank
+            for no restriction (the default) — every client can fetch it.</small>
         </div>
         <div class="checkbox-row"><input type="checkbox" id="ep-filter-rfc1918" /><label for="ep-filter-rfc1918">Filter RFC 1918</label></div>
         <div class="checkbox-row"><input type="checkbox" id="ep-filter-bogons" /><label for="ep-filter-bogons">Filter bogons</label></div>
@@ -253,6 +263,50 @@
           <button type="submit" class="btn btn-primary">Create endpoint</button>
         </div>
         <div id="endpoint-error" class="message error hidden"></div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Edit Endpoint Modal — every field creation offers, including Bound IPs (an endpoint is
+       unrestricted by default; this is where that's changed after the fact). -->
+  <div id="edit-endpoint-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="edit-endpoint-modal-title">
+    <div class="modal-card modal-card-form card">
+      <div class="modal-header">
+        <h3 id="edit-endpoint-modal-title">Edit Endpoint</h3>
+        <button type="button" id="edit-endpoint-close" class="btn-modal-close" aria-label="Close">&times;</button>
+      </div>
+      <form id="edit-endpoint-form">
+        <input type="hidden" id="edit-ep-id" />
+        <div class="form-group">
+          <label for="edit-ep-name">Name <span>*</span></label>
+          <input type="text" id="edit-ep-name" class="input-field" required />
+        </div>
+        <div class="form-group">
+          <label for="edit-ep-description">Description</label>
+          <input type="text" id="edit-ep-description" class="input-field" />
+        </div>
+        <div class="form-group">
+          <label for="edit-ep-groups">Vault groups (comma-separated) <span>*</span></label>
+          <input type="text" id="edit-ep-groups" class="input-field" required />
+        </div>
+        <div class="form-group">
+          <label for="edit-ep-ttl">TTL seconds</label>
+          <input type="number" id="edit-ep-ttl" class="input-field" min="1" />
+        </div>
+        <div class="form-group">
+          <label for="edit-ep-bound-ips">Bound IPs (comma-separated CIDR, optional)</label>
+          <input type="text" id="edit-ep-bound-ips" class="input-field" placeholder="203.0.113.0/24" />
+          <small class="field-hint">Restricts which client IPs may fetch this feed. Clear to
+            remove the restriction.</small>
+        </div>
+        <div class="checkbox-row"><input type="checkbox" id="edit-ep-filter-rfc1918" /><label for="edit-ep-filter-rfc1918">Filter RFC 1918</label></div>
+        <div class="checkbox-row"><input type="checkbox" id="edit-ep-filter-bogons" /><label for="edit-ep-filter-bogons">Filter bogons</label></div>
+        <div class="checkbox-row"><input type="checkbox" id="edit-ep-filter-loopback" /><label for="edit-ep-filter-loopback">Filter loopback</label></div>
+        <div class="modal-actions mt-4">
+          <button type="button" id="edit-endpoint-cancel" class="btn btn-cancel">Cancel</button>
+          <button type="submit" class="btn btn-primary">Save Changes</button>
+        </div>
+        <div id="edit-endpoint-error" class="message error hidden"></div>
       </form>
     </div>
   </div>

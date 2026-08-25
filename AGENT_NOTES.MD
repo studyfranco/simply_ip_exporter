@@ -1,5 +1,78 @@
 # Agent Worklog — `simply_ip_exporter`
 
+## 2026-08-25 (session 14) — Human-readable/compact audit rows, Edit Endpoint modal + Bound IPs everywhere
+
+Four asks; the first three landed, the fourth (a per-API-key, per-Vault-group read-permission
+model) was scoped but not implemented this session — see the note at the end.
+
+### Audit Logs: human-readable timestamps, one line per row
+
+`entry.timestamp` was rendered as the raw `chrono::NaiveDateTime` string
+(`2026-08-24T22:15:56.765123`) — long, and not locale-aware. Added `formatTimestamp()`, ported
+verbatim from `example/simply_ip_vault`'s own (same timezone-inference rule — append `Z` only if
+nothing already marks one — and the same fallback to the raw string if it doesn't parse), rendering
+via `Date.toLocaleString()` instead (`8/24/2026, 10:15:56 PM` in most locales).
+
+Even with a shorter timestamp, this crate's own Target/Details content is inherently longer than
+vault's (`describe_resource()` produces `endpoint:<uuid> (<name>)`-shaped strings; vault's own
+target column is just a short IP address), so rows still wrapped onto multiple lines. Added a
+`.data-table-fixed` variant (ported from vault's identical-purpose class) with a `<colgroup>`
+sizing each column and `overflow: hidden; text-overflow: ellipsis; white-space: nowrap` on every
+cell — applied to the audit table only. Each truncating cell carries the untruncated value in
+`title`, so nothing is actually lost, just collapsed to one line by default.
+
+Hit the same gotcha vault's own CSS comments already document for `.badge-group`: `text-overflow:
+ellipsis` has no effect inside `.badge`'s `display: inline-flex` — needed `display: inline-block`
+on `.data-table-fixed .badge` for truncation to actually render. Also sized the Action column
+around this crate's own (longer) action names rather than vault's short scope badges —
+`ENDPOINT_OWNER_REASSIGN` is 23 characters, long enough that truncating it would make two
+different actions both read `ENDPOINT_...` — so Action gets `13rem` (fits every current action
+name un-truncated) and the ellipsis rule is a safety net for anything longer in the future, not the
+normal case.
+
+### Endpoints: Edit modal, Bound IPs surfaced everywhere
+
+`PUT /api/endpoints/{id}` already supported every field (including `bound_ips`) — this session only
+added the frontend: `#edit-endpoint-modal`, same fields as creation, opened via a new per-row
+"Edit" button (before Copy URL, matching `simply_ip_vault`'s own Edit-first row-action ordering).
+The endpoints table also gained a `Bound IPs` column (previously invisible in the UI entirely —
+an operator had no way to see from the table whether a feed was IP-restricted at all), showing
+either the CIDR list or a muted "Unrestricted", and both the create and edit forms now carry a
+field-hint stating the default explicitly ("no restriction — every client can fetch it").
+
+**A real bug found and fixed while wiring the edit forms** (present in both the new endpoint edit
+and the existing key edit from session 13): `bound_ips: el(...).value || null` sends `null` for a
+field the operator just cleared. `PUT /api/keys/{id}` and `PUT /api/endpoints/{id}` both treat an
+*absent* field as "leave unchanged" and a *present-but-empty* one as "clear it" — so `|| null`
+silently made clearing Bound IPs (the only way to lift a restriction back to unrestricted through
+the UI) do nothing at all. Fixed both call sites to send the raw field value, empty string
+included.
+
+### Scoped but not implemented: per-key Vault-group read permissions
+
+The fourth ask — "list the Vault groups this service can read, and let Master grant each local API
+key read access to specific groups" — is a real M:N permission layer this crate does not have: a
+new join table, new endpoints to list/grant/revoke, and an enforcement point in endpoint
+create/update refusing a Daughter key's `vault_groups` value if it names a group the key hasn't
+been granted. This is exactly the fuller Master/Parent/Daughter-with-per-group-rights model
+`AGENT.MD`'s "Why two tiers, not three" section documents as a *deliberate* scope boundary for this
+crate, reasoned through and written down in session 4's ecosystem audit — not an oversight. Asked
+the user to confirm the scope (a full DB-backed permission system vs. a lighter read-only "list
+what the exporter's Vault key can see" display with no per-key enforcement) before building
+something that reverses a documented architectural decision; implementation is pending that answer.
+
+### Verification performed
+
+- `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`: clean.
+- `cargo test`: 149 passed, 0 failed (no backend change this session — `PUT /api/endpoints/{id}`
+  already had full test coverage from before; this was a frontend-only change plus a JS bug fix).
+- `./scripts/verify_convergence.sh`: all 13 named checks pass.
+- `./scripts/test_e2e.sh`: 110/110 checks pass.
+- Manual: fixture-driven screenshots of the compact audit table (including the longest real action
+  name, `ENDPOINT_OWNER_REASSIGN`, to confirm the ellipsis fallback actually renders), the
+  endpoints table's new Bound IPs column, and the Edit Endpoint modal pre-filled from a
+  bound_ips-restricted fixture.
+
 ## 2026-08-25 (session 13) — Narrower key-secret rotation, Edit Key modal, e2e cross-group aggregation proof
 
 Three asks: (1) confirm convergence work targets this crate's own pages, not `example/simply_ip_vault`

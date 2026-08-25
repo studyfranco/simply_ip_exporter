@@ -763,6 +763,40 @@ input[type='checkbox']:checked::after {
     border-bottom: none;
 }
 
+/* ─── Fixed-Layout Tables ───────────────────────────────── */
+/* Column widths come from <colgroup> rather than content, matching example/simply_ip_vault's own
+   .data-table-fixed — used here for the Audit Logs table, whose Target/Details cells otherwise
+   wrap onto a second line (this crate's target_resource strings, e.g.
+   "endpoint:<uuid> (<name>)", run longer than vault's own short target_address values). Each
+   truncating cell carries the untruncated value in `title`, so it's one hover away. */
+.data-table-fixed {
+    table-layout: fixed;
+    width: 100%;
+}
+
+.data-table-fixed td {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* The action badge must not be squeezed into an unreadable sliver by a long Target/Details cell
+   beside it. Unlike example/simply_ip_vault's own short scope badges (MASTER, READ, WRITE...),
+   this crate's audit action names run long (ENDPOINT_OWNER_REASSIGN is 23 characters) — the
+   Action column is sized to fit the longest one without truncating (truncating an action name
+   specifically loses meaning, e.g. ENDPOINT_CREATE and ENDPOINT_UPDATE would both read
+   "ENDPOINT_..."); this ellipsis is a safety net for anything even longer, not the normal case.
+   `display: inline-block` (overriding `.badge`'s own `inline-flex`) is required for
+   `text-overflow: ellipsis` to have any effect at all — an inline-flex box ignores it entirely,
+   the same gotcha vault's own `.badge-group` truncation rule documents. */
+.data-table-fixed .badge {
+    display: inline-block;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    vertical-align: middle;
+}
+
 /* Shown in place of a table body when a fetch yields zero rows, so an empty state reads as "there
    is genuinely nothing here yet" rather than looking like a loading state that never finished or a
    layout bug. */
