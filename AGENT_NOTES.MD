@@ -1,5 +1,80 @@
 # Agent Worklog — `simply_ip_exporter`
 
+## 2026-08-25 (session 11) — Tab-separated pages, API Keys/Audit Logs feature parity with ip_vault, div-based modal
+
+Five explicit asks, all against `example/simply_ip_vault`'s actual current markup/JS (read in full
+this session — `static/index.html` 1008 lines, relevant `static/app.js` sections):
+
+1. **Separate pages.** Endpoints / API Keys / Audit Logs were three sections stacked in one
+   scrolling page; now three `.tab-panel`s switched by a `.tab-nav` of `.tab-btn[data-tab]`
+   buttons, inside a sticky `#top-bar` (header + tabs). Ported vault's exact tab-switching JS
+   (`activateTab()` — remove `.active`/`aria-selected` from every button and panel, then set both
+   on the target). **Deliberately did not** port vault's `bindStickyTopBar()` scroll-retract
+   animation (JS-measured `--top-bar-shift`, collapses the bar on scroll-down) — `.top-bar` here is
+   a plain `position: sticky; top: 0`, which keeps the tab row reachable without that extra
+   JS/CSS machinery. Noted as a scope decision, not an oversight.
+2. **API Keys page — structure and features from vault.** Adopted `.admin-section`, `.form-grid`
+   (name + bound-IPs side by side), `.permissions-grid`/`.checkbox-container`/`.checkmark` for the
+   "Can manage keys" toggle (replacing the old bare `.checkbox-row`), and `.key-reveal`/
+   `.key-reveal-label`/`.key-reveal-value` for the minted-credential box (replacing the
+   `.message.success` card). New feature ported from vault: row-selection checkboxes +
+   `.batch-actions`/`.btn-batch-delete` for batch key deletion. `wireRowSelection()` in `app.js` is
+   a near-verbatim port of vault's `FirewallClient.wireRowSelection` (shared-Set-backed header
+   checkbox + row checkboxes, indeterminate state, dynamic button label/count). `batchDeleteKeys()`
+   mirrors vault's own `batchDeleteKeys()` exactly: one `DELETE` per id via `Promise.allSettled`,
+   toast summarizing success/failure counts — including on a 409 "still owns endpoints" conflict,
+   which just counts as a failure (vault doesn't auto-resolve its own analogous conflicts in a
+   batch either); the toast text names why a failure is likely a 409 so the operator isn't left
+   guessing, and the single-row Delete button still opens the proper reassignment modal for that
+   one key. **Not ported**: vault's "Manage Group Rights" section and the Master/Parent `.rbac-note`
+   — this crate's two-tier model has no IP-group-rights concept and no Parent tier, so nothing in
+   vault's Keys tab actually maps to a note about scopes a Parent can't grant.
+3. **Audit Logs page — structure and features from vault.** Adopted vault's `.filters`/`.pagination`
+   layout and real Prev/Next pagination against `GET /api/audit-logs?limit=&offset=` (already
+   supported server-side, confirmed by reading `src/api/audit.rs` — no backend change needed).
+   Simpler than vault's own `PagedCache`-backed pagination (fetch-100/paginate-15-locally): this
+   just re-fetches a page of `AUDIT_PAGE_SIZE=50` from the server on every Prev/Next, since there's
+   no total-count endpoint to page a local cache against — "Next" is enabled whenever the last page
+   came back full-length, the only signal available. Kept the existing action-filter input (a
+   working exporter feature vault's own Audit tab doesn't have) alongside the new pagination rather
+   than dropping it.
+4. **Login page structure from vault.** Added the `<small class="field-hint">` under the
+   signing-secret field vault has ("Used locally to sign every request (HMAC-SHA256). Never
+   transmitted.") and moved `#login-error` to be a sibling *after* `</form>` rather than the last
+   child inside it, matching vault's exact DOM order.
+5. **Removed the `●` dot** between the logo-icon square and "simply_ip_exporter" in both the header
+   and the login screen — pure uniformization; neither vault nor hook_executor has one.
+6. **Modal: replaced native `<dialog>` with vault's div-based `.modal-overlay`/`.modal-card`
+   mechanism.** Session 9 had deliberately kept the native `<dialog>` (restyled to match vault's
+   visual language) rather than adopt this mechanism, reasoning that `<dialog>`'s own top-layer
+   stacking and focus trap needed no hand-rolled equivalent — and then session 10's visual QA found
+   a real bug in exactly that choice: the universal `* { margin: 0 }` reset (itself ported from
+   vault in session 9) silently defeats native `<dialog>` centering, which depends on the UA
+   stylesheet's `margin: auto`. Asked explicitly this session to compare the two and copy vault's
+   actual structure, which resolves that whole bug class rather than patching around it again:
+   `#reassign-dialog` is now `.modal-overlay.hidden` > `.modal-card.modal-card-form.card` >
+   `.modal-header` (h3 + `.btn-modal-close` ×) + body + `.modal-actions` (Cancel/Confirm), opened
+   and closed by toggling `.hidden` (`openReassignDialog()`/`closeReassignDialog()`), with
+   backdrop-click-to-close and Escape-to-close wired exactly as vault wires its own
+   `#manage-ip-modal`. `dialog`/`dialog::backdrop`/etc. CSS rules removed entirely — nothing in the
+   page uses a native `<dialog>` anymore.
+
+### Verification performed
+
+- `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`: clean.
+- `cargo test`: 147 passed, 0 failed (unchanged — no new source-hygiene coverage needed;
+  `every_dom_id_referenced_in_app_js_exists_in_index_html` already catches an id mismatch between
+  the two files, which this restructuring touched extensively).
+- `./scripts/verify_convergence.sh`: all 13 named checks pass.
+- `./scripts/test_e2e.sh`: 100/100 checks pass.
+- Manual: fixture-driven screenshots (same stubbed-`fetch` technique as session 10) of each tab
+  (Endpoints, API Keys with a row selected and the batch-delete button visible, Audit Logs with
+  its pagination controls), the reassignment modal, the login screen, and a toast — confirmed the
+  tab switch, batch selection, pagination, modal centering/backdrop, and toast placement (bumped
+  `.toast-container`'s `top` from `6rem` to `11rem` to clear the now-taller header+tabs `.top-bar`;
+  `6rem` cleared the plain header in session 10 but started overlapping the tab-nav's bottom
+  border once tabs were added) all render correctly.
+
 ## 2026-08-25 (session 10) — Visual QA: screenshot comparison against the peer dashboards, three real CSS bugs found
 
 Session 9's harmonization pass was verified by reading CSS side by side, not by looking at a

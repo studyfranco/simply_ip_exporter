@@ -1,10 +1,11 @@
 /* Simply IP Exporter — KDE Plasma-inspired Dark Theme */
-/* Design tokens and component styles harmonized 2026-08-25 with example/simply_ip_vault and
+/* Design tokens and component styles harmonized with example/simply_ip_vault and
    example/simply_hook_executor (byte-identical :root tokens between those two — see
-   AGENT_NOTES.MD). Ported values and class conventions directly; component set trimmed to what
-   this crate's simpler two-tier, four-section dashboard (Endpoints, Keys, Audit Logs, plus the
-   login screen) actually uses — no tab navigation, IP-group, or webhook machinery, none of which
-   this crate's domain has an equivalent of. */
+   AGENT_NOTES.MD). Ported values and class conventions directly, including vault's tab-nav
+   page-separation and div-based modal-overlay mechanism; component set otherwise trimmed to what
+   this crate's simpler two-tier, three-tab dashboard (Endpoints, API Keys, Audit Logs, plus the
+   login screen) actually uses — no IP-group or webhook machinery, which this crate's domain has no
+   equivalent of. */
 
 :root {
     --bg-main: #232629;
@@ -77,14 +78,68 @@ body {
 
 /* Opacity-only fade — deliberately no `transform` here. A non-`none` `transform` on this
    container (even transiently, mid-transition) creates a new containing block for any
-   `position: fixed` descendant, including a native <dialog> shown via showModal(): the
-   reassign-confirmation dialog would render pinned to this element's own box instead of the
-   viewport, landing top-left instead of centered, if it were ever opened while this transition
-   is still in flight. */
+   `position: fixed` descendant, including a `.modal-overlay`: it would render pinned to this
+   element's own box instead of the viewport if it were ever opened while this transition is
+   still in flight. */
 .container.hidden {
     opacity: 0;
     pointer-events: none;
     display: block !important;
+}
+
+/* ─── Sticky Top Bar & Tab Navigation ───────────────────── */
+/* example/simply_ip_vault's top-bar also retracts on scroll-down (bindStickyTopBar(), JS-measured)
+   to give the table more room; not ported here — this stays a plain `position: sticky` unit, which
+   keeps the tab row reachable while scrolling without the extra JS/CSS machinery a retract
+   animation needs. */
+.top-bar {
+    position: sticky;
+    top: 0;
+    z-index: 30;
+    background-color: var(--bg-main);
+    margin: -2rem -2rem 0;
+    padding: 2rem 2rem 0;
+}
+
+.tab-nav {
+    display: flex;
+    gap: 0.25rem;
+    margin-bottom: 1.5rem;
+    border-bottom: 2px solid var(--border);
+    padding-bottom: 0;
+}
+
+.tab-btn {
+    padding: 0.65rem 1.4rem;
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: var(--text-muted);
+    font-family: var(--font-sans);
+    font-size: 0.92rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all var(--transition-base);
+    position: relative;
+    bottom: -2px;
+}
+
+.tab-btn:hover {
+    color: var(--text-main);
+}
+
+.tab-btn.active {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+}
+
+.tab-panel {
+    display: none;
+}
+
+.tab-panel.active {
+    display: block;
+    animation: fadeIn var(--transition-slow);
 }
 
 /* ─── Auth / Login Screen ────────────────────────────────── */
@@ -327,6 +382,54 @@ body {
     font-size: 0.8rem;
 }
 
+.btn-icon {
+    background: transparent;
+    border: 1px solid var(--border);
+    cursor: pointer;
+    color: var(--text-muted);
+    font-size: 0.9rem;
+    padding: 0.45rem 0.9rem;
+    border-radius: var(--radius);
+    font-family: var(--font-sans);
+    transition: all var(--transition-base);
+}
+
+.btn-icon:hover:not(:disabled) {
+    background-color: var(--bg-surface);
+    color: var(--text-main);
+    border-color: var(--accent);
+}
+
+.btn-icon:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+}
+
+/* Solid, high-contrast style for the "Delete Selected" batch-action button — deliberately not
+   .btn-danger's translucent tint, which read as too easy to miss for an action this consequential. */
+.btn-batch-delete {
+    background-color: #dc2626;
+    color: #ffffff;
+    font-weight: 600;
+    font-size: 0.8rem;
+    font-family: var(--font-sans);
+    border: none;
+    padding: 6px 14px;
+    border-radius: 6px;
+    cursor: pointer;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+    transition: all var(--transition-base);
+}
+
+.btn-batch-delete:hover:not(:disabled) {
+    background-color: #b91c1c;
+}
+
+.btn-batch-delete:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+}
+
 /* ─── Forms ─────────────────────────────────────────────── */
 
 .form-group {
@@ -455,6 +558,127 @@ input[type='checkbox']:checked::after {
     min-width: 180px;
 }
 
+.form-actions {
+    display: flex;
+    gap: 0.75rem;
+    margin-top: 0.25rem;
+}
+
+/* API Keys tab: two fields (name, bound IPs) side by side above the Can-manage-keys toggle. */
+.form-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 1rem;
+    margin-bottom: 1.5rem;
+}
+
+.permissions-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 0.75rem;
+    margin-top: 1rem;
+    padding: 1rem;
+    background-color: var(--bg-surface);
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
+}
+
+/* Custom checkbox with a label baked into one clickable element — used for permission toggles
+   inside a .permissions-grid, as opposed to .checkbox-row's plain adjacent input+label pair. */
+.checkbox-container {
+    display: flex;
+    align-items: center;
+    position: relative;
+    padding-left: 28px;
+    margin-bottom: 0;
+    cursor: pointer;
+    font-size: 0.85rem;
+    color: var(--text-main);
+    user-select: none;
+    transition: color var(--transition-fast);
+}
+
+.checkbox-container:hover {
+    color: var(--accent);
+}
+
+.checkbox-container input {
+    position: absolute;
+    opacity: 0;
+    cursor: pointer;
+    height: 0;
+    width: 0;
+}
+
+.checkmark {
+    position: absolute;
+    top: 50%;
+    left: 0;
+    transform: translateY(-50%);
+    height: 18px;
+    width: 18px;
+    background-color: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    transition: all var(--transition-fast);
+}
+
+.checkbox-container:hover input ~ .checkmark {
+    border-color: var(--accent);
+}
+
+.checkbox-container input:checked ~ .checkmark {
+    background-color: var(--accent);
+    border-color: var(--accent);
+}
+
+.checkmark:after {
+    content: '';
+    position: absolute;
+    display: none;
+    left: 6px;
+    top: 2px;
+    width: 5px;
+    height: 10px;
+    border: solid #1a1d20;
+    border-width: 0 2px 2px 0;
+    transform: rotate(45deg);
+}
+
+.checkbox-container input:checked ~ .checkmark:after {
+    display: block;
+}
+
+/* Key Reveal Box — the minted-credential display on the API Keys tab. */
+.key-reveal {
+    margin-top: 1rem;
+    padding: 0.85rem 1rem;
+    background-color: rgba(28, 220, 154, 0.08);
+    border: 1px solid rgba(28, 220, 154, 0.25);
+    border-radius: var(--radius);
+}
+
+.key-reveal-label {
+    font-size: 0.8rem;
+    color: var(--accent);
+    font-weight: 600;
+    margin-bottom: 0.4rem;
+}
+
+.key-reveal-value {
+    display: block;
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+    color: var(--text-main);
+    word-break: break-all;
+    padding: 0.5rem 0.7rem;
+    background-color: var(--bg-input);
+    border-radius: var(--radius);
+    margin-bottom: 0.75rem;
+    user-select: all;
+    cursor: text;
+}
+
 .message {
     margin-top: 0.75rem;
     padding: 0.6rem 0.85rem;
@@ -549,6 +773,65 @@ input[type='checkbox']:checked::after {
     margin-bottom: 0;
 }
 
+.filters {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+    flex: 1 1 auto;
+    min-width: 0;
+    justify-content: flex-end;
+}
+
+.filters .input-field {
+    width: auto;
+    flex: 1 1 220px;
+    min-width: 0;
+}
+
+.admin-section {
+    overflow: hidden;
+}
+
+.batch-actions {
+    display: flex;
+    justify-content: flex-start;
+    margin-bottom: 0.75rem;
+}
+
+/* The API Keys tab stacks this control beneath the create form and the key-reveal box that
+   appears between them — the extra top margin plus a hairline rule separates the "create" area
+   from the "act on existing rows" area. */
+.batch-actions-keys {
+    margin-top: 1.5rem;
+    padding-top: 1.25rem;
+    border-top: 1px solid var(--border);
+}
+
+/* ─── Pagination ────────────────────────────────────────── */
+
+.pagination {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    margin-top: 1rem;
+    padding-top: 0.75rem;
+}
+
+.pagination #audit-page-indicator {
+    color: var(--text-muted);
+    font-size: 0.85rem;
+    font-weight: 500;
+    min-width: 60px;
+    text-align: center;
+}
+
+.pagination .btn-icon {
+    min-width: 2.25rem;
+}
+
 /* ─── Badges ────────────────────────────────────────────── */
 
 .badge {
@@ -588,10 +871,10 @@ input[type='checkbox']:checked::after {
 
 .toast-container {
     position: fixed;
-    /* Cleared past .header (2rem container padding + its own content/border), not the 1.5rem a
-       page with no fixed header could use — at 1.5rem a toast overlapped the identity badge and
-       logout button instead of appearing below them. */
-    top: 6rem;
+    /* Cleared past .top-bar (2rem container padding + header + tab-nav), not the 1.5rem a page
+       with no fixed header could use — at 1.5rem a toast overlapped the identity badge and logout
+       button instead of appearing below them. */
+    top: 11rem;
     right: 1.5rem;
     z-index: 9999;
     display: flex;
@@ -631,53 +914,103 @@ input[type='checkbox']:checked::after {
     color: #ffd9d3;
 }
 
-/* ─── Modals (native <dialog>) ───────────────────────────── */
-/* example/simply_ip_vault uses a plain <div class="modal-overlay"> shown/hidden by class toggling;
-   this crate uses the native <dialog> element instead (its own top-layer stacking and focus trap
-   need no hand-rolled equivalent) — restyled to match the same visual language (.modal-card's
-   background/radius/shadow, .modal-header's title-and-close layout) rather than adopting the
-   overlay-div mechanism itself. See AGENT_NOTES.MD for why the mechanism was kept. */
-dialog {
-    /* The universal `* { margin: 0; }` reset above zeroes out the UA stylesheet's `margin: auto`
-       on `dialog:modal` — that `auto` is the entire mechanism native <dialog> centering relies on
-       (fixed positioning + inset:0 on all four sides + auto margins). Without restoring it here,
-       showModal() renders the dialog pinned to the viewport's top-left corner instead of centered. */
-    margin: auto;
+/* ─── Modals ────────────────────────────────────────────── */
+/* Ported from example/simply_ip_vault's own div-based .modal-overlay/.modal-card mechanism —
+   plain elements shown/hidden by toggling `.hidden`, closed on backdrop click or Escape (wired in
+   app.js), rather than the native <dialog> element this crate used before. See AGENT_NOTES.MD for
+   the earlier native-<dialog> attempt and why it was replaced. */
+.modal-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background-color: rgba(0, 0, 0, 0.55);
+    z-index: 20000;
+    padding: 1.5rem;
+    transition: opacity var(--transition-slow), visibility var(--transition-slow);
+}
+
+.modal-overlay.hidden {
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    display: flex !important;
+}
+
+.modal-card {
+    width: 100%;
+    max-width: min(90vw, 480px);
     background-color: var(--bg-card);
     color: var(--text-main);
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
     padding: 1.5rem;
-    width: 100%;
-    max-width: min(90vw, 480px);
     box-shadow: var(--shadow-lg);
     animation: fadeIn var(--transition-slow);
 }
 
-dialog::backdrop {
-    background-color: rgba(0, 0, 0, 0.55);
-}
-
-dialog h2 {
+.modal-card h3 {
     font-size: 1.1rem;
     font-weight: 600;
     margin-bottom: 0.75rem;
-    color: var(--text-main);
 }
 
-dialog ul {
+.modal-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 1rem;
+}
+
+.btn-modal-close {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: 1.5rem;
+    line-height: 1;
+    padding: 0 0.25rem;
+    cursor: pointer;
+    border-radius: var(--radius);
+    transition: color var(--transition-fast), background-color var(--transition-fast);
+}
+
+.btn-modal-close:hover {
+    color: var(--text-main);
+    background-color: rgba(255, 255, 255, 0.06);
+}
+
+.btn-modal-close:focus-visible {
+    outline: 2px solid var(--highlight);
+    outline-offset: 2px;
+}
+
+/* A modal that holds a form (the reassignment dialog) scrolls inside the card on a short window
+   rather than overflowing the viewport. */
+.modal-card-form {
+    max-width: clamp(360px, 45vw, 600px);
+    max-height: calc(100vh - 3rem);
+    overflow-y: auto;
+}
+
+.modal-card ul {
     margin: 0 0 1rem;
     padding-left: 1.25rem;
     font-size: 0.88rem;
     color: var(--text-muted);
 }
 
-dialog li {
+.modal-card li {
     margin-bottom: 0.25rem;
 }
 
-dialog select {
-    width: 100%;
+.modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.75rem;
 }
 
 /* ─── Utility Classes ───────────────────────────────────── */

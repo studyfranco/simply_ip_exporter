@@ -242,8 +242,8 @@ async function tryLogin(apiKey, signingSecret) {
       me.is_master ? loadAuditLogs() : Promise.resolve(),
     ]);
     if (me.is_master) {
-      el('keys-card').classList.remove('hidden');
-      el('audit-card').classList.remove('hidden');
+      el('keys-tab-btn').classList.remove('hidden');
+      el('audit-tab-btn').classList.remove('hidden');
     }
   } catch (e) {
     Session.clear();
@@ -259,12 +259,32 @@ function renderIdentity() {
   badge.className = 'badge badge-tier ' + (me.is_master ? 'badge-tier-master' : 'badge-tier-daughter');
 }
 
+// Switches the active tab: one .tab-btn/.tab-panel pair gains `.active`, every other pair loses
+// it. Panels not currently active are `display: none` entirely (see .tab-panel in style.css) —
+// each tab's own load*() call already ran once at login (tryLogin's Promise.all), so switching
+// tabs is a pure display change, no re-fetch.
+function activateTab(tabName) {
+  document.querySelectorAll('.tab-btn').forEach((b) => {
+    b.classList.remove('active');
+    b.setAttribute('aria-selected', 'false');
+  });
+  document.querySelectorAll('.tab-panel').forEach((p) => p.classList.remove('active'));
+
+  const btn = document.querySelector(`.tab-btn[data-tab="${tabName}"]`);
+  btn.classList.add('active');
+  btn.setAttribute('aria-selected', 'true');
+  el(`tab-${tabName}`).classList.add('active');
+}
+
 function logout() {
   Session.clear();
   me = null;
   el('dashboard').classList.add('hidden');
   el('header-actions').classList.add('hidden');
   el('login-screen').classList.remove('hidden');
+  el('keys-tab-btn').classList.add('hidden');
+  el('audit-tab-btn').classList.add('hidden');
+  activateTab('endpoints');
 }
 
 // ── Endpoints ────────────────────────────────────────────────────────────────
@@ -324,17 +344,76 @@ async function createEndpoint(event) {
 }
 
 // ── Keys (Master only) ──────────────────────────────────────────────────────
+
+// Row ids currently checked in the keys table, persisted across re-renders (loadKeys() rebuilds
+// the tbody on every call — see wireRowSelection's own comment for why the Set survives that).
+const selectedKeyIds = new Set();
+
+// Wires a table's "select all" header checkbox and its `.row-select` body checkboxes to a shared
+// Set of selected row ids, keeping the header checkbox's checked/indeterminate state and the
+// batch-delete button's enabled state + label in sync. Ported from example/simply_ip_vault's
+// FirewallClient.wireRowSelection. Call after every full tbody.innerHTML replace — row checkboxes
+// are recreated each time, so they need fresh listeners; the header checkbox and delete button are
+// static elements outside the tbody, so their handlers are (re)assigned via .onchange/.onclick
+// rather than addEventListener, to avoid stacking duplicate handlers across renders.
+function wireRowSelection({ tbodyId, selectAllId, deleteBtnId, selectedSet, onDeleteSelected }) {
+  const selectAllEl = el(selectAllId);
+  const deleteBtn = el(deleteBtnId);
+  const rowCheckboxes = () => Array.from(document.querySelectorAll(`#${tbodyId} .row-select`));
+
+  const updateControls = () => {
+    const boxes = rowCheckboxes();
+    const checkedCount = boxes.filter((cb) => cb.checked).length;
+    selectAllEl.checked = boxes.length > 0 && checkedCount === boxes.length;
+    selectAllEl.indeterminate = checkedCount > 0 && checkedCount < boxes.length;
+    const nothingSelected = selectedSet.size === 0;
+    deleteBtn.closest('.batch-actions')?.classList.toggle('hidden', nothingSelected);
+    deleteBtn.disabled = nothingSelected;
+    deleteBtn.textContent = nothingSelected ? 'Delete Selected' : `Delete Selected (${selectedSet.size})`;
+  };
+
+  rowCheckboxes().forEach((cb) => {
+    cb.checked = selectedSet.has(cb.dataset.id);
+    cb.addEventListener('change', () => {
+      if (cb.checked) selectedSet.add(cb.dataset.id);
+      else selectedSet.delete(cb.dataset.id);
+      updateControls();
+    });
+  });
+
+  selectAllEl.onchange = () => {
+    rowCheckboxes().forEach((cb) => {
+      cb.checked = selectAllEl.checked;
+      if (cb.checked) selectedSet.add(cb.dataset.id);
+      else selectedSet.delete(cb.dataset.id);
+    });
+    updateControls();
+  };
+
+  deleteBtn.onclick = () => onDeleteSelected();
+
+  updateControls();
+}
+
 async function loadKeys() {
   const keys = await apiCall('GET', '/api/keys');
+
+  // Drop selections for keys that no longer exist (deleted elsewhere, or by a previous batch).
+  const currentIds = new Set(keys.map((k) => k.id));
+  for (const id of [...selectedKeyIds]) {
+    if (!currentIds.has(id)) selectedKeyIds.delete(id);
+  }
+
   const tbody = el('keys-body');
   tbody.innerHTML = '';
   if (keys.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="4" class="table-empty">No keys yet.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="5" class="table-empty">No keys yet.</td></tr>';
   }
   for (const k of keys) {
     const tr = document.createElement('tr');
     const tierClass = k.is_master ? 'badge-tier-master' : 'badge-tier-daughter';
     tr.innerHTML = `
+      <td>${k.is_master ? '' : `<input type="checkbox" class="row-select" data-id="${k.id}" />`}</td>
       <td>${escapeHtml(k.name)}<div class="text-muted font-mono text-sm">${escapeHtml(k.prefix)}…</div></td>
       <td><span class="badge badge-tier ${tierClass}">${k.is_master ? 'MASTER' : 'DAUGHTER'}</span></td>
       <td>${k.can_manage_keys ? 'Yes' : 'No'}</td>
@@ -358,6 +437,41 @@ async function loadKeys() {
       await loadKeys();
     });
   });
+
+  wireRowSelection({
+    tbodyId: 'keys-body',
+    selectAllId: 'select-all-keys',
+    deleteBtnId: 'delete-selected-keys',
+    selectedSet: selectedKeyIds,
+    onDeleteSelected: () => batchDeleteKeys(),
+  });
+}
+
+// Deletes every selected key with one DELETE per id (the API has no bulk endpoint). Any single
+// failure — including the 409 "still owns endpoints" conflict batchDeleteKeys does not attempt to
+// resolve automatically — just counts toward the failure tally; the operator can delete that one
+// key individually afterward to get the proper reassignment prompt. Mirrors
+// example/simply_ip_vault's own batchDeleteKeys, which resolves conflicts the same way.
+async function batchDeleteKeys() {
+  const count = selectedKeyIds.size;
+  if (count === 0) return;
+  if (!confirm(`Delete ${count} selected key${count === 1 ? '' : 's'}? This immediately revokes their access and cannot be undone.`)) {
+    return;
+  }
+
+  const ids = [...selectedKeyIds];
+  const results = await Promise.allSettled(ids.map((id) => apiCall('DELETE', `/api/keys/${id}`)));
+  const failed = results.filter((r) => r.status === 'rejected').length;
+  selectedKeyIds.clear();
+
+  showToast(
+    failed === 0
+      ? `${count} key${count === 1 ? '' : 's'} deleted`
+      : `${count - failed} of ${count} deleted; ${failed} failed (still owns endpoints? delete it individually to reassign them)`,
+    failed === 0 ? 'success' : 'error'
+  );
+  await loadKeys();
+  await loadEndpoints();
 }
 
 // Deletes a key, handling the 409 "still owns endpoints" case by opening the reassignment dialog
@@ -378,11 +492,22 @@ async function deleteKey(keyId, allKeys) {
   }
 }
 
+// Opens/closes the reassignment modal — a plain `.modal-overlay` div toggled via the `hidden`
+// class (example/simply_ip_vault's own modal mechanism), not a native <dialog>. See
+// AGENT_NOTES.MD for why: this crate briefly used a native <dialog> here, restyled to match
+// vault's visual language, and hit a real centering bug that vault's own div-based modals never
+// could (the universal `* { margin: 0 }` reset silently defeats native <dialog> centering, which
+// depends on the UA stylesheet's `margin: auto` — see the fix commit for the full story). Copying
+// vault's actual mechanism rather than re-styling a different one avoids that whole class of bug.
+function closeReassignDialog() {
+  el('reassign-dialog').classList.add('hidden');
+}
+
 // Lists the endpoints blocking a key's deletion and lets the operator pick another key to receive
 // them before retrying the delete with ?reassign_to=<id> — the reassignment and the delete happen
 // together, atomically, on the server (api::keys::delete_api_key).
 function openReassignDialog(keyId, ownedEndpoints, allKeys) {
-  const dialog = el('reassign-dialog');
+  const modal = el('reassign-dialog');
   el('reassign-summary').textContent =
     `This key still owns ${ownedEndpoints.length} endpoint(s). Choose another key to take ownership, ` +
     'or cancel and reassign/delete them individually first.';
@@ -400,7 +525,8 @@ function openReassignDialog(keyId, ownedEndpoints, allKeys) {
 
   // Assigned (not addEventListener'd) so a second delete attempt replaces the previous attempt's
   // closure over `keyId`/`allKeys` rather than stacking a second listener beside it.
-  el('reassign-cancel-btn').onclick = () => dialog.close();
+  el('reassign-cancel-btn').onclick = () => closeReassignDialog();
+  el('reassign-modal-close').onclick = () => closeReassignDialog();
   el('reassign-confirm-btn').onclick = async () => {
     hideError('reassign-error');
     if (!select.value) {
@@ -409,7 +535,7 @@ function openReassignDialog(keyId, ownedEndpoints, allKeys) {
     }
     try {
       await apiCall('DELETE', `/api/keys/${keyId}?reassign_to=${encodeURIComponent(select.value)}`);
-      dialog.close();
+      closeReassignDialog();
       await loadKeys();
       await loadEndpoints();
     } catch (e) {
@@ -417,7 +543,7 @@ function openReassignDialog(keyId, ownedEndpoints, allKeys) {
     }
   };
 
-  dialog.showModal();
+  modal.classList.remove('hidden');
 }
 
 function showMintedKey(minted) {
@@ -444,12 +570,30 @@ async function createKey(event) {
 }
 
 // ── Audit Logs (Master only) ────────────────────────────────────────────────
+// Straightforward offset pagination against GET /api/audit-logs?limit=&offset= (src/api/audit.rs
+// already supports both) — no PagedCache/local-chunk layer like example/simply_ip_vault's own
+// audit tab, since this crate has no total-count endpoint to page a local cache against. A page
+// that comes back full-length is the only signal "there might be a next page" has to go on.
+const AUDIT_PAGE_SIZE = 50;
+let auditOffset = 0;
+let auditHasMore = false;
+
+function updateAuditPaginationUI() {
+  el('audit-btn-prev').disabled = auditOffset === 0;
+  el('audit-btn-next').disabled = !auditHasMore;
+  el('audit-page-indicator').textContent = `Page ${Math.floor(auditOffset / AUDIT_PAGE_SIZE) + 1}`;
+}
+
 async function loadAuditLogs() {
   hideError('audit-error');
   try {
     const action = el('audit-action-filter').value.trim();
-    const path = '/api/audit-logs' + (action ? `?action=${encodeURIComponent(action)}` : '');
-    const logs = await apiCall('GET', path);
+    const params = new URLSearchParams({ limit: String(AUDIT_PAGE_SIZE), offset: String(auditOffset) });
+    if (action) params.set('action', action);
+    const logs = await apiCall('GET', `/api/audit-logs?${params.toString()}`);
+    auditHasMore = logs.length === AUDIT_PAGE_SIZE;
+    updateAuditPaginationUI();
+
     const tbody = el('audit-body');
     tbody.innerHTML = '';
     if (logs.length === 0) {
@@ -493,12 +637,44 @@ document.addEventListener('DOMContentLoaded', () => {
   el('endpoint-form').addEventListener('submit', createEndpoint);
   el('key-form').addEventListener('submit', createKey);
   el('minted-key-dismiss').addEventListener('click', () => el('minted-key-box').classList.add('hidden'));
-  el('audit-refresh-btn').addEventListener('click', loadAuditLogs);
+
+  el('audit-refresh-btn').addEventListener('click', () => {
+    auditOffset = 0;
+    loadAuditLogs();
+  });
   el('audit-action-filter').addEventListener('keydown', (event) => {
     if (event.key === 'Enter') {
       event.preventDefault();
+      auditOffset = 0;
       loadAuditLogs();
     }
+  });
+  el('audit-btn-prev').addEventListener('click', () => {
+    auditOffset = Math.max(0, auditOffset - AUDIT_PAGE_SIZE);
+    loadAuditLogs();
+  });
+  el('audit-btn-next').addEventListener('click', () => {
+    if (!auditHasMore) return;
+    auditOffset += AUDIT_PAGE_SIZE;
+    loadAuditLogs();
+  });
+
+  // Tabs — each panel's data was already loaded once at login (tryLogin's Promise.all), so
+  // switching is a pure display change; see activateTab()'s own comment.
+  document.querySelectorAll('.tab-btn').forEach((btn) => {
+    btn.addEventListener('click', () => activateTab(btn.dataset.tab));
+  });
+
+  // Reassignment modal: close on the × button, Cancel (wired per-open in openReassignDialog()),
+  // a backdrop click, or Escape — matching example/simply_ip_vault's own modal-close conventions.
+  el('reassign-dialog').addEventListener('click', (event) => {
+    // Only a click on the overlay itself — a click that merely bubbled up from the card would
+    // close the dialog while the operator is still using the reassignment dropdown.
+    if (event.target.id === 'reassign-dialog') closeReassignDialog();
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return;
+    if (!el('reassign-dialog').classList.contains('hidden')) closeReassignDialog();
   });
 
   if (Session.isSet()) {
