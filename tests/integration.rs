@@ -33,6 +33,18 @@ async fn spawn_mock_vault_groups(groups: serde_json::Value) -> (String, tokio::t
     (format!("http://{addr}"), handle)
 }
 
+async fn spawn_mock_vault_status(status: axum::http::StatusCode) -> (String, tokio::task::JoinHandle<()>) {
+    use axum::{Router, routing::get};
+
+    let app = Router::new().route("/api/groups", get(move || async move { status }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback bind always succeeds");
+    let addr = listener.local_addr().expect("a bound listener has a local address");
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}"), handle)
+}
+
 async fn body_json(response: axum::response::Response) -> serde_json::Value {
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("body reads");
     serde_json::from_slice(&bytes).expect("valid JSON")
@@ -820,6 +832,21 @@ async fn listing_vault_groups_requires_master_and_a_configured_vault() {
     // panic or an opaque 500.
     let as_master = app.oneshot(signed_request("GET", "/api/vault-groups", &master, "")).await.unwrap();
     assert_eq!(as_master.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn listing_vault_groups_returns_empty_array_when_vault_returns_403_forbidden() {
+    let db = setup_test_db().await;
+    let master = insert_key(&db, true, true).await;
+
+    let (vault_url, _server) = spawn_mock_vault_status(StatusCode::FORBIDDEN).await;
+    let state = test_state_with_vault(&db, vault_url).with_pinned_master(master.model.id);
+    let app = create_app(state);
+
+    let response = app.oneshot(signed_request("GET", "/api/vault-groups", &master, "")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let groups = body_json(response).await;
+    assert_eq!(groups.as_array().unwrap().len(), 0);
 }
 
 /// End-to-end against a mocked Vault: list → grant (rejecting a nonexistent group id first) →

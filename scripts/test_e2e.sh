@@ -492,6 +492,56 @@ check_jq ".is_master" "true" "Exporter master key reports is_master=true"
 raw_call GET "$EXPORTER_URL/api/auth/me"
 check "401" "an unsigned admin API request is rejected"
 
+log "Listing Vault groups via Exporter's GET /api/vault-groups (live Vault call)..."
+api_call "$EXPORTER_URL" GET "/api/vault-groups" "$EXPORTER_MASTER_KEY"
+check "200" "GET /api/vault-groups returns 200 OK against live Vault"
+check_jq "length" "3" "sees all 3 Vault groups accessible to Exporter's Vault key"
+check_contains "$RESP_BODY" "pfBlocker_Blacklist" "pfBlocker_Blacklist is returned by live Vault group listing"
+check_contains "$RESP_BODY" "pfBlocker_Private_Test" "pfBlocker_Private_Test is returned by live Vault group listing"
+check_contains "$RESP_BODY" "pfBlocker_Secondary_Test" "pfBlocker_Secondary_Test is returned by live Vault group listing"
+
+log "Minting a Daughter key to test Vault-group permission grants and endpoint creation with group selection..."
+api_call "$EXPORTER_URL" POST "/api/keys" "$EXPORTER_MASTER_KEY" '{"name":"Group Selection Daughter"}'
+check "200" "Group Selection Daughter key created"
+GSD_KEY=$(echo "$RESP_BODY" | jq -r '.api_key')
+GSD_SECRET=$(echo "$RESP_BODY" | jq -r '.signing_secret')
+GSD_ID=$(echo "$RESP_BODY" | jq -r '.id')
+register_key_secret "$GSD_KEY" "$GSD_SECRET"
+
+log "Granting read access on live Vault group pfBlocker_Blacklist to the Daughter key..."
+api_call "$EXPORTER_URL" POST "/api/keys/$GSD_ID/groups" "$EXPORTER_MASTER_KEY" "{\"vault_group_id\":\"$BLACKLIST_GROUP_ID\"}"
+check "200" "Vault group grant for pfBlocker_Blacklist succeeded"
+
+log "Creating an endpoint using selected Vault group pfBlocker_Blacklist via the Daughter key..."
+api_call "$EXPORTER_URL" POST "/api/endpoints" "$GSD_KEY" \
+    '{"name":"Daughter Blacklist Feed","vault_groups":"pfBlocker_Blacklist","ttl_seconds":2}'
+check "200" "endpoint created using selected Vault group by Daughter key"
+
+log "Attempting to create an endpoint using an ungranted Vault group as Daughter key..."
+api_call "$EXPORTER_URL" POST "/api/endpoints" "$GSD_KEY" \
+    '{"name":"Forbidden Group Feed","vault_groups":"pfBlocker_Secondary_Test","ttl_seconds":2}'
+check "403" "endpoint creation refused when Daughter key lacks grant for selected Vault group"
+
+log "Testing live background cleanup setup: creating a temp Vault group, granting it locally, then deleting it in Vault..."
+api_call "$VAULT_URL" POST "/api/groups" "$VAULT_MASTER_KEY" '{"name":"pfBlocker_Temp_Cleanup"}'
+check "200" "temp Vault group created"
+TEMP_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call "$VAULT_URL" POST "/api/keys/$EXPORTER_VAULT_KEY_ID/groups" "$VAULT_MASTER_KEY" \
+    "{\"group_id\":\"$TEMP_GROUP_ID\",\"can_read\":true,\"can_write\":false,\"can_delete\":false}"
+check "200" "Exporter Vault key granted read on temp Vault group"
+
+api_call "$EXPORTER_URL" POST "/api/keys/$GSD_ID/groups" "$EXPORTER_MASTER_KEY" "{\"vault_group_id\":\"$TEMP_GROUP_ID\"}"
+check "200" "Daughter key granted read access to temp Vault group"
+
+api_call "$EXPORTER_URL" GET "/api/keys/$GSD_ID/groups" "$EXPORTER_MASTER_KEY"
+check_jq "length" "2" "Daughter key initially has 2 group grants"
+
+log "Deleting the temp group in live Vault..."
+api_call "$VAULT_URL" DELETE "/api/groups/$TEMP_GROUP_ID" "$VAULT_MASTER_KEY"
+check "204" "temp group deleted in Vault"
+
+
 log "Creating the public feed endpoint (ttl_seconds=2, filter_rfc1918=true, filter_bogons=true), spanning all three Vault groups..."
 api_call "$EXPORTER_URL" POST "/api/endpoints" "$EXPORTER_MASTER_KEY" \
     '{"name":"pfBlockerNG DMZ Feed","vault_groups":"pfBlocker_Blacklist,pfBlocker_Private_Test,pfBlocker_Secondary_Test","ttl_seconds":2,"filter_rfc1918":true,"filter_bogons":true}'
@@ -715,6 +765,12 @@ check "200" "feed served again after cache rehydration"
 check_contains "$RESP_BODY" "8.8.8.0/24" "the rehydrated cache contains the expected aggregated content"
 check_not_contains "$RESP_BODY" "8.8.4.4" "the soft-deleted address is NOT resurrected by the post-restart full sync"
 check_not_contains "$RESP_BODY" "192.168.1.50" "filter_rfc1918 (restored to true in §7) is still enforced after restart"
+
+log "Verifying live background cleanup removed the grant for the group deleted in Vault..."
+api_call "$EXPORTER_URL" GET "/api/keys/$GSD_ID/groups" "$EXPORTER_MASTER_KEY"
+check "200" "Daughter key groups list returns 200 OK after restart"
+check_jq "length" "1" "background cleanup removed the stale grant for the deleted Vault group"
+check_jq ".[0].vault_group_name" "pfBlocker_Blacklist" "valid grant for pfBlocker_Blacklist survived background cleanup"
 
 # ── 10. Wrong encryption key at startup ─────────────────────────────────────
 
@@ -945,10 +1001,10 @@ fi
 
 # The audit trail is written to the same SQLite database as everything else, so it must have
 # survived §9's restart intact — entries from both before and after the restart should be present.
-# Three endpoints are created before the restart: the main DMZ feed, §8's bound_ips-restricted
-# "Restricted Feed", and §4's group-scoping "Secondary Group Only Feed".
+# Four endpoints are created before the restart: the main DMZ feed, §4's group-scoping "Secondary Group Only Feed",
+# Daughter Blacklist Feed, and §8's bound_ips-restricted "Restricted Feed".
 PRE_RESTART_COUNT=$(echo "$RESP_BODY" | jq --arg a "ENDPOINT_CREATE" '[.[] | select(.action == $a)] | length')
-check_local "$PRE_RESTART_COUNT" "3" "all three ENDPOINT_CREATE entries (created before the restart) survived it"
+check_local "$PRE_RESTART_COUNT" "4" "all four ENDPOINT_CREATE entries (created before the restart) survived it"
 
 log "Confirming a Daughter key cannot read the audit log..."
 api_call "$EXPORTER_URL" GET "/api/audit-logs" "$DAUGHTER_KEY"

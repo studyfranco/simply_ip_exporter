@@ -46,6 +46,12 @@ async fn cleanup_stale_group_permissions(state: &AppState) {
 
     let live_groups = match client.list_groups().await {
         Ok(groups) => groups,
+        Err(crate::vault_client::VaultError::Status(s)) if s == reqwest::StatusCode::FORBIDDEN => {
+            tracing::info!(
+                "Skipping this cycle's Vault-group permission cleanup: Vault API key lacks group listing permissions (HTTP 403 Forbidden). Existing grants are left untouched."
+            );
+            return;
+        }
         Err(e) => {
             tracing::warn!(
                 "Skipping this cycle's Vault-group permission cleanup: could not list Vault's \
@@ -199,6 +205,20 @@ mod tests {
 
         let remaining = VaultGroupPermission::find().all(&db).await.expect("query succeeds");
         assert_eq!(remaining.len(), 1, "a failed Vault call must not be treated as \"the group is gone\"");
+    }
+
+    #[tokio::test]
+    async fn a_403_forbidden_from_vault_leaves_every_grant_untouched() {
+        let db = test_db().await;
+        let group_id = Uuid::new_v4();
+        insert_grant(&db, group_id, "some_group").await;
+        let (url, _server) = spawn_mock_vault_error(axum::http::StatusCode::FORBIDDEN).await;
+        let state = test_state(&db, Some(url));
+
+        cleanup_stale_group_permissions(&state).await;
+
+        let remaining = VaultGroupPermission::find().all(&db).await.expect("query succeeds");
+        assert_eq!(remaining.len(), 1, "a 403 Forbidden response must leave grants untouched");
     }
 
     #[tokio::test]

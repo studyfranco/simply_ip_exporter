@@ -33,10 +33,14 @@ pub async fn list_vault_groups(
     require_master(&caller)?;
 
     let client = state.vault_client.as_ref().ok_or(AppError::VaultNotConfigured)?;
-    let groups = client.list_groups().await.map_err(|e| {
-        tracing::warn!("Could not list Vault groups: {e}");
-        AppError::VaultUnreachable
-    })?;
+    let groups = match client.list_groups().await {
+        Ok(groups) => groups,
+        Err(crate::vault_client::VaultError::Status(s)) if s == reqwest::StatusCode::FORBIDDEN => Vec::new(),
+        Err(e) => {
+            tracing::warn!("Could not list Vault groups: {e}");
+            return Err(AppError::VaultUnreachable);
+        }
+    };
 
     Ok(Json(groups.into_iter().map(VaultGroupResponse::from).collect::<Vec<_>>()))
 }
@@ -120,10 +124,14 @@ pub async fn grant_key_group(
     let target = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
 
     let client = state.vault_client.as_ref().ok_or(AppError::VaultNotConfigured)?;
-    let groups = client.list_groups().await.map_err(|e| {
-        tracing::warn!("Could not list Vault groups while granting access: {e}");
-        AppError::VaultUnreachable
-    })?;
+    let groups = match client.list_groups().await {
+        Ok(groups) => groups,
+        Err(crate::vault_client::VaultError::Status(s)) if s == reqwest::StatusCode::FORBIDDEN => Vec::new(),
+        Err(e) => {
+            tracing::warn!("Could not list Vault groups while granting access: {e}");
+            return Err(AppError::VaultUnreachable);
+        }
+    };
     let group = groups
         .into_iter()
         .find(|g| g.id == payload.vault_group_id)
