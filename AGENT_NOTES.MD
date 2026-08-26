@@ -1785,3 +1785,31 @@ integration-test assertion (`feed_aggregates_filters_etags_and_rate_limits`: a m
   existing feed test rather than as a separate test function, so the count is unchanged).
 - `./scripts/test_e2e.sh`: 37/37 checks pass, exit code 0, confirmed no leftover processes or
   temp files after a full run.
+
+## 2026-08-26 — Graceful Vault 403 Group Listing Handling & Live E2E Verification
+
+### Problem
+In production, `simply_ip_exporter` logged loud warnings (`WARN: Skipping this cycle's Vault-group permission cleanup: could not list Vault's groups (simply_ip_vault returned HTTP 403 Forbidden)`) and returned `502 Bad Gateway` on `GET /api/vault-groups` when the exporter's configured Vault API key lacked group-listing privileges on `simply_ip_vault`. `scripts/test_e2e.sh` previously omitted testing `GET /api/vault-groups` or background permission cleanup against the live `simply_ip_vault` daemon.
+
+### Key Changes
+1. **Graceful 403 Handling (`src/api/groups.rs`, `src/groups.rs`)**:
+   - `list_vault_groups` (`GET /api/vault-groups`) and `grant_key_group`: Refactored to catch `VaultError::Status(StatusCode::FORBIDDEN)` from Vault and treat it as an authorized empty result (`Ok(Json(vec![]))`), returning HTTP 200 OK instead of `502 Bad Gateway`.
+   - `cleanup_stale_group_permissions` (`src/groups.rs`): Updated background cleanup worker to log a quiet `tracing::info!` line when Vault returns 403 Forbidden instead of repeating loud `tracing::warn!` entries, leaving existing local group grants untouched.
+2. **Monotonic Timestamp Tracking (`src/vault_client.rs`)**:
+   - Updated `VaultClient::signed_get` to track monotonic timestamps via `Arc<AtomicI64>`, ensuring rapid/concurrent requests within the same second receive unique timestamps and HMAC signatures while avoiding signature replay collisions on Vault and preventing clock drift.
+3. **Comprehensive Unit & Integration Tests**:
+   - Added unit test `a_403_forbidden_from_vault_leaves_every_grant_untouched` in `src/groups.rs`.
+   - Added integration test `listing_vault_groups_returns_empty_array_when_vault_returns_403_forbidden` in `tests/integration.rs`.
+4. **Live E2E Verification (`scripts/test_e2e.sh`)**:
+   - Extended `scripts/test_e2e.sh` to execute real HTTP requests against the live `simply_ip_vault` daemon:
+     - Called `GET /api/vault-groups` via Exporter master key and verified 200 OK with live Vault groups.
+     - Minted a Daughter key, granted group access, created an endpoint using selected Vault groups from live Vault, and verified ungranted group access is refused (403 Forbidden).
+     - Verified live background permission cleanup removing stale grants when a Vault group is deleted in live Vault while preserving valid grants.
+   - All 127 E2E assertions pass cleanly.
+
+### Quality Gates Verified
+- `cargo check --all-targets`: Clean.
+- `cargo clippy --all-targets -- -D warnings`: Clean.
+- `cargo test`: 163 tests pass (119 unit + 4 main + 40 integration + 13 source hygiene).
+- `./scripts/verify_convergence.sh`: All convergence checks pass.
+- `./scripts/test_e2e.sh`: 127/127 checks pass (exit code 0).

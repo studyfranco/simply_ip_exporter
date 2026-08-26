@@ -1,6 +1,8 @@
 //! Outbound `simply_ip_vault` API client: `CANONICAL_V1` HMAC-signed `GET /api/ips` requests for
 //! the hybrid differential/full sync protocol.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use chrono::NaiveDateTime;
@@ -65,6 +67,7 @@ pub struct VaultClient {
     base_url: String,
     api_key: String,
     signing_secret: String,
+    last_timestamp: Arc<AtomicI64>,
 }
 
 impl VaultClient {
@@ -78,7 +81,8 @@ impl VaultClient {
             config.vault_signing_secret.clone()?,
         );
         let http = reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build().ok()?;
-        Some(Self { http, base_url, api_key, signing_secret })
+        let last_timestamp = Arc::new(AtomicI64::new(0));
+        Some(Self { http, base_url, api_key, signing_secret, last_timestamp })
     }
 
     /// Fetches IP records for `groups`. When `since` is set, performs a differential query
@@ -111,7 +115,18 @@ impl VaultClient {
     /// and response shape, not in how a request gets signed or a non-2xx/malformed body is turned
     /// into a [`VaultError`].
     async fn signed_get<T: DeserializeOwned>(&self, path_and_query: &str) -> Result<T, VaultError> {
-        let timestamp = chrono::Utc::now().timestamp().to_string();
+        let now = chrono::Utc::now().timestamp();
+        let mut ts = now;
+        let _ = self.last_timestamp.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+            let next = if now > last || last.saturating_sub(now) >= 5 {
+                now
+            } else {
+                last + 1
+            };
+            ts = next;
+            Some(next)
+        });
+        let timestamp = ts.to_string();
         let payload = canonical_v1_payload("GET", path_and_query, &timestamp, b"");
         let signature = compute_signature(&self.signing_secret, &payload)
             .ok_or(VaultError::Status(reqwest::StatusCode::INTERNAL_SERVER_ERROR))?;
