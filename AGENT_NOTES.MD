@@ -1,5 +1,49 @@
 # Agent Worklog — `simply_ip_exporter`
 
+## 2026-08-26 (session 20) — Peer API-reference audit, and the restricted-key multi-group e2e
+
+`git -C example/simply_ip_vault pull` (already at `29942ad`, which added `API_REFERENCE.md`), then
+audited every `VaultClient` call against Vault's now-official contract rather than against its
+source as read in sessions 17–18. **No code changes were required — the audit confirmed all four
+contracts.**
+
+| Audited | Reference says | This crate does |
+| :--- | :--- | :--- |
+| `GET /api/ips` pagination | `limit` u64 default **50**, `offset` u64 default **0**; no cap documented | Walks `limit`/`offset` pages of 1000 to completion (session 18) ✔ |
+| `GET /api/ips` response | `IpRecordResponse` incl. `target_address`, `updated_at`, `is_deleted` | `VaultApiRecord` deserialises exactly that subset; the rest ignored ✔ |
+| `GET /api/ips` ordering | "ordered by `updated_at` descending" | Matches the consistency caveat documented on `fetch_ips` ✔ |
+| `GET /api/groups` auth | "**any authenticated key** — no `is_master` gate"; a key with no permission rows gets "`200` with `[]` — **never `403`**" | Calls `/api/groups` unchanged ✔ |
+
+That last row is session 17's diagnosis restated in Vault's own documentation: the reported "403
+because the key isn't Master" cannot happen, and the production 403 was never an RBAC failure. The
+absence of any documented `limit` ceiling also vindicates session 18's choice of a loop over a large
+hardcoded `limit` — nothing promises a cap will not appear later.
+
+One deliberate non-adoption worth recording: Vault exposes a server-side `max_age` filter
+(`last_seen_at` within N seconds). Session 19's `max_age_seconds` does **not** delegate to it,
+because pushing the retention window server-side would stop the excluded records from ever being
+cached — making the window destructive and irreversible, which is precisely the property session 19
+chose feed-time filtering to avoid. The two also key off different columns (`last_seen_at` vs the
+`updated_at` this crate caches).
+
+### New e2e §4d — the production shape, end to end
+
+The one scenario still genuinely uncovered: a restricted Vault key holding grants on *some* groups
+while an endpoint names *more*. 500 records across `Group_Alpha`/`Group_Beta`/`Group_Gamma`
+(167/167/166), with the Exporter's non-Master Vault key granted `can_read` on Alpha and Beta only.
+The endpoint deliberately names all three.
+
+This leans on Vault's documented "restrict-not-reject" rule: naming an unreadable group is not an
+error, it contributes nothing. So the assertions are that Vault hands the restricted key exactly 334
+of the 500 records (checked directly, before the Exporter is involved), that the published feed is
+exactly those 334 with both groups' first *and last* records present (so a truncated page would
+fail), that **not one** of Gamma's 166 records leaks, that `GET /api/vault-groups` lists Alpha and
+Beta but not Gamma, and that the Exporter logged no Vault `403` anywhere in the run — a tolerated-
+but-silent 403 would still mean a misconfigured integration.
+
+Gates: `cargo check`/`clippy -D warnings` clean; `cargo test` 129 + 4 + 41 + 13 = 187 passed;
+`verify_convergence.sh` all checks pass; `test_e2e.sh` **192/192** (was 166), first run green.
+
 ## 2026-08-26 (session 19) — `max_age_seconds`: a per-endpoint retention window, `0` = unlimited
 
 New `endpoints.max_age_seconds` (BigInteger, `NOT NULL DEFAULT 0`, validated `>= 0`) bounding how

@@ -131,7 +131,7 @@ its specific coverage.
 ## `example/` — reference implementations (not part of this crate)
 
 Gitignored, untracked checkouts of `simply_ip_vault` and `simply_hook_executor` used as pattern
-references for the `CANONICAL_V1` HMAC scheme, `SecretCipher`, `MasterPin`, and `ReplayGuard` — see
+references for the `CANONICAL_V1` HMAC scheme. `example/simply_ip_vault/API_REFERENCE.md` is Vault's official endpoint/parameter catalogue and is the authority every `VaultClient` call is audited against (see `AGENT_NOTES.MD` session 20), `SecretCipher`, `MasterPin`, and `ReplayGuard` — see
 `AGENT.MD` and `AGENT_NOTES.MD` for what was adapted versus deliberately simplified for this
 crate's two-tier RBAC model. `scripts/test_e2e.sh` additionally builds and runs
 `example/simply_ip_vault` as a live dependency of its own test run.

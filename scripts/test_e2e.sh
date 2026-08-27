@@ -458,6 +458,45 @@ api_call "$VAULT_URL" GET "/api/ips?groups=pfBlocker_Pagination_Test" "$VAULT_MA
 check "200" "Vault serves the pagination group"
 check_jq "length" "50" "Vault truncates to its default limit=50 when no limit is supplied (the bug's root cause)"
 
+# ── Restricted-key multi-group fixture (§4d) ────────────────────────────────
+# 500 records across three groups, with the Exporter's Vault key granted can_read on only two of
+# them. This is the production shape: the Exporter authenticates to Vault with a restricted,
+# non-Master key, and must publish exactly what that key may read — no more, and without erroring on
+# the group it may not.
+#
+# Vault's "restrict-not-reject" rule (API_REFERENCE.md §GET /api/ips) is what makes the negative
+# assertion meaningful: naming an unreadable group is NOT an error, it simply contributes nothing.
+# So the Exporter asks for all three groups and must silently receive only two groups' worth —
+# proving the exclusion happens in Vault's scoping rather than by the Exporter guessing.
+log "Creating Group_Alpha/Beta/Gamma and seeding 500 records across them..."
+for g in Group_Alpha Group_Beta Group_Gamma; do
+    api_call "$VAULT_URL" POST "/api/groups" "$VAULT_MASTER_KEY" "{\"name\":\"$g\"}"
+    check "200" "$g is created"
+    eval "${g}_ID=\$(echo \"\$RESP_BODY\" | jq -r '.id')"
+done
+
+# 167 + 167 + 166 = 500. Distinct /8s per group and a lone host per /24, so nothing aggregates
+# within or across groups and each group's contribution is countable on its own.
+seed_group() { # group_name octet count
+    local batch
+    batch=$(python3 - "$1" "$2" "$3" <<'PY'
+import json, sys
+group, octet, count = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+records = [
+    {"target_address": "%d.0.%d.1" % (octet, i), "cause": "restricted-key fixture"}
+    for i in range(count)
+]
+print(json.dumps({"group_name": group, "mode": "upsert", "records": records, "skip_webhooks": True}))
+PY
+)
+    api_call "$VAULT_URL" POST "/api/records/batch" "$VAULT_MASTER_KEY" "$batch"
+    check "200" "$3 records seeded into $1"
+    check_jq ".created" "$3" "Vault reports all $3 records created in $1"
+}
+seed_group Group_Alpha 61 167
+seed_group Group_Beta 62 167
+seed_group Group_Gamma 63 166
+
 # ── Retention-window fixture (§4c) ──────────────────────────────────────────
 # Two records in one group, differing only in age, so `max_age_seconds` is the single variable
 # distinguishing what the three §4c feeds publish. Vault's batch API accepts an explicit
@@ -537,6 +576,22 @@ api_call "$VAULT_URL" POST "/api/keys/$EXPORTER_VAULT_KEY_ID/groups" "$VAULT_MAS
     "{\"group_id\":\"$AGE_GROUP_ID\",\"can_read\":true,\"can_write\":false,\"can_delete\":false}"
 check "200" "can_read granted on pfBlocker_Age_Test"
 
+log "Granting the Exporter's restricted Vault key can_read on Alpha and Beta ONLY (Gamma denied)..."
+api_call "$VAULT_URL" POST "/api/keys/$EXPORTER_VAULT_KEY_ID/groups" "$VAULT_MASTER_KEY" \
+    "{\"group_id\":\"$Group_Alpha_ID\",\"can_read\":true,\"can_write\":false,\"can_delete\":false}"
+check "200" "can_read granted on Group_Alpha"
+api_call "$VAULT_URL" POST "/api/keys/$EXPORTER_VAULT_KEY_ID/groups" "$VAULT_MASTER_KEY" \
+    "{\"group_id\":\"$Group_Beta_ID\",\"can_read\":true,\"can_write\":false,\"can_delete\":false}"
+check "200" "can_read granted on Group_Beta"
+log "Group_Gamma is deliberately NOT granted — its 166 records must never reach the feed."
+
+# Proves the restriction is real at the Vault boundary before the Exporter is even involved: the
+# same query that a Master answers with all 500 returns only the readable 334 for this key.
+api_call "$VAULT_URL" GET "/api/ips?groups=Group_Alpha,Group_Beta,Group_Gamma&limit=100000" "$EXPORTER_VAULT_KEY"
+check "200" "the restricted key may query all three groups without a 403 (restrict-not-reject)"
+check_jq "length" "334" "Vault returns only Alpha+Beta's 334 records to the restricted key, silently omitting Gamma's 166"
+
+
 api_call "$VAULT_URL" GET "/api/ips?groups=pfBlocker_Blacklist,pfBlocker_Private_Test,pfBlocker_Secondary_Test" "$EXPORTER_VAULT_KEY"
 check "200" "the scoped Exporter key can read across all three groups"
 check_jq "length" "6" "sees all 6 seeded records (restrict-not-reject: no group is silently rejected)"
@@ -579,7 +634,7 @@ check "401" "an unsigned admin API request is rejected"
 log "Listing Vault groups via Exporter's GET /api/vault-groups (live Vault call)..."
 api_call "$EXPORTER_URL" GET "/api/vault-groups" "$EXPORTER_MASTER_KEY"
 check "200" "GET /api/vault-groups returns 200 OK against live Vault"
-check_jq "length" "5" "sees all 5 Vault groups accessible to Exporter's Vault key (Blacklist, Private, Secondary, Pagination, Age)"
+check_jq "length" "7" "sees the 7 Vault groups this key may read (Blacklist, Private, Secondary, Pagination, Age, Group_Alpha, Group_Beta) — Group_Gamma is ungranted and correctly absent"
 check_contains "$RESP_BODY" "pfBlocker_Blacklist" "pfBlocker_Blacklist is returned by live Vault group listing"
 check_contains "$RESP_BODY" "pfBlocker_Private_Test" "pfBlocker_Private_Test is returned by live Vault group listing"
 check_contains "$RESP_BODY" "pfBlocker_Secondary_Test" "pfBlocker_Secondary_Test is returned by live Vault group listing"
@@ -684,6 +739,15 @@ AGE_TIGHT_PATH=$(echo "$RESP_BODY" | jq -r '.feed_path')
 api_call "$EXPORTER_URL" POST "/api/endpoints" "$EXPORTER_MASTER_KEY" \
     '{"name":"Rejected Age Feed","vault_groups":"pfBlocker_Age_Test","max_age_seconds":-1}'
 check "400" "a negative max_age_seconds is refused at creation" 
+
+# Deliberately names all three groups, including the one the Exporter's Vault key cannot read.
+# Vault answers such a request normally and simply contributes nothing for Gamma, so a correct
+# Exporter publishes 334 records and never sees a 403.
+log "Creating the restricted multi-group feed over Alpha+Beta+Gamma (Gamma is denied to our key)..."
+api_call "$EXPORTER_URL" POST "/api/endpoints" "$EXPORTER_MASTER_KEY" \
+    '{"name":"Restricted Multi-Group Feed","vault_groups":"Group_Alpha,Group_Beta,Group_Gamma","ttl_seconds":2}'
+check "200" "the restricted multi-group feed is created"
+RESTRICTED_MULTI_PATH=$(echo "$RESP_BODY" | jq -r '.feed_path')
 
 # sync_all_endpoints() (src/sync.rs) syncs every due endpoint sequentially within one 15s tick,
 # each a real HTTP round-trip to Vault — two endpoints due at once (as here) take measurably
@@ -805,6 +869,44 @@ raw_call GET "$EXPORTER_URL$AGE_TIGHT_PATH" -H "X-Forwarded-For: 198.51.100.64"
 check "200" "the widened feed is served"
 AGE_RESTORED_COUNT=$(echo "$RESP_BODY" | grep -c . || true)
 check_local "$AGE_RESTORED_COUNT" "2" "both records are back immediately — the window is a view, not a destructive filter"
+
+# ── 4d. Restricted Vault key across granted and denied groups ───────────────
+
+log_section "4d. Restricted Vault Key: Granted vs Denied Groups (500 records)"
+
+# The production shape end-to-end: the Exporter holds a non-Master Vault key granted can_read on
+# Group_Alpha and Group_Beta but not Group_Gamma, and its endpoint names all three. §2 already
+# proved Vault hands that key exactly 334 of the 500 records; this proves the Exporter publishes
+# precisely those and nothing from Gamma.
+raw_call GET "$EXPORTER_URL$RESTRICTED_MULTI_PATH" -H "X-Forwarded-For: 198.51.100.71"
+check "200" "the restricted multi-group feed is served"
+
+RESTRICTED_MULTI_COUNT=$(echo "$RESP_BODY" | grep -c . || true)
+check_local "$RESTRICTED_MULTI_COUNT" "334" "exactly 334 lines — every record from the two granted groups, and only those"
+
+check_contains "$RESP_BODY" "61.0.0.1/32" "Group_Alpha's first record is published"
+check_contains "$RESP_BODY" "61.0.166.1/32" "Group_Alpha's last record is published (all 167, not a truncated page)"
+check_contains "$RESP_BODY" "62.0.0.1/32" "Group_Beta's first record is published"
+check_contains "$RESP_BODY" "62.0.166.1/32" "Group_Beta's last record is published"
+
+# The security-relevant half: nothing from the group this key was never granted.
+check_not_contains "$RESP_BODY" "63.0." "NOT ONE of Group_Gamma's 166 records leaked into the feed"
+
+# And the Exporter's own group listing reflects the same scoping — Gamma is absent rather than the
+# call failing, which is what distinguishes correct scoping from a swallowed error.
+api_call "$EXPORTER_URL" GET "/api/vault-groups" "$EXPORTER_MASTER_KEY"
+check "200" "GET /api/vault-groups still returns 200 with a restricted key (no 403)"
+check_contains "$RESP_BODY" "Group_Alpha" "the granted Group_Alpha is listed"
+check_contains "$RESP_BODY" "Group_Beta" "the granted Group_Beta is listed"
+check_not_contains "$RESP_BODY" "Group_Gamma" "the ungranted Group_Gamma is NOT listed"
+
+# No 403 may have been logged against Vault during the whole run — a silent 403 that the Exporter
+# merely tolerated would still mean the integration is misconfigured.
+if grep -q "403 Forbidden" "$EXPORTER_LOG"; then
+    check_local "found" "none" "the Exporter logged no Vault 403 Forbidden during the run"
+else
+    check_local "none" "none" "the Exporter logged no Vault 403 Forbidden during the run"
+fi
 
 # ── 5. HTTP optimizations & anti-DoS ────────────────────────────────────────
 
@@ -1197,13 +1299,13 @@ fi
 
 # The audit trail is written to the same SQLite database as everything else, so it must have
 # survived §9's restart intact — entries from both before and after the restart should be present.
-# Eight endpoints are created before the restart: the main DMZ feed, §4's group-scoping "Secondary
+# Nine endpoints are created before the restart: the main DMZ feed, §4's group-scoping "Secondary
 # Group Only Feed", §4b's large-dataset "Pagination Feed", §4c's three retention-window feeds,
 # Daughter Blacklist Feed, and §8's bound_ips-restricted "Restricted Feed". (The negative
 # max_age_seconds attempt in §3 was refused, so it writes no audit entry — which this count
 # incidentally confirms.)
 PRE_RESTART_COUNT=$(echo "$RESP_BODY" | jq --arg a "ENDPOINT_CREATE" '[.[] | select(.action == $a)] | length')
-check_local "$PRE_RESTART_COUNT" "8" "all eight ENDPOINT_CREATE entries (created before the restart) survived it"
+check_local "$PRE_RESTART_COUNT" "9" "all nine ENDPOINT_CREATE entries (created before the restart) survived it"
 
 log "Confirming a Daughter key cannot read the audit log..."
 api_call "$EXPORTER_URL" GET "/api/audit-logs" "$DAUGHTER_KEY"
