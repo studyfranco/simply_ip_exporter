@@ -1,5 +1,81 @@
 # Agent Worklog — `simply_ip_exporter`
 
+## 2026-08-26 (session 21) — Bounded parallel paging on Vault's `include_total` envelope
+
+Pulled the peer (`b8bd281 feat(api): add include_total query parameter`) and rebuilt
+`VaultClient::fetch_ips` around it: page one is fetched with `include_total=true`, and if Vault
+reports `total_pages > 1` the remaining offsets are fetched concurrently through
+`futures::stream::iter(...).buffer_unordered(5)`.
+
+### Contract, verified before implementing
+
+`API_REFERENCE.md` and `src/api/records.rs` agree: `include_total` is opt-in (`default false`),
+ignored under `format=iplist`, and yields `{data, total, limit, offset, total_pages}` with
+`total_pages = total.div_ceil(limit)` — **`0`, not `1`, when `total` is `0`**. Only `data` and
+`total_pages` are modelled here; re-deriving the page count from `total`/`limit` would duplicate a
+calculation Vault has already made and could disagree with it at the boundary.
+
+### The finding the brief did not anticipate: "legacy" is a `400`, not a bare array
+
+The brief specified falling back when Vault "returns a plain array without `total_pages`". Reading
+the source showed that is not the failure mode a real old deployment produces: Vault's
+`QueryFilters` carries `#[serde(deny_unknown_fields)]`, so a vault predating `b8bd281` treats
+`include_total` as an **unknown field and refuses the whole request with `400`** — no array at all.
+An exporter upgraded ahead of its vault would have failed every sync cycle. Both shapes are now
+handled, and both are tested:
+
+- **`400` on the probe** → retry once without the flag, walk sequentially from offset 0.
+- **`200` with a root array** (a vault that merely ignores the parameter) → page one is real data,
+  so it is kept and the walk resumes at page *two* rather than re-requesting offset 0.
+
+An `#[serde(untagged)]` `IpsResponse` covers the response half in one deserialize; the status half
+is a `match` arm on `VaultError::Status(400)`.
+
+### Design notes
+
+`include_total` rides on the probe **only** — repeating it per page would make Vault recompute the
+same `COUNT(*)` once per page for nothing. `MAX_CONCURRENT_PAGES = 5` bounds in-flight requests:
+`total_pages` is Vault's number, and an unbounded fan-out would turn a routine sync into a
+self-inflicted burst against the service the exporter depends on. Page order is not preserved
+(`buffer_unordered` yields as pages complete) because nothing downstream depends on it — the cache
+keys by address and `filter_and_aggregate` sorts. `groups`/`since`/`include_deleted` live in the
+shared `base` string, so every parallel page is scoped identically; a delta that widened partway
+through the fetch would be worse than a slow one.
+
+### A real harness bug surfaced by the scale-up
+
+Seeding 3,214 records failed with an *empty* HTTP status, not an error. Cause: `api_call` passed the
+request body to curl as a single command-line argument, and Linux caps one argv entry at
+`MAX_ARG_STRLEN` (128 KiB) — the ~240 KB batch payload made `execve` fail with `E2BIG` before curl
+ran. Bodies now stream from a file via `--data-binary @file` (`--data-binary`, not `-d`, since `-d`
+strips newlines and the HMAC is computed over exact bytes). The 250-record fixture had sat just
+under the limit, which is why this only appeared at realistic scale.
+
+### Verification
+
+- 9 new `vault_client` unit tests: the headline 3,214-over-4-pages parallel fetch (asserting 4 total
+  requests, offsets `0/1000/2000/3000` each requested exactly once, `include_total` on the probe
+  alone, and 3,214 *distinct* records); single-page and `total_pages: 0` cases issuing no follow-up;
+  a concurrency-cap test where the mock tracks its own live-request high-water mark and asserts it
+  is both `> 1` (genuinely parallel) and `<= 5`; delta filters present on every parallel page; and
+  the two legacy paths above. The four pre-existing sequential tests still pass unchanged, which is
+  what shows the refactor preserved the fallback.
+- e2e §4b scaled 250 → **3,214** records, i.e. four real pages at the production `PAGE_SIZE` of
+  1000. Asserts the live envelope (`total=3214`, `total_pages=4`, `data` length 1000), then both
+  sides of all three page seams (`51.3.231.1`/`51.3.232.1`, `51.7.207.1`/`51.7.208.1`,
+  `51.11.183.1`/`51.11.184.1`) plus the final `51.12.141.1`, so an offset off-by-one names a
+  specific missing address rather than only a wrong total. Line count *and* distinct count are both
+  checked — duplicates from a bad concurrent merge would otherwise inflate the total while every
+  spot-check still passed. Log is scanned for `403`/panic/concurrency errors. Serve time is logged
+  (2547 ms for 3,214 records, cache-served).
+- Gates: `cargo check`/`clippy -D warnings` clean; `cargo test` 137 + 4 + 41 + 13 = 195 passed;
+  `verify_convergence.sh` all pass; `test_e2e.sh` **203/203**.
+- `example/simply_ip_vault` is read-only and verified clean. One slip worth recording: a `cargo add
+  futures` ran while the shell's cwd was inside the peer checkout and added the dependency to
+  *Vault's* `Cargo.toml`; caught immediately via `git status` and reverted with `git checkout --`
+  before anything else touched it. Peer-repo commands must be absolute-path or `git -C`, never
+  cwd-dependent.
+
 ## 2026-08-26 (session 20) — Peer API-reference audit, and the restricted-key multi-group e2e
 
 `git -C example/simply_ip_vault pull` (already at `29942ad`, which added `API_REFERENCE.md`), then

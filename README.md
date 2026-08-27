@@ -61,7 +61,7 @@ Each `endpoints` row names one or more Vault group(s) and a `ttl_seconds`. A bac
 - performs a **differential sync** (`GET /api/ips?groups=...&since=<last_synced_at>&include_deleted=true`)
   once `ttl_seconds` has elapsed since the last sync, merging additions and soft-deletes into the
   in-memory cache; or
-- performs a **full, unconstrained sync** (`GET /api/ips?groups=...`) at least once every 24 hours
+- performs a **full, unconstrained sync** (`GET /api/ips?groups=...`, paginated — page one asks for Vault's `include_total` envelope and any remaining pages are fetched concurrently, at most 5 in flight) at least once every 24 hours
   regardless of `ttl_seconds`, replacing the cached set outright to clear any orphaned records a
   differential sync might have missed.
 
@@ -263,14 +263,14 @@ orchestrators, load balancers) cannot compute an HMAC signature.
 ```sh
 cargo check --all-targets
 cargo clippy --all-targets -- -D warnings
-cargo test                     # 129 unit + 4 main.rs unit + 41 integration + 13 source-hygiene tests
+cargo test                     # 137 unit + 4 main.rs unit + 41 integration + 13 source-hygiene tests
 ./scripts/verify_convergence.sh  # source hygiene (raw SQL, unwrap/expect, frontend syntax/DOM refs) + clippy -D warnings + cargo test, one gate
 ./scripts/test_e2e.sh          # full live E2E against a real simply_ip_vault + simply_ip_exporter pair
 ```
 
 `scripts/test_e2e.sh` builds and boots both services against throwaway SQLite databases with
 deterministic bootstrap keys, provisions Vault, configures an exporter endpoint, and asserts —
-across 192 checks in 17 sections — the feed pipeline (aggregation, filtering, ETag/304, rate
+across 203 checks in 17 sections — the feed pipeline (aggregation, filtering, ETag/304, rate
 limiting), Vault soft-delete propagation via differential sync, hot-reload of endpoint config with
 no restart, `bound_ips` client-IP restriction, a full graceful-restart-with-encryption cycle
 (Master key, a Daughter key's encrypted secret, and the endpoint row all surviving a `SIGTERM` and

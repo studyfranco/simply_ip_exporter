@@ -68,8 +68,12 @@ EXPORTER_URL="http://127.0.0.1:$EXPORTER_PORT"
 # shape each generates for itself), so these are hex; the signing secrets have no such constraint.
 # Distinct per service so a copy-paste mistake between the two is loud, not silent.
 # How many records §2 seeds into pfBlocker_Pagination_Test, and §4b expects to survive intact.
-# Must stay > Vault's default page (50) for the guard to mean anything.
-PAGINATION_RECORD_COUNT=250
+# Must stay > Vault's default page (50) for the truncation guard to mean anything, and is chosen at
+# 3214 to span exactly four pages at VaultClient's PAGE_SIZE of 1000 (1000+1000+1000+214) — so the
+# bounded-parallel envelope path is exercised at its real page size, not a shrunken test one.
+PAGINATION_RECORD_COUNT=3214
+PAGINATION_PAGE_SIZE=1000
+PAGINATION_EXPECTED_PAGES=4
 
 VAULT_MASTER_KEY="a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
 VAULT_MASTER_SECRET="e2e_vault_master_signing_secret_for_testing"
@@ -91,6 +95,11 @@ EXPORTER_DB_PATH="$WORK_DIR/exporter.db"
 VAULT_LOG="$WORK_DIR/vault.log"
 EXPORTER_LOG="$WORK_DIR/exporter.log"
 RESP_BODY_FILE="$WORK_DIR/resp_body"
+# Request bodies are handed to curl via `--data-binary @file`, never as a command-line argument:
+# Linux caps a *single* argv entry at MAX_ARG_STRLEN (128 KiB), and §2's multi-thousand-record batch
+# payloads run past that. Passing one inline made execve fail with E2BIG, which surfaced as an empty
+# HTTP status rather than any error curl could report.
+REQ_BODY_FILE="$WORK_DIR/req_body"
 VAULT_PID=""
 EXPORTER_PID=""
 
@@ -201,7 +210,10 @@ api_call() {
 
     [ -n "$xff" ] && args+=(-H "X-Forwarded-For: $xff")
     if [ -n "$data" ]; then
-        args+=(-H "Content-Type: application/json" -d "$data")
+        # `--data-binary`, not `-d`: `-d` strips newlines, and the HMAC signature above is computed
+        # over the exact bytes, so any transformation curl applied would invalidate it.
+        printf '%s' "$data" > "$REQ_BODY_FILE"
+        args+=(-H "Content-Type: application/json" --data-binary "@$REQ_BODY_FILE")
     fi
     RESP_STATUS=$(curl "${args[@]}" "$base$path")
     RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
@@ -457,6 +469,16 @@ check_jq ".created" "$PAGINATION_RECORD_COUNT" "Vault reports all $PAGINATION_RE
 api_call "$VAULT_URL" GET "/api/ips?groups=pfBlocker_Pagination_Test" "$VAULT_MASTER_KEY"
 check "200" "Vault serves the pagination group"
 check_jq "length" "50" "Vault truncates to its default limit=50 when no limit is supplied (the bug's root cause)"
+
+# The include_total envelope contract this Exporter's parallel paging is built on, asserted against
+# the live daemon rather than assumed from the reference: if Vault ever stops reporting total_pages,
+# the Exporter silently falls back to sequential paging and §4b would still pass — so the envelope
+# itself needs its own check.
+api_call "$VAULT_URL" GET "/api/ips?groups=pfBlocker_Pagination_Test&include_total=true&limit=$PAGINATION_PAGE_SIZE" "$VAULT_MASTER_KEY"
+check "200" "Vault answers include_total=true"
+check_jq ".total" "$PAGINATION_RECORD_COUNT" "the envelope reports total=$PAGINATION_RECORD_COUNT across all pages"
+check_jq ".total_pages" "$PAGINATION_EXPECTED_PAGES" "the envelope reports total_pages=$PAGINATION_EXPECTED_PAGES at limit=$PAGINATION_PAGE_SIZE"
+check_jq ".data | length" "$PAGINATION_PAGE_SIZE" "page one carries exactly $PAGINATION_PAGE_SIZE records under .data"
 
 # ── Restricted-key multi-group fixture (§4d) ────────────────────────────────
 # 500 records across three groups, with the Exporter's Vault key granted can_read on only two of
@@ -796,7 +818,7 @@ check_local "$SECONDARY_LINE_COUNT" "1" "exactly one line — only this endpoint
 
 # ── 4b. Large-dataset pagination ────────────────────────────────────────────
 
-log_section "4b. Large-Dataset Pagination (>50 records)"
+log_section "4b. Large-Dataset Pagination ($PAGINATION_RECORD_COUNT records, $PAGINATION_EXPECTED_PAGES parallel pages)"
 
 # The regression guard for the production defect where simply_ip_exporter published only ~50 IPs
 # regardless of how many Vault held. Vault paginates GET /api/ips with limit/offset and defaults to
@@ -807,8 +829,12 @@ log_section "4b. Large-Dataset Pagination (>50 records)"
 # §2 already asserted Vault itself truncates at 50 without a limit, so this section isolates the
 # exporter's half: given a group Vault serves 50-at-a-time, does the published feed carry all
 # $PAGINATION_RECORD_COUNT?
+PAGINATION_FETCH_START=$(date +%s%3N)
 raw_call GET "$EXPORTER_URL$PAGINATION_FEED_PATH" -H "X-Forwarded-For: 198.51.100.51"
 check "200" "the large-dataset feed is served"
+PAGINATION_FETCH_MS=$(( $(date +%s%3N) - PAGINATION_FETCH_START ))
+log "Feed of $PAGINATION_RECORD_COUNT records served in ${PAGINATION_FETCH_MS}ms (served from the in-memory cache, so this measures serving, not syncing)."
+
 
 PAGINATION_LINE_COUNT=$(echo "$RESP_BODY" | grep -c . || true)
 check_local "$PAGINATION_LINE_COUNT" "$PAGINATION_RECORD_COUNT" \
@@ -819,8 +845,30 @@ check_local "$PAGINATION_LINE_COUNT" "$PAGINATION_RECORD_COUNT" \
 check_contains "$RESP_BODY" "51.0.0.1/32" "the first seeded record is present"
 check_contains "$RESP_BODY" "51.0.49.1/32" "the 50th record (the last of Vault's default first page) is present"
 check_contains "$RESP_BODY" "51.0.50.1/32" "the 51st record is present — the first one the old single-page fetch always lost"
-check_contains "$RESP_BODY" "51.0.150.1/32" "a record from the middle of page four is present"
-check_contains "$RESP_BODY" "51.0.249.1/32" "the final record is present — the walk ran to completion, not just past the first boundary"
+
+# Every boundary between the four 1000-record pages, checked on both sides. A parallel walk that
+# miscomputed an offset, or dropped a page entirely, shows up here as a specific missing address
+# rather than only as a wrong total — and the pairs straddling each seam are exactly where an
+# off-by-one in the offset arithmetic would land.
+check_contains "$RESP_BODY" "51.3.231.1/32" "record 1000 — the last of parallel page 1"
+check_contains "$RESP_BODY" "51.3.232.1/32" "record 1001 — the first of parallel page 2"
+check_contains "$RESP_BODY" "51.7.207.1/32" "record 2000 — the last of parallel page 2"
+check_contains "$RESP_BODY" "51.7.208.1/32" "record 2001 — the first of parallel page 3"
+check_contains "$RESP_BODY" "51.11.183.1/32" "record 3000 — the last of parallel page 3"
+check_contains "$RESP_BODY" "51.11.184.1/32" "record 3001 — the first of parallel page 4 (the short 214-record tail)"
+check_contains "$RESP_BODY" "51.12.141.1/32" "record 3214 — the very last, so the short final page arrived complete"
+
+# Duplicates would inflate the count while every spot-check still passed, so the line count above is
+# only meaningful alongside this: no address may appear twice after a concurrent merge.
+PAGINATION_DISTINCT=$(echo "$RESP_BODY" | sort -u | grep -c . || true)
+check_local "$PAGINATION_DISTINCT" "$PAGINATION_RECORD_COUNT" "all $PAGINATION_RECORD_COUNT lines are distinct — concurrent pages merged without duplicating a record"
+
+# Concurrency must not have produced errors of its own, and no page may have been refused.
+if grep -qE "403 Forbidden|panicked|concurrency" "$EXPORTER_LOG"; then
+    check_local "found" "none" "no 403, panic, or concurrency error in the Exporter log during the large-dataset sync"
+else
+    check_local "none" "none" "no 403, panic, or concurrency error in the Exporter log during the large-dataset sync"
+fi
 
 # ── 4c. Retention window (max_age_seconds) ──────────────────────────────────
 

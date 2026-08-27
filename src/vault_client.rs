@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use chrono::NaiveDateTime;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
@@ -71,6 +72,40 @@ const PAGE_SIZE: u64 = 1_000;
 /// Hard ceiling on pages walked in one [`VaultClient::fetch_ips`] call — a runaway guard, not a
 /// dataset limit. At [`PAGE_SIZE`] this allows a million records before it trips.
 const MAX_PAGES: u32 = 1_000;
+
+/// How many page requests may be in flight at once when Vault reports a page count up front.
+///
+/// Bounded rather than unbounded on purpose: `total_pages` is Vault's number, not ours, and a large
+/// dataset would otherwise open one connection per page simultaneously — turning a routine sync
+/// into a self-inflicted burst against the very service the exporter depends on. Five keeps the
+/// wall-clock win of parallelism (a 4-page fetch costs roughly one round-trip instead of four)
+/// while capping concurrent load at something a single Vault answers comfortably.
+const MAX_CONCURRENT_PAGES: usize = 5;
+
+/// Vault's `GET /api/ips?include_total=true` envelope.
+///
+/// Only the two fields this client acts on are modelled; `total`, `limit` and `offset` are also
+/// present in Vault's response and deliberately ignored — `total_pages` already encodes everything
+/// needed to enumerate the remaining offsets, and re-deriving it from `total`/`limit` here would
+/// duplicate a calculation Vault has already made (and could disagree with it at the boundary).
+#[derive(Debug, Deserialize)]
+struct IpRecordsEnvelope {
+    data: Vec<VaultApiRecord>,
+    total_pages: u64,
+}
+
+/// What `GET /api/ips` answered with: the paginated envelope, or the historical bare array.
+///
+/// `untagged` so one deserialize attempt covers both shapes — an object with `data`/`total_pages`
+/// matches [`IpRecordsEnvelope`], and a root array matches [`Self::Legacy`]. That is the *response*
+/// half of legacy tolerance; see [`VaultClient::fetch_ips`] for the other, sharper half, where an
+/// older Vault rejects the request outright.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum IpsResponse {
+    Envelope(IpRecordsEnvelope),
+    Legacy(Vec<VaultApiRecord>),
+}
 
 /// A signed HTTP client for `simply_ip_vault`.
 #[derive(Clone)]
@@ -152,9 +187,117 @@ impl VaultClient {
             ));
         }
 
-        let mut all: Vec<VaultApiRecord> = Vec::new();
-        let mut offset: u64 = 0;
-        let mut pages: u32 = 0;
+        // Page one doubles as a capability probe: `include_total=true` asks Vault to report how
+        // many pages exist, and how it answers decides which strategy the rest of this fetch uses.
+        let first = self
+            .signed_get::<IpsResponse>(&format!(
+                "{base}&include_total=true&limit={}&offset=0",
+                self.page_size
+            ))
+            .await;
+
+        match first {
+            Ok(IpsResponse::Envelope(envelope)) => {
+                self.fetch_remaining_pages_in_parallel(&base, envelope, groups).await
+            }
+            // Vault answered, but with the historical root array — it does not implement
+            // `include_total` yet simply ignored the parameter. Page one is still perfectly good
+            // data, so it is kept and the sequential walk resumes from page two rather than
+            // re-requesting offset 0.
+            Ok(IpsResponse::Legacy(first_page)) => {
+                self.fetch_sequentially(&base, groups, first_page).await
+            }
+            // The sharper legacy case, and the one that actually occurs in the field: Vault's
+            // `QueryFilters` is `deny_unknown_fields`, so a deployment older than the
+            // `include_total` change rejects the *request* with `400` rather than ignoring the
+            // parameter. Retry once without the flag — an exporter upgraded ahead of its vault must
+            // keep syncing, not fail every cycle until the vault catches up.
+            Err(VaultError::Status(status)) if status == reqwest::StatusCode::BAD_REQUEST => {
+                tracing::debug!(
+                    "simply_ip_vault rejected `include_total` ({status}) — it predates that \
+                     parameter. Falling back to sequential paging for groups {groups:?}."
+                );
+                self.fetch_sequentially(&base, groups, Vec::new()).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Fetches pages `2..=total_pages` concurrently, capped at [`MAX_CONCURRENT_PAGES`] in flight,
+    /// and merges them onto the already-fetched first page.
+    ///
+    /// Every page reuses `base`, so `groups`/`since`/`include_deleted` are identical across the
+    /// whole set — a delta that widened or narrowed partway through the walk would be worse than a
+    /// slow one. `include_total` is *not* repeated on the follow-up pages: their count is already
+    /// known, and asking Vault to recompute a `COUNT(*)` per page would pay for the same number
+    /// four times over.
+    ///
+    /// Ordering is not preserved, and deliberately so: `buffer_unordered` yields pages as they
+    /// complete. Nothing downstream depends on record order — `cache::IpCache` keys by address and
+    /// `ipfilter::filter_and_aggregate` sorts — so paying for ordering here would buy nothing.
+    async fn fetch_remaining_pages_in_parallel(
+        &self,
+        base: &str,
+        envelope: IpRecordsEnvelope,
+        groups: &str,
+    ) -> Result<Vec<VaultApiRecord>, VaultError> {
+        let mut all = envelope.data;
+
+        // `total_pages` is 0 when there is nothing to page through and 1 when it all fit in page
+        // one; both mean "no follow-up requests", which this range expresses without a branch.
+        let offsets: Vec<u64> =
+            (1..envelope.total_pages).map(|page| page * self.page_size).collect();
+        if offsets.is_empty() {
+            return Ok(all);
+        }
+
+        if offsets.len() + 1 > MAX_PAGES as usize {
+            tracing::error!(
+                "simply_ip_vault reports {} pages for groups {groups:?}, beyond the {MAX_PAGES}-page \
+                 ceiling. Refusing to fetch them all; the result IS truncated.",
+                envelope.total_pages
+            );
+        }
+        let offsets: Vec<u64> = offsets.into_iter().take(MAX_PAGES as usize - 1).collect();
+
+        let pages: Vec<Vec<VaultApiRecord>> = stream::iter(offsets)
+            .map(|offset| async move {
+                self.signed_get::<Vec<VaultApiRecord>>(&format!(
+                    "{base}&limit={}&offset={offset}",
+                    self.page_size
+                ))
+                .await
+            })
+            .buffer_unordered(MAX_CONCURRENT_PAGES)
+            .try_collect()
+            .await?;
+
+        all.extend(pages.into_iter().flatten());
+        Ok(all)
+    }
+
+    /// The original offset walk, kept as the fallback for any Vault that cannot report a page
+    /// count. Terminates on the first short page — the only signal available without a total.
+    ///
+    /// `already_fetched` carries page one when the caller already has it (the "Vault ignored
+    /// `include_total`" path), so the walk resumes at page two instead of re-requesting offset 0.
+    /// An empty vector starts from the beginning, which is what the `400`-rejection path wants.
+    async fn fetch_sequentially(
+        &self,
+        base: &str,
+        groups: &str,
+        already_fetched: Vec<VaultApiRecord>,
+    ) -> Result<Vec<VaultApiRecord>, VaultError> {
+        let resume_at_second_page = already_fetched.len() as u64 == self.page_size;
+        let mut all = already_fetched;
+
+        // A short (or empty) first page already ended the walk before it began.
+        if !all.is_empty() && !resume_at_second_page {
+            return Ok(all);
+        }
+
+        let mut offset: u64 = if resume_at_second_page { self.page_size } else { 0 };
+        let mut pages: u32 = if resume_at_second_page { 1 } else { 0 };
 
         loop {
             let page: Vec<VaultApiRecord> = self
@@ -165,7 +308,7 @@ impl VaultClient {
             pages += 1;
 
             // A short page is Vault saying "that was the last of them" — the only correct
-            // termination signal, since this endpoint reports no total count.
+            // termination signal, since this response shape reports no total count.
             if page_len < self.page_size {
                 break;
             }
@@ -416,6 +559,339 @@ mod tests {
         assert!(queries[0].contains("offset=0"));
         assert!(queries[1].contains("offset=50"));
         assert!(queries[2].contains("offset=100"));
+    }
+
+    // ── include_total envelope: bounded parallel paging ───────────────────────
+
+    /// How a mock Vault should answer `GET /api/ips`, so one harness can model every deployment
+    /// this client has to survive.
+    #[derive(Clone, Copy, PartialEq)]
+    enum VaultFlavour {
+        /// Current Vault: honours `include_total=true` with the `{data, …, total_pages}` envelope.
+        Envelope,
+        /// A Vault that accepts the parameter but still answers with the historical root array.
+        IgnoresIncludeTotal,
+        /// Real pre-`b8bd281` Vault: `QueryFilters` is `deny_unknown_fields`, so `include_total`
+        /// is an *unknown field* and the request is refused with `400` before any data is read.
+        RejectsIncludeTotal,
+    }
+
+    /// Boots a mock Vault that paginates exactly as the real one does — honouring `limit`/`offset`,
+    /// defaulting to `limit=50`, and (per `flavour`) implementing `include_total` the way a current,
+    /// an indifferent, or an outdated deployment would.
+    ///
+    /// Records are `51.<i/256>.<i%256>.1`: lone hosts in distinct /24s, so a count is a count.
+    /// Every request's query string is recorded, letting a test assert *how* the fetch was
+    /// performed — page count, concurrency bound, and that the delta filters rode along.
+    async fn spawn_flavoured_mock_vault(
+        total: usize,
+        flavour: VaultFlavour,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+        use axum::{
+            Router, extract::RawQuery, http::StatusCode, response::IntoResponse, routing::get,
+        };
+
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let seen_for_handler = std::sync::Arc::clone(&seen);
+
+        let app = Router::new().route(
+            "/api/ips",
+            get(move |RawQuery(query): RawQuery| {
+                let seen = std::sync::Arc::clone(&seen_for_handler);
+                async move {
+                    let query = query.unwrap_or_default();
+                    if let Ok(mut guard) = seen.lock() {
+                        guard.push(query.clone());
+                    }
+
+                    let has = |name: &str| query.split('&').any(|kv| kv == format!("{name}=true"));
+                    let param = |name: &str| -> Option<u64> {
+                        query
+                            .split('&')
+                            .find_map(|kv| kv.strip_prefix(&format!("{name}=")))
+                            .and_then(|v| v.parse().ok())
+                    };
+
+                    let wants_total = has("include_total");
+                    if wants_total && flavour == VaultFlavour::RejectsIncludeTotal {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            axum::Json(serde_json::json!({
+                                "error": "Failed to deserialize query string: unknown field `include_total`"
+                            })),
+                        )
+                            .into_response();
+                    }
+
+                    let limit = param("limit").unwrap_or(50) as usize;
+                    let offset = param("offset").unwrap_or(0) as usize;
+                    let page: Vec<serde_json::Value> = (offset..total.min(offset + limit))
+                        .map(|i| {
+                            serde_json::json!({
+                                "target_address": format!("51.{}.{}.1", i / 256, i % 256),
+                                "updated_at": "2026-08-11T10:00:00",
+                                "is_deleted": false,
+                            })
+                        })
+                        .collect();
+
+                    if wants_total && flavour == VaultFlavour::Envelope {
+                        let total_pages =
+                            if limit == 0 { 0 } else { total.div_ceil(limit) } as u64;
+                        return axum::Json(serde_json::json!({
+                            "data": page,
+                            "total": total,
+                            "limit": limit,
+                            "offset": offset,
+                            "total_pages": total_pages,
+                        }))
+                        .into_response();
+                    }
+
+                    axum::Json(serde_json::Value::Array(page)).into_response()
+                }
+            }),
+        );
+
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback bind always succeeds");
+        let addr = listener.local_addr().expect("a bound listener has a local address");
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), seen, handle)
+    }
+
+    fn offsets_requested(queries: &[String]) -> Vec<u64> {
+        let mut offsets: Vec<u64> = queries
+            .iter()
+            .filter_map(|q| {
+                q.split('&').find_map(|kv| kv.strip_prefix("offset=")).and_then(|v| v.parse().ok())
+            })
+            .collect();
+        offsets.sort_unstable();
+        offsets
+    }
+
+    /// The headline scenario: 3,214 records over 4 pages at `limit=1000` (1000+1000+1000+214).
+    /// One probing request learns `total_pages = 4`, then pages 2–4 are fetched concurrently, and
+    /// all 3,214 distinct records arrive with no duplicates and nothing lost at a page boundary.
+    #[tokio::test]
+    async fn an_envelope_fetch_pulls_3214_records_across_four_pages_in_parallel() {
+        let (url, seen, _server) =
+            spawn_flavoured_mock_vault(3_214, VaultFlavour::Envelope).await;
+        let client = client_at(url); // real PAGE_SIZE = 1000
+
+        let records = client.fetch_ips("g1", None).await.expect("the parallel fetch succeeds");
+
+        assert_eq!(records.len(), 3_214, "every record across all four pages must arrive");
+        let distinct: std::collections::HashSet<_> =
+            records.iter().map(|r| r.target_address.clone()).collect();
+        assert_eq!(distinct.len(), 3_214, "pages must not overlap, duplicate, or drop a boundary row");
+
+        let queries = seen.lock().expect("not poisoned").clone();
+        assert_eq!(queries.len(), 4, "exactly four requests: one probe plus three follow-up pages");
+        assert_eq!(
+            offsets_requested(&queries),
+            vec![0, 1_000, 2_000, 3_000],
+            "each page requested exactly once, at the offsets total_pages implies"
+        );
+
+        // Only the probe pays for Vault's COUNT(*); re-requesting it per page would compute the
+        // same total four times for no benefit.
+        let with_total = queries.iter().filter(|q| q.contains("include_total=true")).count();
+        assert_eq!(with_total, 1, "include_total belongs on the probe alone");
+    }
+
+    /// A dataset that fits in one page must cost exactly one request — `total_pages = 1` means
+    /// there is nothing to parallelise, and the probe already returned the data.
+    #[tokio::test]
+    async fn a_single_page_envelope_costs_one_request_and_spawns_no_parallel_work() {
+        let (url, seen, _server) = spawn_flavoured_mock_vault(10, VaultFlavour::Envelope).await;
+        let client = client_at(url);
+
+        let records = client.fetch_ips("g1", None).await.expect("fetch succeeds");
+
+        assert_eq!(records.len(), 10);
+        assert_eq!(seen.lock().expect("not poisoned").len(), 1);
+    }
+
+    /// `total_pages` is `0` (not `1`) when there is nothing to page through — Vault's documented
+    /// edge case, and the one a naive `1..total_pages` loop would mishandle by requesting a page
+    /// that does not exist.
+    #[tokio::test]
+    async fn an_empty_envelope_reporting_zero_pages_issues_no_follow_up_requests() {
+        let (url, seen, _server) = spawn_flavoured_mock_vault(0, VaultFlavour::Envelope).await;
+        let client = client_at(url);
+
+        let records = client.fetch_ips("g1", None).await.expect("fetch succeeds");
+
+        assert!(records.is_empty());
+        assert_eq!(seen.lock().expect("not poisoned").len(), 1, "nothing to follow up on");
+    }
+
+    /// Concurrency must stay bounded: with 12 pages outstanding, no more than
+    /// [`MAX_CONCURRENT_PAGES`] requests may be in flight at once. Measured by having the mock
+    /// track its own live-request high-water mark rather than by inspecting the stream.
+    #[tokio::test]
+    async fn parallel_paging_never_exceeds_the_concurrency_cap() {
+        use axum::{Router, extract::RawQuery, routing::get};
+
+        let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (in_flight_h, peak_h) =
+            (std::sync::Arc::clone(&in_flight), std::sync::Arc::clone(&peak));
+
+        let total = 12_000usize; // 12 pages at PAGE_SIZE 1000
+        let app = Router::new().route(
+            "/api/ips",
+            get(move |RawQuery(query): RawQuery| {
+                let (in_flight, peak) =
+                    (std::sync::Arc::clone(&in_flight_h), std::sync::Arc::clone(&peak_h));
+                async move {
+                    let now = in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                    // Held open long enough that genuinely concurrent requests overlap here; without
+                    // the pause every request could complete before the next began and the peak
+                    // would read 1 no matter how the client behaved.
+                    tokio::time::sleep(Duration::from_millis(60)).await;
+
+                    let query = query.unwrap_or_default();
+                    let param = |name: &str| -> Option<u64> {
+                        query
+                            .split('&')
+                            .find_map(|kv| kv.strip_prefix(&format!("{name}=")))
+                            .and_then(|v| v.parse().ok())
+                    };
+                    let limit = param("limit").unwrap_or(50) as usize;
+                    let offset = param("offset").unwrap_or(0) as usize;
+                    let page: Vec<serde_json::Value> = (offset..total.min(offset + limit))
+                        .map(|i| {
+                            serde_json::json!({
+                                "target_address": format!("51.{}.{}.1", i / 256, i % 256),
+                                "updated_at": "2026-08-11T10:00:00",
+                                "is_deleted": false,
+                            })
+                        })
+                        .collect();
+                    in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+
+                    if query.contains("include_total=true") {
+                        return axum::Json(serde_json::json!({
+                            "data": page, "total": total, "limit": limit,
+                            "offset": offset, "total_pages": total.div_ceil(limit),
+                        }));
+                    }
+                    axum::Json(serde_json::Value::Array(page))
+                }
+            }),
+        );
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback bind always succeeds");
+        let addr = listener.local_addr().expect("a bound listener has a local address");
+        let _server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = client_at(format!("http://{addr}"));
+        let records = client.fetch_ips("g1", None).await.expect("fetch succeeds");
+
+        assert_eq!(records.len(), 12_000);
+        let observed = peak.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            observed > 1,
+            "pages must actually overlap — a peak of 1 would mean the fetch ran sequentially"
+        );
+        assert!(
+            observed <= MAX_CONCURRENT_PAGES,
+            "at most {MAX_CONCURRENT_PAGES} requests may be in flight, saw {observed}"
+        );
+    }
+
+    /// Delta-sync filters must ride along on every parallel page. Dropping `since` or
+    /// `include_deleted` on page two would silently widen the delta partway through the fetch —
+    /// and unlike the sequential walk, these requests are built independently, so it is a genuinely
+    /// separate risk worth pinning.
+    #[tokio::test]
+    async fn parallel_pages_each_carry_since_include_deleted_and_groups() {
+        let (url, seen, _server) =
+            spawn_flavoured_mock_vault(2_500, VaultFlavour::Envelope).await;
+        let client = client_at(url);
+        let since = chrono::DateTime::from_timestamp(1_700_000_000, 0)
+            .expect("a valid timestamp")
+            .naive_utc();
+
+        let records = client.fetch_ips("g1,g2", Some(since)).await.expect("fetch succeeds");
+        assert_eq!(records.len(), 2_500);
+
+        let queries = seen.lock().expect("not poisoned").clone();
+        assert_eq!(queries.len(), 3, "one probe plus two follow-up pages");
+        for query in &queries {
+            assert!(query.contains("since=1700000000"), "every page keeps the cutoff: {query}");
+            assert!(query.contains("include_deleted=true"), "every page keeps the flag: {query}");
+            assert!(query.contains("groups=g1,g2"), "every page keeps the group scope: {query}");
+        }
+    }
+
+    // ── Legacy tolerance: two distinct shapes of "older Vault" ────────────────
+
+    /// The failure mode that actually occurs in the field. Vault's `QueryFilters` is
+    /// `deny_unknown_fields`, so a deployment predating `include_total` refuses the *request* with
+    /// `400`. An exporter upgraded ahead of its vault must keep syncing, not fail every cycle — so
+    /// it retries without the flag and completes the fetch sequentially.
+    #[tokio::test]
+    async fn a_vault_that_rejects_include_total_with_400_falls_back_to_sequential_paging() {
+        let (url, seen, _server) =
+            spawn_flavoured_mock_vault(120, VaultFlavour::RejectsIncludeTotal).await;
+        let client = client_at(url).with_page_size(50);
+
+        let records = client.fetch_ips("g1", None).await.expect("the fallback must succeed");
+
+        assert_eq!(records.len(), 120, "a 400 on the probe must not lose any data");
+        let queries = seen.lock().expect("not poisoned").clone();
+        // The refused probe, then a clean sequential walk: 50, 50, 20.
+        assert_eq!(queries.len(), 4);
+        assert!(queries[0].contains("include_total=true"), "the probe is attempted once");
+        assert!(
+            queries[1..].iter().all(|q| !q.contains("include_total")),
+            "and never repeated after it was refused"
+        );
+        assert_eq!(offsets_requested(&queries), vec![0, 0, 50, 100]);
+    }
+
+    /// The gentler legacy shape: Vault accepts the parameter but still answers with the historical
+    /// root array. Page one is real data, so it is kept and the walk resumes at page two rather
+    /// than re-requesting offset 0 — which would both waste a round-trip and duplicate records.
+    #[tokio::test]
+    async fn a_vault_that_ignores_include_total_reuses_page_one_and_pages_on_sequentially() {
+        let (url, seen, _server) =
+            spawn_flavoured_mock_vault(120, VaultFlavour::IgnoresIncludeTotal).await;
+        let client = client_at(url).with_page_size(50);
+
+        let records = client.fetch_ips("g1", None).await.expect("the fallback must succeed");
+
+        assert_eq!(records.len(), 120);
+        let distinct: std::collections::HashSet<_> =
+            records.iter().map(|r| r.target_address.clone()).collect();
+        assert_eq!(distinct.len(), 120, "page one must not be fetched twice");
+
+        let queries = seen.lock().expect("not poisoned").clone();
+        assert_eq!(queries.len(), 3, "offset 0 is not re-requested");
+        assert_eq!(offsets_requested(&queries), vec![0, 50, 100]);
+    }
+
+    /// A legacy first page shorter than the page size ends the fetch immediately — there is no
+    /// second page to ask for, and asking anyway would be a wasted round-trip on every small sync.
+    #[tokio::test]
+    async fn a_short_legacy_first_page_completes_without_a_second_request() {
+        let (url, seen, _server) =
+            spawn_flavoured_mock_vault(10, VaultFlavour::IgnoresIncludeTotal).await;
+        let client = client_at(url).with_page_size(50);
+
+        let records = client.fetch_ips("g1", None).await.expect("fetch succeeds");
+
+        assert_eq!(records.len(), 10);
+        assert_eq!(seen.lock().expect("not poisoned").len(), 1);
     }
 
     // ── The Vault error spectrum: HTTP-status mapping and connection failure ───
