@@ -72,6 +72,10 @@ EXPORTER_URL="http://127.0.0.1:$EXPORTER_PORT"
 # 3214 to span exactly four pages at VaultClient's PAGE_SIZE of 1000 (1000+1000+1000+214) — so the
 # bounded-parallel envelope path is exercised at its real page size, not a shrunken test one.
 PAGINATION_RECORD_COUNT=3214
+# 500 IPv6 records seeded into the same group, so the large-scale fixture exercises both
+# families through one multi-page parallel fetch rather than proving IPv4 only.
+PAGINATION_IPV6_COUNT=500
+PAGINATION_TOTAL_COUNT=$((PAGINATION_RECORD_COUNT + PAGINATION_IPV6_COUNT))
 PAGINATION_PAGE_SIZE=1000
 PAGINATION_EXPECTED_PAGES=4
 
@@ -463,6 +467,34 @@ api_call "$VAULT_URL" POST "/api/records/batch" "$VAULT_MASTER_KEY" "$PAGINATION
 check "200" "$PAGINATION_RECORD_COUNT records are batch-seeded into pfBlocker_Pagination_Test"
 check_jq ".created" "$PAGINATION_RECORD_COUNT" "Vault reports all $PAGINATION_RECORD_COUNT records created"
 
+# IPv6 half of the fixture, into the same group so one feed spans both families.
+#
+# `2a01:4f8::/32` is global unicast, deliberately NOT the `2001:db8::/32` documentation range:
+# that range is on simply_ip_exporter's own bogon list (src/ipfilter.rs), so a fixture built
+# from it would vanish from any feed with filter_bogons enabled and would prove IPv6 works only
+# where filtering happens to be off. Consecutive addresses differ in the third hextet, so —
+# exactly like the IPv4 half — none can be aggregated away and the line count stays the record
+# count.
+log "Seeding $PAGINATION_IPV6_COUNT IPv6 records into the same group (total now $PAGINATION_TOTAL_COUNT)..."
+PAGINATION_V6_BATCH=$(python3 - "$PAGINATION_IPV6_COUNT" <<'PYV6'
+import json, sys
+n = int(sys.argv[1])
+records = [
+    {"target_address": "2a01:4f8:%x::1" % (i + 1), "cause": "pagination fixture (ipv6)"}
+    for i in range(n)
+]
+print(json.dumps({
+    "group_name": "pfBlocker_Pagination_Test",
+    "mode": "upsert",
+    "records": records,
+    "skip_webhooks": True,
+}))
+PYV6
+)
+api_call "$VAULT_URL" POST "/api/records/batch" "$VAULT_MASTER_KEY" "$PAGINATION_V6_BATCH"
+check "200" "$PAGINATION_IPV6_COUNT IPv6 records are batch-seeded into pfBlocker_Pagination_Test"
+check_jq ".created" "$PAGINATION_IPV6_COUNT" "Vault reports all $PAGINATION_IPV6_COUNT IPv6 records created"
+
 # Proves the premise rather than assuming it: Vault really does truncate to 50 when no `limit` is
 # sent. If Vault ever changes that default, this check fails loudly and §4b's guard becomes moot —
 # far better than the guard quietly testing nothing.
@@ -476,7 +508,7 @@ check_jq "length" "50" "Vault truncates to its default limit=50 when no limit is
 # itself needs its own check.
 api_call "$VAULT_URL" GET "/api/ips?groups=pfBlocker_Pagination_Test&include_total=true&limit=$PAGINATION_PAGE_SIZE" "$VAULT_MASTER_KEY"
 check "200" "Vault answers include_total=true"
-check_jq ".total" "$PAGINATION_RECORD_COUNT" "the envelope reports total=$PAGINATION_RECORD_COUNT across all pages"
+check_jq ".total" "$PAGINATION_TOTAL_COUNT" "the envelope reports total=$PAGINATION_TOTAL_COUNT (IPv4 + IPv6) across all pages"
 check_jq ".total_pages" "$PAGINATION_EXPECTED_PAGES" "the envelope reports total_pages=$PAGINATION_EXPECTED_PAGES at limit=$PAGINATION_PAGE_SIZE"
 check_jq ".data | length" "$PAGINATION_PAGE_SIZE" "page one carries exactly $PAGINATION_PAGE_SIZE records under .data"
 
@@ -833,12 +865,12 @@ PAGINATION_FETCH_START=$(date +%s%3N)
 raw_call GET "$EXPORTER_URL$PAGINATION_FEED_PATH" -H "X-Forwarded-For: 198.51.100.51"
 check "200" "the large-dataset feed is served"
 PAGINATION_FETCH_MS=$(( $(date +%s%3N) - PAGINATION_FETCH_START ))
-log "Feed of $PAGINATION_RECORD_COUNT records served in ${PAGINATION_FETCH_MS}ms (served from the in-memory cache, so this measures serving, not syncing)."
+log "Feed of $PAGINATION_TOTAL_COUNT records ($PAGINATION_RECORD_COUNT IPv4 + $PAGINATION_IPV6_COUNT IPv6) served in ${PAGINATION_FETCH_MS}ms (served from the in-memory cache, so this measures serving, not syncing)."
 
 
 PAGINATION_LINE_COUNT=$(echo "$RESP_BODY" | grep -c . || true)
-check_local "$PAGINATION_LINE_COUNT" "$PAGINATION_RECORD_COUNT" \
-    "all $PAGINATION_RECORD_COUNT records survive the sync — not truncated to Vault's 50-record default page"
+check_local "$PAGINATION_LINE_COUNT" "$PAGINATION_TOTAL_COUNT" \
+    "all $PAGINATION_TOTAL_COUNT records (IPv4 + IPv6) survive the sync — not truncated to Vault's 50-record default page"
 
 # Spot-checks at and beyond the old truncation boundary. A count alone could in principle be met by
 # the wrong 250 records; these name specific addresses that only a complete multi-page walk reaches.
@@ -858,10 +890,32 @@ check_contains "$RESP_BODY" "51.11.183.1/32" "record 3000 — the last of parall
 check_contains "$RESP_BODY" "51.11.184.1/32" "record 3001 — the first of parallel page 4 (the short 214-record tail)"
 check_contains "$RESP_BODY" "51.12.141.1/32" "record 3214 — the very last, so the short final page arrived complete"
 
+# ── IPv6 ─────────────────────────────────────────────────────────────────────
+# The same multi-page parallel fetch must carry IPv6 intact. These are counted and spot-checked
+# separately from IPv4 because a family-specific parsing or serialization fault would otherwise be
+# invisible: the totals above would still balance if IPv6 records were silently dropped and IPv4
+# over-counted, and vice versa.
+PAGINATION_V6_LINES=$(echo "$RESP_BODY" | grep -c ":" || true)
+check_local "$PAGINATION_V6_LINES" "$PAGINATION_IPV6_COUNT" "exactly $PAGINATION_IPV6_COUNT IPv6 lines in the feed — none dropped in pagination or aggregation"
+PAGINATION_V4_LINES=$(echo "$RESP_BODY" | grep -c "^51\\." || true)
+check_local "$PAGINATION_V4_LINES" "$PAGINATION_RECORD_COUNT" "and all $PAGINATION_RECORD_COUNT IPv4 lines alongside them"
+
+# Spot-checks spread across the IPv6 sequence, so a truncation at any page boundary is named rather
+# than only showing up as a wrong count. Emitted in canonical /128 form by ipnet.
+check_contains "$RESP_BODY" "2a01:4f8:1::1/128" "the first IPv6 record is present"
+check_contains "$RESP_BODY" "2a01:4f8:64::1/128" "IPv6 record 100 is present"
+check_contains "$RESP_BODY" "2a01:4f8:fa::1/128" "IPv6 record 250 is present"
+check_contains "$RESP_BODY" "2a01:4f8:12c::1/128" "IPv6 record 300 is present"
+check_contains "$RESP_BODY" "2a01:4f8:1f4::1/128" "the 500th and final IPv6 record is present"
+
+# Serialization sanity: every IPv6 line must be a well-formed /128, not a corrupted or bare address.
+PAGINATION_V6_MALFORMED=$(echo "$RESP_BODY" | grep ":" | grep -cv "^2a01:4f8:[0-9a-f]\\{1,3\\}::1/128$" || true)
+check_local "$PAGINATION_V6_MALFORMED" "0" "every IPv6 line is a well-formed canonical /128 — none corrupted in transit"
+
 # Duplicates would inflate the count while every spot-check still passed, so the line count above is
 # only meaningful alongside this: no address may appear twice after a concurrent merge.
 PAGINATION_DISTINCT=$(echo "$RESP_BODY" | sort -u | grep -c . || true)
-check_local "$PAGINATION_DISTINCT" "$PAGINATION_RECORD_COUNT" "all $PAGINATION_RECORD_COUNT lines are distinct — concurrent pages merged without duplicating a record"
+check_local "$PAGINATION_DISTINCT" "$PAGINATION_TOTAL_COUNT" "all $PAGINATION_TOTAL_COUNT lines are distinct — concurrent pages merged without duplicating a record"
 
 # Concurrency must not have produced errors of its own, and no page may have been refused.
 if grep -qE "403 Forbidden|panicked|concurrency" "$EXPORTER_LOG"; then

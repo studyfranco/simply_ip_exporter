@@ -662,6 +662,112 @@ mod tests {
         (format!("http://{addr}"), seen, handle)
     }
 
+    /// The fixture address for record `i` in a mixed-protocol dataset: every 7th record is IPv6,
+    /// the rest IPv4.
+    ///
+    /// `2a01:4f8::/32` is **global unicast**, deliberately not the `2001:db8::/32` documentation
+    /// range the brief offered as an alternative — that range is on this crate's own bogon list
+    /// (`ipfilter::BOGONS`), so a fixture built from it would be stripped by any feed with
+    /// `filter_bogons` enabled and would prove IPv6 works only where filtering is off.
+    ///
+    /// Neither family can aggregate: IPv4 records are lone hosts in distinct /24s, and consecutive
+    /// IPv6 records differ in the third hextet, so `ipnet::IpNet::aggregate()` can merge nothing and
+    /// a count stays a count.
+    fn mixed_fixture_address(i: usize) -> String {
+        if i.is_multiple_of(7) {
+            format!("2a01:4f8:{:x}::1", i / 7 + 1)
+        } else {
+            format!("51.{}.{}.1", i / 256, i % 256)
+        }
+    }
+
+    /// A paginating mock whose dataset mixes IPv4 and IPv6, so the envelope/parallel path is
+    /// exercised against both families interleaved across every page rather than one family in a
+    /// contiguous block at the end.
+    async fn spawn_mixed_protocol_mock_vault(
+        total: usize,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{Router, extract::RawQuery, routing::get};
+
+        let app = Router::new().route(
+            "/api/ips",
+            get(move |RawQuery(query): RawQuery| async move {
+                let query = query.unwrap_or_default();
+                let param = |name: &str| -> Option<u64> {
+                    query
+                        .split('&')
+                        .find_map(|kv| kv.strip_prefix(&format!("{name}=")))
+                        .and_then(|v| v.parse().ok())
+                };
+                let limit = param("limit").unwrap_or(50) as usize;
+                let offset = param("offset").unwrap_or(0) as usize;
+                let page: Vec<serde_json::Value> = (offset..total.min(offset + limit))
+                    .map(|i| {
+                        serde_json::json!({
+                            "target_address": mixed_fixture_address(i),
+                            "updated_at": "2026-08-11T10:00:00",
+                            "is_deleted": false,
+                        })
+                    })
+                    .collect();
+
+                if query.contains("include_total=true") {
+                    let total_pages = if limit == 0 { 0 } else { total.div_ceil(limit) };
+                    return axum::Json(serde_json::json!({
+                        "data": page, "total": total, "limit": limit,
+                        "offset": offset, "total_pages": total_pages,
+                    }));
+                }
+                axum::Json(serde_json::Value::Array(page))
+            }),
+        );
+
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback bind always succeeds");
+        let addr = listener.local_addr().expect("a bound listener has a local address");
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    /// IPv6 must survive the whole multi-page parallel fetch exactly as IPv4 does. 3,500 records
+    /// over four pages, of which 500 are IPv6 interleaved every 7th record — so every page carries
+    /// both families and a family-specific parsing or merge fault cannot hide in a page that
+    /// happens to be homogeneous.
+    #[tokio::test]
+    async fn a_mixed_ipv4_and_ipv6_dataset_survives_the_parallel_multi_page_fetch() {
+        let (url, _server) = spawn_mixed_protocol_mock_vault(3_500).await;
+        let client = client_at(url); // real PAGE_SIZE = 1000 → 4 pages
+
+        let records = client.fetch_ips("g1", None).await.expect("a mixed-family fetch succeeds");
+
+        assert_eq!(records.len(), 3_500, "no record of either family may be dropped");
+
+        let addresses: std::collections::HashSet<String> =
+            records.iter().map(|r| r.target_address.clone()).collect();
+        assert_eq!(addresses.len(), 3_500, "no duplicates across concurrently-merged pages");
+
+        let (v6, v4): (Vec<&String>, Vec<&String>) =
+            addresses.iter().partition(|a| a.contains(':'));
+        assert_eq!(v6.len(), 500, "exactly the 500 seeded IPv6 records arrived");
+        assert_eq!(v4.len(), 3_000, "and all 3,000 IPv4 records alongside them");
+
+        // Every IPv6 record must parse back into a network — a corrupted or truncated address
+        // would still count correctly above while being useless in a feed.
+        for address in &v6 {
+            let parsed = crate::cache::parse_target_address(address)
+                .unwrap_or_else(|| panic!("IPv6 fixture {address:?} must parse as a network"));
+            assert!(parsed.addr().is_ipv6(), "{address:?} must round-trip as IPv6, got {parsed}");
+        }
+
+        // Spot-check the boundaries of the IPv6 sequence: the first (record 0) and the last
+        // (record 3493, the 500th multiple of 7 below 3500) both land on different pages, so their
+        // presence proves IPv6 crossed page seams rather than clustering in page one.
+        assert!(addresses.contains("2a01:4f8:1::1"), "the first IPv6 record, from page 1");
+        assert!(addresses.contains("2a01:4f8:1f4::1"), "the 500th IPv6 record, from the final page");
+    }
+
     fn offsets_requested(queries: &[String]) -> Vec<u64> {
         let mut offsets: Vec<u64> = queries
             .iter()

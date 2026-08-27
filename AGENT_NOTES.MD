@@ -1,5 +1,52 @@
 # Agent Worklog — `simply_ip_exporter`
 
+## 2026-08-26 (session 23) — IPv6 across the large-scale pagination fixture
+
+The 3,214-record scale fixture proved multi-page parallel paging for IPv4 only. Both the unit mock
+and the live e2e now carry 500 IPv6 records alongside it, so the envelope/parallel path, the cache,
+`ipnet` aggregation and feed serialization are all exercised against both families.
+
+### `2a01:4f8::/32`, not `2001:db8::/32`
+
+The brief offered the documentation range as an option. Rejected: `2001:db8::/32` is on this
+crate's **own bogon list** (`ipfilter::BOGONS`), so a fixture built from it would be stripped by any
+feed with `filter_bogons` enabled — the test would pass while proving IPv6 works only where
+filtering happens to be off, and would silently stop testing anything the moment a filter was turned
+on. `2a01:4f8::/32` is global unicast and survives every filter, so the assertions mean what they
+appear to mean. (The documentation range's *removal* under `filter_bogons` is already covered by
+`ipfilter`'s own unit tests, so nothing is lost.)
+
+Addresses are `2a01:4f8:<hex>::1`, consecutive entries differing in the third hextet. As with the
+IPv4 half (lone hosts in distinct /24s) nothing can aggregate, so a line count stays a record count
+— which is what makes the exact-count assertions trustworthy rather than approximate.
+
+### Counting both families separately is the point
+
+`fetch_ips` returning the right *total* is not evidence that IPv6 survived: dropping IPv6 records
+while over-counting IPv4 would balance identically. So both the unit test and §4b partition the
+result and assert each family's count on its own (500 IPv6 / 3,214 IPv4 live; 500 / 3,000 in the
+unit mock), then spot-check IPv6 at five points across the sequence so a truncation at any page
+boundary names an address rather than only skewing a number.
+
+In the unit mock IPv6 is interleaved every 7th record rather than appended as a block, so every page
+carries both families — a family-specific parse or merge fault cannot hide in a page that happens to
+be homogeneous. Each IPv6 address is additionally round-tripped through
+`cache::parse_target_address` and asserted `is_ipv6()`, since a corrupted address would still count
+correctly while being useless in a feed. The live feed adds a serialization check: every IPv6 line
+must match a canonical `/128` form, catching corruption in transit that a `grep -c ":"` would not.
+
+### Verification
+
+- 1 new `vault_client` unit test over a 3,500-record mixed dataset (500 IPv6 + 3,000 IPv4) across
+  four pages at the production `PAGE_SIZE`.
+- e2e §4b fixture grown 3,214 → **3,714** records; the live `include_total` envelope now asserts
+  `total=3714`, and the feed is checked for 500 IPv6 lines, 3,214 IPv4 lines, five IPv6 spot-checks,
+  and zero malformed IPv6 lines. Serve time 2,664 ms for 3,714 records.
+- One clippy fix along the way: `i % 7 == 0` tripped `manual_implementation_of_is_multiple_of`,
+  replaced with `i.is_multiple_of(7)`.
+- Gates: `cargo check`/`clippy -D warnings` clean; `cargo test` 142 + 4 + 43 + 13 = 202 passed;
+  `verify_convergence.sh` all pass; `test_e2e.sh` **213/213**.
+
 ## 2026-08-26 (session 22) — Startup sync before the listener opens
 
 `main.rs` now awaits one full sync pass (`sync::run_boot_sync`) after the Master pin and **before**
