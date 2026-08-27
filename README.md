@@ -262,14 +262,14 @@ orchestrators, load balancers) cannot compute an HMAC signature.
 ```sh
 cargo check --all-targets
 cargo clippy --all-targets -- -D warnings
-cargo test                     # 118 unit + 4 main.rs unit + 39 integration + 13 source-hygiene tests
+cargo test                     # 123 unit + 4 main.rs unit + 40 integration + 13 source-hygiene tests
 ./scripts/verify_convergence.sh  # source hygiene (raw SQL, unwrap/expect, frontend syntax/DOM refs) + clippy -D warnings + cargo test, one gate
 ./scripts/test_e2e.sh          # full live E2E against a real simply_ip_vault + simply_ip_exporter pair
 ```
 
 `scripts/test_e2e.sh` builds and boots both services against throwaway SQLite databases with
 deterministic bootstrap keys, provisions Vault, configures an exporter endpoint, and asserts —
-across 110 checks in 14 sections — the feed pipeline (aggregation, filtering, ETag/304, rate
+across 141 checks in 15 sections — the feed pipeline (aggregation, filtering, ETag/304, rate
 limiting), Vault soft-delete propagation via differential sync, hot-reload of endpoint config with
 no restart, `bound_ips` client-IP restriction, a full graceful-restart-with-encryption cycle
 (Master key, a Daughter key's encrypted secret, and the endpoint row all surviving a `SIGTERM` and

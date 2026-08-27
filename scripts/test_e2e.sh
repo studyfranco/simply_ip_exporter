@@ -67,6 +67,10 @@ EXPORTER_URL="http://127.0.0.1:$EXPORTER_PORT"
 # instances. Both services require INITIAL_MASTER_KEY to be exactly 64 hex characters (the same
 # shape each generates for itself), so these are hex; the signing secrets have no such constraint.
 # Distinct per service so a copy-paste mistake between the two is loud, not silent.
+# How many records §2 seeds into pfBlocker_Pagination_Test, and §4b expects to survive intact.
+# Must stay > Vault's default page (50) for the guard to mean anything.
+PAGINATION_RECORD_COUNT=250
+
 VAULT_MASTER_KEY="a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
 VAULT_MASTER_SECRET="e2e_vault_master_signing_secret_for_testing"
 EXPORTER_MASTER_KEY="b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"
@@ -410,6 +414,50 @@ SECONDARY_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
 api_call "$VAULT_URL" POST "/api/ban" "$VAULT_MASTER_KEY" '{"target_address":"9.9.9.0/24","group_name":"pfBlocker_Secondary_Test","cause":"cross-group aggregation test"}'
 check "200" "9.9.9.0/24 added to the secondary group"
 
+# ── Pagination fixture (§4b) ────────────────────────────────────────────────
+# simply_ip_vault's GET /api/ips defaults to limit=50 (src/api/records.rs::list_ips,
+# `filters.limit.unwrap_or(50)`) and imposes no cap. simply_ip_exporter's VaultClient used to send
+# no `limit` at all, so every sync silently received the 50 most recently updated records and
+# treated that page as the whole dataset — the exact production symptom this fixture now guards.
+# 250 is chosen to be comfortably over that default (5 full pages at the mock/probe page size)
+# while staying fast to seed.
+#
+# Each address is a lone host in its own /24 (51.<i/256>.<i%256>.1), which makes the count assertion
+# in §4b exact: no two are adjacent, so ipnet::IpNet::aggregate() cannot merge any of them, and none
+# fall in an RFC1918/bogon/loopback range that a filter could remove.
+log "Creating pfBlocker_Pagination_Test and seeding it with $PAGINATION_RECORD_COUNT records (Vault's default page is 50)..."
+api_call "$VAULT_URL" POST "/api/groups" "$VAULT_MASTER_KEY" '{"name":"pfBlocker_Pagination_Test"}'
+check "200" "pfBlocker_Pagination_Test group is created"
+PAGINATION_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+# Seeded through POST /api/records/batch (transactional, up to 10k records) rather than 250
+# individual POST /api/ban calls — 250 signed round-trips would dominate this script's runtime.
+PAGINATION_BATCH=$(python3 - "$PAGINATION_RECORD_COUNT" <<'PY'
+import json, sys
+n = int(sys.argv[1])
+records = [
+    {"target_address": "51.%d.%d.1" % (i // 256, i % 256), "cause": "pagination fixture"}
+    for i in range(n)
+]
+print(json.dumps({
+    "group_name": "pfBlocker_Pagination_Test",
+    "mode": "upsert",
+    "records": records,
+    "skip_webhooks": True,
+}))
+PY
+)
+api_call "$VAULT_URL" POST "/api/records/batch" "$VAULT_MASTER_KEY" "$PAGINATION_BATCH"
+check "200" "$PAGINATION_RECORD_COUNT records are batch-seeded into pfBlocker_Pagination_Test"
+check_jq ".created" "$PAGINATION_RECORD_COUNT" "Vault reports all $PAGINATION_RECORD_COUNT records created"
+
+# Proves the premise rather than assuming it: Vault really does truncate to 50 when no `limit` is
+# sent. If Vault ever changes that default, this check fails loudly and §4b's guard becomes moot —
+# far better than the guard quietly testing nothing.
+api_call "$VAULT_URL" GET "/api/ips?groups=pfBlocker_Pagination_Test" "$VAULT_MASTER_KEY"
+check "200" "Vault serves the pagination group"
+check_jq "length" "50" "Vault truncates to its default limit=50 when no limit is supplied (the bug's root cause)"
+
 log "Seeding pfBlocker_Blacklist with a contiguous/overlapping pair and a CGN (bogon) address..."
 # 8.8.8.0/24 + 8.8.8.1/32 (a host fully inside that block) is the aggregation fixture: a
 # spec-compliant ipnet::IpNet::aggregate() must collapse them into the single block 8.8.8.0/24.
@@ -452,6 +500,9 @@ check "200" "can_read granted on pfBlocker_Private_Test"
 api_call "$VAULT_URL" POST "/api/keys/$EXPORTER_VAULT_KEY_ID/groups" "$VAULT_MASTER_KEY" \
     "{\"group_id\":\"$SECONDARY_GROUP_ID\",\"can_read\":true,\"can_write\":false,\"can_delete\":false}"
 check "200" "can_read granted on pfBlocker_Secondary_Test"
+api_call "$VAULT_URL" POST "/api/keys/$EXPORTER_VAULT_KEY_ID/groups" "$VAULT_MASTER_KEY" \
+    "{\"group_id\":\"$PAGINATION_GROUP_ID\",\"can_read\":true,\"can_write\":false,\"can_delete\":false}"
+check "200" "can_read granted on pfBlocker_Pagination_Test"
 
 api_call "$VAULT_URL" GET "/api/ips?groups=pfBlocker_Blacklist,pfBlocker_Private_Test,pfBlocker_Secondary_Test" "$EXPORTER_VAULT_KEY"
 check "200" "the scoped Exporter key can read across all three groups"
@@ -495,7 +546,7 @@ check "401" "an unsigned admin API request is rejected"
 log "Listing Vault groups via Exporter's GET /api/vault-groups (live Vault call)..."
 api_call "$EXPORTER_URL" GET "/api/vault-groups" "$EXPORTER_MASTER_KEY"
 check "200" "GET /api/vault-groups returns 200 OK against live Vault"
-check_jq "length" "3" "sees all 3 Vault groups accessible to Exporter's Vault key"
+check_jq "length" "4" "sees all 4 Vault groups accessible to Exporter's Vault key (Blacklist, Private, Secondary, Pagination)"
 check_contains "$RESP_BODY" "pfBlocker_Blacklist" "pfBlocker_Blacklist is returned by live Vault group listing"
 check_contains "$RESP_BODY" "pfBlocker_Private_Test" "pfBlocker_Private_Test is returned by live Vault group listing"
 check_contains "$RESP_BODY" "pfBlocker_Secondary_Test" "pfBlocker_Secondary_Test is returned by live Vault group listing"
@@ -565,6 +616,17 @@ check "200" "the secondary-group-only feed endpoint is created"
 SECONDARY_FEED_PATH=$(echo "$RESP_BODY" | jq -r '.feed_path')
 log "Secondary feed path: $SECONDARY_FEED_PATH"
 
+# Created here, alongside the others, specifically so it becomes due in the same background-sync
+# pass the `sleep 20` below already waits for — §4b then asserts against it without costing the
+# script a second 20-second wait. No filters are enabled: the §2 fixture addresses are public,
+# non-adjacent hosts, so the feed's line count is exactly the record count.
+log "Creating the large-dataset feed endpoint over pfBlocker_Pagination_Test ($PAGINATION_RECORD_COUNT records)..."
+api_call "$EXPORTER_URL" POST "/api/endpoints" "$EXPORTER_MASTER_KEY" \
+    '{"name":"Pagination Feed","vault_groups":"pfBlocker_Pagination_Test","ttl_seconds":2}'
+check "200" "the large-dataset feed endpoint is created"
+PAGINATION_FEED_PATH=$(echo "$RESP_BODY" | jq -r '.feed_path')
+log "Pagination feed path: $PAGINATION_FEED_PATH"
+
 # sync_all_endpoints() (src/sync.rs) syncs every due endpoint sequentially within one 15s tick,
 # each a real HTTP round-trip to Vault — two endpoints due at once (as here) take measurably
 # longer than one, so the old 18s margin (15s tick + 3s slack, sized for a single endpoint) was
@@ -609,6 +671,34 @@ check_not_contains "$RESP_BODY" "8.8.8.0/24" "the secondary-group-only feed does
 check_not_contains "$RESP_BODY" "8.8.4.4" "the secondary-group-only feed does NOT leak pfBlocker_Blacklist's content"
 SECONDARY_LINE_COUNT=$(echo "$RESP_BODY" | grep -c . || true)
 check_local "$SECONDARY_LINE_COUNT" "1" "exactly one line — only this endpoint's own group's content"
+
+# ── 4b. Large-dataset pagination ────────────────────────────────────────────
+
+log_section "4b. Large-Dataset Pagination (>50 records)"
+
+# The regression guard for the production defect where simply_ip_exporter published only ~50 IPs
+# regardless of how many Vault held. Vault paginates GET /api/ips with limit/offset and defaults to
+# limit=50; VaultClient::fetch_ips sent no limit, so it read one page and treated it as the entire
+# dataset. On a full sync that is actively destructive, since apply_full has replace semantics —
+# everything past the 50th was dropped from the cache and vanished from the published feed.
+#
+# §2 already asserted Vault itself truncates at 50 without a limit, so this section isolates the
+# exporter's half: given a group Vault serves 50-at-a-time, does the published feed carry all
+# $PAGINATION_RECORD_COUNT?
+raw_call GET "$EXPORTER_URL$PAGINATION_FEED_PATH" -H "X-Forwarded-For: 198.51.100.51"
+check "200" "the large-dataset feed is served"
+
+PAGINATION_LINE_COUNT=$(echo "$RESP_BODY" | grep -c . || true)
+check_local "$PAGINATION_LINE_COUNT" "$PAGINATION_RECORD_COUNT" \
+    "all $PAGINATION_RECORD_COUNT records survive the sync — not truncated to Vault's 50-record default page"
+
+# Spot-checks at and beyond the old truncation boundary. A count alone could in principle be met by
+# the wrong 250 records; these name specific addresses that only a complete multi-page walk reaches.
+check_contains "$RESP_BODY" "51.0.0.1/32" "the first seeded record is present"
+check_contains "$RESP_BODY" "51.0.49.1/32" "the 50th record (the last of Vault's default first page) is present"
+check_contains "$RESP_BODY" "51.0.50.1/32" "the 51st record is present — the first one the old single-page fetch always lost"
+check_contains "$RESP_BODY" "51.0.150.1/32" "a record from the middle of page four is present"
+check_contains "$RESP_BODY" "51.0.249.1/32" "the final record is present — the walk ran to completion, not just past the first boundary"
 
 # ── 5. HTTP optimizations & anti-DoS ────────────────────────────────────────
 
@@ -1001,10 +1091,11 @@ fi
 
 # The audit trail is written to the same SQLite database as everything else, so it must have
 # survived §9's restart intact — entries from both before and after the restart should be present.
-# Four endpoints are created before the restart: the main DMZ feed, §4's group-scoping "Secondary Group Only Feed",
-# Daughter Blacklist Feed, and §8's bound_ips-restricted "Restricted Feed".
+# Five endpoints are created before the restart: the main DMZ feed, §4's group-scoping "Secondary
+# Group Only Feed", §4b's large-dataset "Pagination Feed", Daughter Blacklist Feed, and §8's
+# bound_ips-restricted "Restricted Feed".
 PRE_RESTART_COUNT=$(echo "$RESP_BODY" | jq --arg a "ENDPOINT_CREATE" '[.[] | select(.action == $a)] | length')
-check_local "$PRE_RESTART_COUNT" "4" "all four ENDPOINT_CREATE entries (created before the restart) survived it"
+check_local "$PRE_RESTART_COUNT" "5" "all five ENDPOINT_CREATE entries (created before the restart) survived it"
 
 log "Confirming a Daughter key cannot read the audit log..."
 api_call "$EXPORTER_URL" GET "/api/audit-logs" "$DAUGHTER_KEY"

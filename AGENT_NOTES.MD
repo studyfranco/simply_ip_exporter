@@ -1,5 +1,140 @@
 # Agent Worklog — `simply_ip_exporter`
 
+## 2026-08-26 (session 18) — The ~50-record truncation: `fetch_ips` never paginated
+
+Production published only ~50 IPs regardless of how many Vault held. Root cause confirmed in
+Vault's source and then reproduced against the live daemon before a line was changed.
+
+### The contract, verified against a running Vault (not inferred)
+
+`example/simply_ip_vault/src/api/records.rs::list_ips` ends with `let limit =
+filters.limit.unwrap_or(50);` — **default 50, and no cap anywhere**. `VaultClient::fetch_ips` sent
+no `limit` at all, so it received page one and treated it as the entire dataset. Booted the real
+daemon, seeded 250 records via `POST /api/records/batch`, and measured:
+
+| Query | Records returned |
+| :--- | :--- |
+| no `limit` param | **50** ← the production symptom, exactly |
+| `limit=0` | **0** — *not* "unlimited"; it is `LIMIT 0` |
+| `limit=100000` | 250 |
+| `limit=50&offset=200` | 50 |
+| `limit=50&offset=250` | 0 (clean end-of-data signal) |
+| `format=iplist`, no `limit` | 50 (truncated too) |
+| `since` + `include_deleted`, no `limit` | 50 (**differential sync was equally broken**) |
+| offset walk at page 50 | 6 requests, 250 distinct — paging is sound |
+
+Two findings beyond the headline: the `since`/`include_deleted` delta query is truncated by the
+same default, so differential sync was losing records too, not just the 24h full sync; and
+`limit=0` is a trap that returns nothing.
+
+### Why a loop rather than one large `limit`
+
+Vault applies no ceiling, so `limit=100000` would work *today*. Rejected anyway: it re-creates the
+exact defect being fixed, just further away — the moment the dataset outgrows the constant, or Vault
+gains a cap, truncation resumes silently. `fetch_ips` now walks pages ([`PAGE_SIZE`] = 1000) until
+Vault returns a short page, which is correct at any size and under any future cap. `MAX_PAGES` is a
+runaway guard (a Vault ignoring `offset` would otherwise loop forever); tripping it logs
+`tracing::error!` naming the truncation explicitly, because a silent short feed is the one outcome
+this function exists to prevent.
+
+Documented honestly rather than papered over: Vault orders by `updated_at DESC` with no tiebreaker,
+so an offset walk is not a stable snapshot — a record re-registered mid-walk can shift across a page
+boundary and be duplicated (harmless; the cache is keyed by address) or skipped (picked up next
+cycle). Vault exposes no cursor that would avoid it. A page size of 1000 puts almost every
+deployment in a single page, where the question cannot arise at all.
+
+Aggregation was already correct and stayed untouched: `filter_and_aggregate` runs in `feed.rs` over
+the assembled cache snapshot, i.e. strictly after the complete multi-page fetch.
+
+### Verification
+
+- 4 new `vault_client` unit tests against a mock that paginates **exactly as Vault does**, including
+  defaulting to `limit=50` when the parameter is absent — so the mock reproduces the bug, and the
+  tests fail against the old single-shot code. Cover: 250 records over 5 pages + terminator; a
+  single-page dataset costing exactly one request; an exact-multiple total (100 @ 50) needing the
+  extra empty page to terminate; and a differential fetch carrying `since`/`include_deleted`/
+  `groups` onto *every* page with `offset` actually advancing. `VaultClient::with_page_size` is
+  `#[cfg(test)]`-only, mirroring `config::TrustedProxies::with_ttls`.
+- New e2e §4b, against live Vault: a 4th group seeded with 250 batch records, its own endpoint, and
+  assertions that the published feed carries all 250 — plus spot-checks at `51.0.49.1` (last of
+  Vault's default page), `51.0.50.1` (**the first record the old code always lost**) and
+  `51.0.249.1`. §2 additionally asserts Vault itself still truncates at 50 without a `limit`, so if
+  that default ever changes the guard fails loudly instead of quietly testing nothing.
+- Fixture addresses are lone hosts in distinct /24s (`51.<i/256>.<i%256>.1`), so nothing aggregates
+  and the line count is exactly the record count.
+- Gates: `cargo check`/`clippy -D warnings` clean; `cargo test` 123 lib + 4 main + 40 integration +
+  13 hygiene = 180 passed; `verify_convergence.sh` all checks pass; `test_e2e.sh` **141/141**
+  (was 110 — 250-record seeding, the §4b block, and two hardcoded counts updated for the new group
+  and endpoint).
+
+## 2026-08-26 (session 17) — DIAGNOSIS ONLY, NO CODE CHANGED: the Vault group-listing 403 is not an RBAC failure
+
+Asked to deep-dive whether `simply_ip_vault` is missing a non-Master group-listing mechanism
+(Case A → pause) or whether this crate calls it wrongly (Case B → fix + 500-IP e2e). **Neither is
+true.** Audit + live reproduction against the real daemon proves the reported cause is wrong, so
+Tasks 2–4 were deliberately not started: implementing them would have changed working code against
+a false premise, which is exactly the "hacky workaround" the brief forbade. No source file in this
+crate was modified this session; `example/simply_ip_vault` was read and built only, never edited
+(verified: `git status --porcelain --untracked-files=no` clean at `c5f9ef7`).
+
+### What the source audit found
+
+`example/simply_ip_vault/src/api/groups.rs::list_ip_groups` (route `GET /api/groups`, mounted via
+`.nest("/api", api_routes)` in its `lib.rs` — **not** `/api/v1`, despite several stale doc comments
+in that file saying `/api/v1/...`) **has never been Master-gated in any commit in this checkout.**
+Checked all five commits that ever touched the file (`036794a`, `6ebf277`, `6f1c4c7`, `cd8b247`,
+`c5f9ef7`): every version branches on `if !key.is_master` and filters `ip_groups` to the rows the
+caller holds a permission on. The handler contains no `AppError::Forbidden` at all.
+
+Vault's HEAD commit is itself `c5f9ef7 fix(rbac): allow non-master and daughter keys to list
+read-accessible groups` (2026-08-26 16:43 +0200 — landed *after* this repo's last
+`verify_convergence.sh` peer-sync). It did **not** introduce non-Master listing; it broadened the
+predicate from `can_read` alone to any of `can_read`/`can_write`/`can_delete`/`can_manage`, and
+added an `if accessible_groups.is_empty() { return Ok(Json(vec![])) }` early return.
+
+The only `403` reachable on that route is in `example/simply_ip_vault/src/middleware.rs`:
+the `bound_ips` client-IP check, `AppError::Forbidden("Client IP not allowed")`.
+
+### What the live reproduction proved
+
+Booted the real Vault at `c5f9ef7` standalone (scratch DB, throwaway port; never touching the
+checkout) and drove it with signed `CANONICAL_V1` requests:
+
+| Caller | `GET /api/groups` | Result |
+| :--- | :--- | :--- |
+| Non-Master, `can_read` on 2 of 3 groups | **200** | returns exactly `["Group_Alpha","Group_Beta"]` — correctly scoped, Gamma withheld |
+| Non-Master, **zero** grants | **200** | `[]` (the `c5f9ef7` early return) |
+| Master (control) | **200** | all 3 groups |
+| Non-Master, grants fine, `bound_ips=10.99.99.0/24` | **403** | `{"error":"Client IP not allowed"}` |
+
+A second probe established the decisive property: that 403 is **route-independent**. The same
+badly-bound key returns `403` identically on `GET /api/groups`, `GET /api/ips?groups=…`, *and*
+`GET /api/auth/me`, while a correctly-bound key with identical grants gets `200` on all three.
+
+### The diagnosis
+
+The reported symptom — "403 on group listing, attributed to missing Master privileges" — cannot be
+produced by Vault's RBAC, because no RBAC 403 exists on that route in any version here. Two
+mutually exclusive explanations remain, distinguishable by one observation in production (**is IP
+sync also failing?**):
+
+1. **Sync is ALSO failing → the Vault API key's `bound_ips` excludes the Exporter's source address
+   as Vault resolves it.** The classic shape is containerised: the key is bound to a LAN CIDR, but
+   Vault sees the Docker-network or reverse-proxy address instead, because Vault's own
+   `TRUSTED_PROXIES` is unset (so it ignores `X-Forwarded-For` and authorizes the raw TCP peer).
+   Fix is configuration, in Vault, not code here: widen that key's `bound_ips`, or set Vault's
+   `TRUSTED_PROXIES` to the proxy in front of it.
+2. **Sync is working and only group listing 403s → the deployed Vault binary is older than, or
+   forked from, every commit in this checkout.** Nothing in this history can produce that split.
+   Fix is to redeploy Vault at ≥ `c5f9ef7`.
+
+Either way the corrective action is on the Vault deployment. This crate's own behaviour is already
+correct and already defensive: it calls the right path, and commits `6f54576`/`c2da8f2` (session 16)
+made a `403` degrade to an empty group list plus one quiet INFO line rather than a `502` — which is
+why the operator sees a tidy log line instead of a broken dashboard. That log line's wording
+(*"Vault API key lacks group listing permissions"*) is now known to be a misleading guess at the
+cause and should be reworded once the branch above is settled.
+
 ## 2026-08-25 (session 16) — Header/keys/audit UI parity, dynamic group picker, hostname `bound_ips`
 
 Six-task batch: strict-parity header simplification, an API Keys scopes column, Audit Logs header/
