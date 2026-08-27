@@ -65,8 +65,9 @@ Each `endpoints` row names one or more Vault group(s) and a `ttl_seconds`. A bac
   regardless of `ttl_seconds`, replacing the cached set outright to clear any orphaned records a
   differential sync might have missed.
 
-If Vault is unreachable, the worker logs a warning and leaves the existing in-memory cache
-untouched — the public feed keeps serving its last-known-good content without interruption.
+At startup one full pass runs before the HTTP listener opens, so the first request is served from a
+populated cache (bounded at 30s, never fatal). If Vault is unreachable, the worker logs a warning and
+leaves the existing in-memory cache untouched — the public feed keeps serving its last-known-good content without interruption.
 
 ## Quickstart
 
@@ -263,7 +264,7 @@ orchestrators, load balancers) cannot compute an HMAC signature.
 ```sh
 cargo check --all-targets
 cargo clippy --all-targets -- -D warnings
-cargo test                     # 137 unit + 4 main.rs unit + 41 integration + 13 source-hygiene tests
+cargo test                     # 141 unit + 4 main.rs unit + 43 integration + 13 source-hygiene tests
 ./scripts/verify_convergence.sh  # source hygiene (raw SQL, unwrap/expect, frontend syntax/DOM refs) + clippy -D warnings + cargo test, one gate
 ./scripts/test_e2e.sh          # full live E2E against a real simply_ip_vault + simply_ip_exporter pair
 ```

@@ -1537,3 +1537,131 @@ async fn max_age_seconds_defaults_to_unlimited_round_trips_and_refuses_negatives
     let row = rows.as_array().unwrap().iter().find(|r| r["id"] == id.as_str()).unwrap();
     assert_eq!(row["max_age_seconds"], 86400, "the refused update must not have changed anything");
 }
+
+/// Boots a throwaway Vault answering `GET /api/ips` with a fixed record set.
+async fn spawn_mock_vault_ips(records: serde_json::Value) -> (String, tokio::task::JoinHandle<()>) {
+    use axum::{Router, routing::get};
+
+    let app = Router::new().route(
+        "/api/ips",
+        get(move || {
+            let records = records.clone();
+            async move { axum::Json(records) }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback bind always succeeds");
+    let addr = listener.local_addr().expect("a bound listener has a local address");
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}"), handle)
+}
+
+fn feed_request(path: &str, source: [u8; 4]) -> Request<Body> {
+    Request::builder()
+        .uri(path)
+        .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((source, 9000))))
+        .body(Body::empty())
+        .expect("request builds")
+}
+
+/// The startup-sync contract, end to end through the real router: an endpoint that already exists
+/// in the database is synced against Vault *during initialization*, so the very first feed request
+/// is answered with real data.
+///
+/// The two halves are what make this meaningful. Before `run_boot_sync`, the feed answers `200`
+/// with an empty body — which is precisely the failure being fixed, because a consumer like
+/// pfBlockerNG cannot tell that apart from "the list is legitimately empty" and would install an
+/// empty alias. After it, the same endpoint serves its records. Asserting only the second half
+/// would pass even if the cache had been populated by something else entirely.
+#[tokio::test]
+async fn the_startup_sync_populates_endpoints_before_the_first_feed_request_is_served() {
+    let (vault_url, _vault) = spawn_mock_vault_ips(serde_json::json!([
+        {"target_address": "203.0.113.7/32", "updated_at": "2026-08-11T10:00:00", "is_deleted": false},
+        {"target_address": "198.51.100.9/32", "updated_at": "2026-08-11T10:00:00", "is_deleted": false}
+    ]))
+    .await;
+
+    let db = setup_test_db().await;
+    let master = insert_key(&db, true, true).await;
+    let state = test_state_with_vault(&db, vault_url).with_pinned_master(master.model.id);
+
+    // A pre-configured endpoint, exactly as one would already be in the database across a restart.
+    let created = create_app(state.clone())
+        .oneshot(signed_request(
+            "POST",
+            "/api/endpoints",
+            &master,
+            r#"{"name":"Boot Sync Feed","vault_groups":"g1","ttl_seconds":3600}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let feed_path = body_json(created).await["feed_path"].as_str().unwrap().to_owned();
+
+    // Before the startup sync: served, but empty — the window this feature closes.
+    let cold = create_app(state.clone())
+        .oneshot(feed_request(&feed_path, [198, 51, 100, 81]))
+        .await
+        .unwrap();
+    assert_eq!(cold.status(), StatusCode::OK);
+    let cold_body = axum::body::to_bytes(cold.into_body(), usize::MAX).await.unwrap();
+    assert!(cold_body.is_empty(), "precondition: nothing is cached before the startup sync runs");
+
+    // Exactly what `main.rs` awaits before binding the listener.
+    simply_ip_exporter::sync::run_boot_sync(&state).await;
+
+    // A distinct source address, so the feed's per-IP rate limiter cannot be what answers here.
+    let warm = create_app(state)
+        .oneshot(feed_request(&feed_path, [198, 51, 100, 82]))
+        .await
+        .unwrap();
+    assert_eq!(warm.status(), StatusCode::OK);
+    let warm_body = axum::body::to_bytes(warm.into_body(), usize::MAX).await.unwrap();
+    let served = String::from_utf8(warm_body.to_vec()).expect("the feed is UTF-8");
+
+    assert!(served.contains("203.0.113.7/32"), "first record must be served: {served:?}");
+    assert!(served.contains("198.51.100.9/32"), "second record must be served: {served:?}");
+    assert_eq!(served.lines().count(), 2, "exactly the two synced records: {served:?}");
+}
+
+/// The boot sync must never be able to stop the process from starting. With Vault unreachable it
+/// returns normally, and the router it precedes still serves — an empty feed and a healthy probe,
+/// rather than a crash loop that never reaches the listener at all.
+#[tokio::test]
+async fn an_unreachable_vault_at_startup_does_not_prevent_the_service_from_serving() {
+    // Bind then drop, so the address is genuinely refusing connections.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let db = setup_test_db().await;
+    let master = insert_key(&db, true, true).await;
+    let state = test_state_with_vault(&db, format!("http://{dead_addr}"))
+        .with_pinned_master(master.model.id);
+
+    let created = create_app(state.clone())
+        .oneshot(signed_request(
+            "POST",
+            "/api/endpoints",
+            &master,
+            r#"{"name":"Unreachable Vault Feed","vault_groups":"g1","ttl_seconds":3600}"#,
+        ))
+        .await
+        .unwrap();
+    let feed_path = body_json(created).await["feed_path"].as_str().unwrap().to_owned();
+
+    simply_ip_exporter::sync::run_boot_sync(&state).await;
+
+    let feed = create_app(state.clone())
+        .oneshot(feed_request(&feed_path, [198, 51, 100, 83]))
+        .await
+        .unwrap();
+    assert_eq!(feed.status(), StatusCode::OK, "the feed is still served, just empty");
+
+    let ready = create_app(state)
+        .oneshot(with_connect_info(Request::builder().uri("/ready")).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(ready.status(), StatusCode::OK, "readiness is unaffected by Vault being down at boot");
+}

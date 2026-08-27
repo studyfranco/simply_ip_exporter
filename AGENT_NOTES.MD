@@ -1,5 +1,56 @@
 # Agent Worklog — `simply_ip_exporter`
 
+## 2026-08-26 (session 22) — Startup sync before the listener opens
+
+`main.rs` now awaits one full sync pass (`sync::run_boot_sync`) after the Master pin and **before**
+`TcpListener::bind`, so the first feed request is answered from a populated cache.
+
+### The premise needed one correction — but the underlying gap was real
+
+The brief stated the worker "waits for its first tick interval before synchronizing". It does not:
+`spawn_sync_worker` calls `sync_all_endpoints` and *then* sleeps, so its first pass has always been
+immediate. The real defect is subtler and matches the brief's *intent* exactly — that pass runs on a
+**spawned task, concurrently with `axum::serve`**, so the listener starts accepting traffic while
+the first sync is still in flight. A feed fetched inside that window gets `200` with an empty body,
+which a consumer like pfBlockerNG cannot distinguish from "the list is legitimately empty" and will
+install as an empty alias. The integration test asserts both halves — empty before the boot sync,
+populated after — because asserting only the second would pass even if something else had filled
+the cache.
+
+No duplicated work: after the boot pass, the worker's own immediate first pass finds
+`full_sync_due` false (`apply_full` just set `last_full_sync_at`) and the differential `due` check
+false (`mark_synced` just set `last_synced_at`), so it fetches nothing. Pinned by
+`the_worker_does_not_repeat_the_work_the_boot_sync_just_did`, which counts hits at the mock — a
+duplicate full sync would be invisible in the cache contents.
+
+### Bounded, because "blocking at boot" and "no boot loops" conflict at the edges
+
+The brief allowed blocking or non-blocking, and asked for the cache to be populated *before* traffic
+is accepted — which means blocking. But the boot pass is sequential and each endpoint's fetch can
+take `vault_client`'s full 15s request timeout, so an unreachable Vault plus a handful of endpoints
+would hold the listener closed for minutes. To Docker's `HEALTHCHECK` or a Kubernetes probe that is
+indistinguishable from a failed start — they cannot open a connection at all while the listener is
+unbound — so they restart, and the next boot stalls identically. That is precisely the crash loop
+the brief's own resilience guideline forbids.
+
+So the pass is capped at `BOOT_SYNC_BUDGET` (30s): normally the cache is fully warm before the first
+request, and in the pathological case startup proceeds cold after a bounded wait while the
+background worker keeps retrying. Failures were already logged-and-swallowed per endpoint by
+`sync_endpoint`, so nothing here can abort the process.
+
+### Verification
+
+- 4 new `sync` unit tests: the cache is populated for a pre-existing endpoint; an unreachable Vault
+  returns normally leaving the cache empty; the unconfigured-Vault path is a fast no-op (asserted
+  against a 5s margin, so a no-op that somehow waited on the 30s budget would fail); and the
+  no-duplicate-work property above.
+- 2 new integration tests through the real router: the empty-then-populated contrast described
+  above, and an unreachable Vault at boot still leaving the service serving (feed `200`, `/ready`
+  `200`) rather than failing to start.
+- Gates: `cargo check`/`clippy -D warnings` clean; `cargo test` 141 + 4 + 43 + 13 = 201 passed;
+  `verify_convergence.sh` all pass; `test_e2e.sh` 203/203 unchanged — the e2e creates its endpoints
+  *after* the exporter boots, so the boot pass finds none and the script's existing timing holds.
+
 ## 2026-08-26 (session 21) — Bounded parallel paging on Vault's `include_total` envelope
 
 Pulled the peer (`b8bd281 feat(api): add include_total query parameter`) and rebuilt

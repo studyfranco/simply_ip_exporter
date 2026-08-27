@@ -239,6 +239,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              is idle and feeds will stay empty until Vault sync is configured."
         );
     }
+    // One full pass *before* the listener binds, so the first feed request is answered from a
+    // populated cache instead of an empty one. Never fatal and internally time-capped — see
+    // `sync::run_boot_sync` for why a boot that waits indefinitely on Vault would be worse than one
+    // that starts cold.
+    sync::run_boot_sync(&state).await;
+
     let sync_handle = sync::spawn_sync_worker(state.clone());
     // Same Vault-configured-or-not gate as the sync worker above: with no Vault client, every
     // cleanup pass is a no-op anyway (see `groups::cleanup_stale_group_permissions`), so the

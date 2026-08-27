@@ -17,6 +17,18 @@ pub const FULL_SYNC_INTERVAL: Duration = Duration::from_secs(24 * 3600);
 /// How often the worker wakes to check whether any endpoint is due for a sync.
 const TICK_INTERVAL: Duration = Duration::from_secs(15);
 
+/// Wall-clock ceiling on the boot sync ([`run_boot_sync`]) before startup proceeds regardless.
+///
+/// The boot pass is sequential and each endpoint's fetch can take up to `vault_client`'s own 15s
+/// request timeout, so an unreachable Vault plus a handful of endpoints would otherwise hold the
+/// HTTP listener closed for minutes. To an orchestrator that is indistinguishable from a failed
+/// start: Docker's `HEALTHCHECK` and Kubernetes' probes cannot even open a connection while the
+/// listener is unbound, so they escalate to a restart, and the next boot stalls identically — the
+/// crash loop `AGENT.MD` requires this daemon never to enter. Capping the wait converts that into a
+/// bounded delay after which the service starts serving (initially from an empty or partial cache)
+/// while the background worker keeps retrying.
+const BOOT_SYNC_BUDGET: Duration = Duration::from_secs(30);
+
 fn map_records(records: Vec<VaultApiRecord>) -> Vec<VaultRecord> {
     records
         .into_iter()
@@ -28,7 +40,58 @@ fn map_records(records: Vec<VaultApiRecord>) -> Vec<VaultRecord> {
         .collect()
 }
 
+/// Runs one full synchronization pass over every endpoint **before** the HTTP listener opens, so
+/// the first caller to fetch a feed is served real data rather than an empty cache.
+///
+/// # Why this exists when the worker already syncs immediately
+///
+/// [`spawn_sync_worker`] does not sleep before its first pass — it syncs, *then* waits a tick. But
+/// it does that on a **spawned task**, concurrently with `axum::serve`, so the listener starts
+/// accepting traffic while that first pass is still in flight. Any feed fetched inside that window
+/// is answered from a cache that has not been populated yet: a `200` with an empty body, which a
+/// consumer like pfBlockerNG cannot distinguish from "the list is legitimately empty" and will
+/// happily install as an empty alias. Awaiting one pass here closes that window; the worker is
+/// spawned afterwards and its own immediate pass finds nothing due (this pass just set
+/// `last_full_sync_at` and `last_synced_at`), so nothing is fetched twice.
+///
+/// # Never fatal, always bounded
+///
+/// Every failure inside the pass is already logged-and-swallowed per endpoint by [`sync_endpoint`],
+/// so an unreachable Vault costs warnings rather than a failed boot. The whole pass is additionally
+/// capped at [`BOOT_SYNC_BUDGET`]: without that ceiling a Vault that accepts connections but never
+/// answers would keep the listener closed for `endpoints × 15s`, which an orchestrator reads as a
+/// failed start and restarts — a boot loop, which is strictly worse than serving a cold cache while
+/// the background worker catches up.
+pub async fn run_boot_sync(state: &AppState) {
+    if state.vault_client.is_none() {
+        tracing::info!(
+            "Skipping the startup sync: simply_ip_vault is not configured. Feeds will be empty \
+             until VAULT_BASE_URL/VAULT_API_KEY/VAULT_SIGNING_SECRET are set."
+        );
+        return;
+    }
+
+    tracing::info!("Running the startup sync before opening the HTTP listener...");
+    let started = std::time::Instant::now();
+
+    match tokio::time::timeout(BOOT_SYNC_BUDGET, sync_all_endpoints(state)).await {
+        Ok(()) => tracing::info!(
+            "Startup sync finished in {:?}; the cache is populated before the first request.",
+            started.elapsed()
+        ),
+        Err(_) => tracing::warn!(
+            "Startup sync did not finish within {}s. Starting anyway and serving whatever is \
+             already cached — the background sync worker continues from here, so no restart is \
+             needed. Check that simply_ip_vault is reachable.",
+            BOOT_SYNC_BUDGET.as_secs()
+        ),
+    }
+}
+
 /// Spawns the background sync loop, returning its join handle for graceful shutdown.
+///
+/// The loop syncs first and sleeps second, so an endpoint created while the process is running is
+/// picked up on the next tick rather than a tick plus a full interval later.
 pub fn spawn_sync_worker(state: AppState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -211,6 +274,131 @@ mod tests {
             updated_at: Utc::now().naive_utc(),
             is_deleted: false,
         }
+    }
+
+    // ── Startup sync ────────────────────────────────────────────────────────
+
+    /// The property the boot sync exists for: an endpoint already in the database is synced during
+    /// startup, so the cache holds real records *before* `axum::serve` is ever reached — not one
+    /// tick later, and not racing the listener from a spawned task.
+    #[tokio::test]
+    async fn the_boot_sync_populates_the_cache_for_endpoints_already_in_the_database() {
+        let (url, _server) = spawn_mock_vault(
+            axum::http::StatusCode::OK,
+            serde_json::json!([
+                {"target_address": "203.0.113.7/32", "updated_at": "2026-08-11T10:00:00", "is_deleted": false},
+                {"target_address": "198.51.100.9/32", "updated_at": "2026-08-11T10:00:00", "is_deleted": false}
+            ]),
+        )
+        .await;
+        let db = test_db().await;
+        let state = test_state(&db, url);
+        let ep = insert_test_endpoint(&db, None).await;
+
+        assert!(
+            state.ip_cache.snapshot(ep.id).await.is_empty(),
+            "precondition: nothing is cached before the boot sync runs"
+        );
+
+        run_boot_sync(&state).await;
+
+        let cached = state.ip_cache.snapshot(ep.id).await;
+        assert_eq!(cached.len(), 2, "the boot sync must have fetched and cached both records");
+    }
+
+    /// The resilience contract at boot: Vault being unreachable must leave the process able to
+    /// continue starting. `run_boot_sync` returns normally (there is no error to propagate and
+    /// nothing to panic on), leaving the cache empty for the worker to fill in later.
+    #[tokio::test]
+    async fn the_boot_sync_returns_normally_when_vault_is_unreachable() {
+        // Bind then immediately drop, so the port is genuinely closed — a deterministic
+        // ECONNREFUSED without depending on a specific port staying free.
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback bind always succeeds");
+        let addr = listener.local_addr().expect("a bound listener has a local address");
+        drop(listener);
+
+        let db = test_db().await;
+        let state = test_state(&db, format!("http://{addr}"));
+        let ep = insert_test_endpoint(&db, None).await;
+
+        run_boot_sync(&state).await;
+
+        assert!(
+            state.ip_cache.snapshot(ep.id).await.is_empty(),
+            "an unreachable Vault leaves the cache empty rather than failing the boot"
+        );
+    }
+
+    /// With no Vault configured the boot sync is a no-op that must not stall startup — the
+    /// zero-configuration path a first run takes before any Vault credentials are set.
+    #[tokio::test]
+    async fn the_boot_sync_is_a_no_op_without_a_configured_vault() {
+        let db = test_db().await;
+        let config = RuntimeConfig::default();
+        let state = AppState::new(
+            db.clone(),
+            std::sync::Arc::new(config),
+            std::sync::Arc::new(SecretCipher::Plaintext),
+        );
+        let ep = insert_test_endpoint(&db, None).await;
+
+        // Also asserts it returns promptly: `BOOT_SYNC_BUDGET` is 30s, so a no-op that somehow
+        // waited on the timeout would blow this margin by orders of magnitude.
+        let started = std::time::Instant::now();
+        run_boot_sync(&state).await;
+        assert!(started.elapsed() < Duration::from_secs(5), "the unconfigured path must return at once");
+        assert!(state.ip_cache.snapshot(ep.id).await.is_empty());
+    }
+
+    /// The boot sync must not re-fetch what it just fetched: after it runs, the background worker's
+    /// own immediate first pass finds nothing due (`last_full_sync_at` and `last_synced_at` were
+    /// both just set) and issues no further requests. Counted at the mock, since a duplicate full
+    /// sync would be invisible in the cache contents.
+    #[tokio::test]
+    async fn the_worker_does_not_repeat_the_work_the_boot_sync_just_did() {
+        use axum::{Router, routing::get};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let hits_for_handler = std::sync::Arc::clone(&hits);
+        let app = Router::new().route(
+            "/api/ips",
+            get(move || {
+                let hits = std::sync::Arc::clone(&hits_for_handler);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(serde_json::json!([
+                        {"target_address": "203.0.113.7/32", "updated_at": "2026-08-11T10:00:00", "is_deleted": false}
+                    ]))
+                }
+            }),
+        );
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback bind always succeeds");
+        let addr = listener.local_addr().expect("a bound listener has a local address");
+        let _server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let db = test_db().await;
+        let state = test_state(&db, format!("http://{addr}"));
+        // ttl_seconds is 1 in the fixture, so this endpoint would become due again a second later;
+        // the assertion below runs well inside that, isolating "the worker's first pass" from
+        // "a legitimately due later sync".
+        let _ep = insert_test_endpoint(&db, None).await;
+
+        run_boot_sync(&state).await;
+        let after_boot = hits.load(Ordering::SeqCst);
+        assert_eq!(after_boot, 1, "the boot sync fetches each endpoint exactly once");
+
+        // Exactly what `spawn_sync_worker` does before its first sleep.
+        sync_all_endpoints(&state).await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            after_boot,
+            "the worker's immediate first pass must find nothing due and re-fetch nothing"
+        );
     }
 
     /// A full sync (never-synced endpoint) against an unauthorized Vault must not panic and must
