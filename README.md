@@ -198,6 +198,7 @@ An `endpoints` row's fields:
 | :--- | :--- |
 | `vault_groups` | Comma-separated Vault group names/UUIDs this endpoint pulls from. |
 | `ttl_seconds` | Differential-sync interval and in-memory cache "freshness" window. |
+| `max_age_seconds` | Retention window: how recently a Vault record must have been updated to be published. `0` (the default) means unlimited. Evaluated at feed generation, so an edit takes effect on the next fetch. |
 | `bound_ips` | Optional comma-separated CIDR/IP/hostname allowlist for the *public* feed request (separate from any admin-API `bound_ips`). A hostname entry is resolved via DNS at request time (30s/5s positive/negative cache, shared with `TRUSTED_PROXIES`'s own resolver). |
 | `filter_rfc1918` | Strip `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`. |
 | `filter_bogons` | Strip CGN, TEST-NET, multicast, and other reserved/unallocated ranges. |
@@ -262,14 +263,14 @@ orchestrators, load balancers) cannot compute an HMAC signature.
 ```sh
 cargo check --all-targets
 cargo clippy --all-targets -- -D warnings
-cargo test                     # 123 unit + 4 main.rs unit + 40 integration + 13 source-hygiene tests
+cargo test                     # 129 unit + 4 main.rs unit + 41 integration + 13 source-hygiene tests
 ./scripts/verify_convergence.sh  # source hygiene (raw SQL, unwrap/expect, frontend syntax/DOM refs) + clippy -D warnings + cargo test, one gate
 ./scripts/test_e2e.sh          # full live E2E against a real simply_ip_vault + simply_ip_exporter pair
 ```
 
 `scripts/test_e2e.sh` builds and boots both services against throwaway SQLite databases with
 deterministic bootstrap keys, provisions Vault, configures an exporter endpoint, and asserts —
-across 141 checks in 15 sections — the feed pipeline (aggregation, filtering, ETag/304, rate
+across 166 checks in 16 sections — the feed pipeline (aggregation, filtering, ETag/304, rate
 limiting), Vault soft-delete propagation via differential sync, hot-reload of endpoint config with
 no restart, `bound_ips` client-IP restriction, a full graceful-restart-with-encryption cycle
 (Master key, a Daughter key's encrypted secret, and the endpoint row all surviving a `SIGTERM` and

@@ -26,6 +26,14 @@ pub struct Model {
     pub vault_groups: String,
     /// In-memory cache retention duration and refresh interval, in seconds.
     pub ttl_seconds: i32,
+    /// Retention window: how recently a Vault record must have been updated to appear in this
+    /// endpoint's feed, in seconds. **`0` means unlimited** (no age cutoff) and is the default.
+    ///
+    /// Distinct from [`ttl_seconds`](Self::ttl_seconds), which governs how often this endpoint is
+    /// *re-synced*; this one governs which of the synced records are *published*. Evaluated at feed
+    /// generation, not at sync — see [`crate::cache::IpCache::snapshot_within`].
+    #[sea_orm(default_value = 0)]
+    pub max_age_seconds: i64,
     /// Comma-separated allowed CIDR networks, bare IPs, and/or hostnames (resolved at request
     /// time, see `bound_ips`) for client queries against this public feed.
     #[sea_orm(column_type = "Text", nullable)]

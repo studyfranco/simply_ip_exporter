@@ -21,6 +21,7 @@ This document defines the official database schema, SeaORM entity models, relati
 | signing_secret    |       | token_secret              |
 | bound_ips         |       | vault_groups              |
 | is_master         |       | ttl_seconds               |
+|                   |       | max_age_seconds           |
 | master_marker     |       | bound_ips                 |
 | can_manage_keys   |       | filter_rfc1918            |
 | parent_key_id     |       | filter_bogons             |
@@ -87,6 +88,7 @@ Defines public feed routes exposed at `/feed/v1/<token_secret>/list.txt`.
 | `token_secret` | String | NOT NULL, UNIQUE, INDEXED (`idx_endpoints_token_secret`) | Unique random secret token used in the public URL path (`/feed/v1/<token_secret>/list.txt`). |
 | `vault_groups` | Text | NOT NULL | Comma-separated list of target group names/UUIDs fetched from `simply_ip_vault`. |
 | `ttl_seconds` | Integer | NOT NULL, DEFAULT `3600` | In-memory cache retention duration and refresh interval. |
+| `max_age_seconds` | BigInteger | NOT NULL, DEFAULT `0`, `>= 0` | Retention window: how recently a Vault record must have been updated to appear in this endpoint's feed. **`0` means unlimited** (no age cutoff) — the default, so every endpoint predating this column keeps its previous behaviour. Distinct from `ttl_seconds`, which governs how often the endpoint is *re-synced*; this governs which synced records are *published*. Validated `>= 0` at the API boundary (`api::endpoints::validate_max_age`) and applied at feed generation, not at sync (`cache::IpCache::snapshot_within`) — so an edit takes effect on the next fetch, is non-destructive, and keeps the window accurate as time passes. Added 2026-08-26. |
 | `bound_ips` | Text | NULLABLE | Comma-separated allowed CIDR networks for client queries against this public feed endpoint. |
 | `filter_rfc1918` | Boolean | NOT NULL, DEFAULT `false` | When `true`, strips private IPv4 ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) from output. |
 | `filter_bogons` | Boolean | NOT NULL, DEFAULT `false` | When `true`, strips invalid, unallocated, or reserved IP ranges. |

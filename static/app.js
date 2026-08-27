@@ -308,7 +308,7 @@ async function loadEndpoints() {
   const tbody = el('endpoints-body');
   tbody.innerHTML = '';
   if (endpoints.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="7" class="table-empty">No endpoints yet — create one below.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8" class="table-empty">No endpoints yet — create one below.</td></tr>';
   }
   for (const ep of endpoints) {
     const tr = document.createElement('tr');
@@ -317,6 +317,7 @@ async function loadEndpoints() {
       <td>${escapeHtml(ep.name)}<div class="text-muted text-sm">${escapeHtml(ep.vault_groups)}</div></td>
       <td class="font-mono break-all">${escapeHtml(feedUrl)}</td>
       <td>${ep.ttl_seconds}s</td>
+      <td>${formatMaxAge(ep.max_age_seconds)}</td>
       <td>${[ep.filter_rfc1918 && 'RFC1918', ep.filter_bogons && 'Bogons', ep.filter_loopback && 'Loopback'].filter(Boolean).join(', ') || '—'}</td>
       <td class="font-mono text-sm">${ep.bound_ips ? escapeHtml(ep.bound_ips) : '<span class="text-muted">Unrestricted</span>'}</td>
       <td>${ep.last_synced_at || 'never'}</td>
@@ -423,6 +424,7 @@ async function createEndpoint(event) {
       description: el('ep-description').value || null,
       vault_groups: readGroupPicker('ep-groups-list'),
       ttl_seconds: parseInt(el('ep-ttl').value, 10) || 3600,
+      max_age_seconds: parseInt(el('ep-max-age').value, 10) || 0,
       bound_ips: el('ep-bound-ips').value || null,
       filter_rfc1918: el('ep-filter-rfc1918').checked,
       filter_bogons: el('ep-filter-bogons').checked,
@@ -446,6 +448,7 @@ function openEditEndpointModal(target) {
   el('edit-ep-name').value = target.name;
   el('edit-ep-description').value = target.description || '';
   el('edit-ep-ttl').value = target.ttl_seconds;
+  el('edit-ep-max-age').value = target.max_age_seconds;
   el('edit-ep-bound-ips').value = target.bound_ips || '';
   el('edit-ep-filter-rfc1918').checked = target.filter_rfc1918;
   el('edit-ep-filter-bogons').checked = target.filter_bogons;
@@ -473,6 +476,7 @@ async function submitEditEndpoint(event) {
       description: el('edit-ep-description').value,
       vault_groups: readGroupPicker('edit-ep-groups-list'),
       ttl_seconds: parseInt(el('edit-ep-ttl').value, 10) || 3600,
+      max_age_seconds: parseInt(el('edit-ep-max-age').value, 10) || 0,
       bound_ips: el('edit-ep-bound-ips').value,
       filter_rfc1918: el('edit-ep-filter-rfc1918').checked,
       filter_bogons: el('edit-ep-filter-bogons').checked,
@@ -955,6 +959,20 @@ function formatTimestamp(raw) {
   const date = new Date(hasTimezone ? raw : `${raw}Z`);
   if (Number.isNaN(date.getTime())) return raw;
   return date.toLocaleString('en-GB');
+}
+
+// Renders an endpoint's retention window for the endpoints table. 0 is the documented spelling of
+// "unlimited" (no age cutoff), not "zero seconds" — showing a bare "0s" would read as the opposite
+// of what it means. Anything else is shown both raw and in the largest whole unit that divides it
+// evenly, so "3600s / 1h" stays scannable without hiding the exact configured value.
+function formatMaxAge(seconds) {
+  const value = Number(seconds);
+  if (!Number.isFinite(value) || value <= 0) return '<span class="text-muted">Unlimited</span>';
+  const units = [['d', 86400], ['h', 3600], ['m', 60]];
+  for (const [suffix, size] of units) {
+    if (value % size === 0) return `${value}s <span class="text-muted">/ ${value / size}${suffix}</span>`;
+  }
+  return `${value}s`;
 }
 
 // ── Wiring ───────────────────────────────────────────────────────────────────

@@ -1,5 +1,75 @@
 # Agent Worklog — `simply_ip_exporter`
 
+## 2026-08-26 (session 19) — `max_age_seconds`: a per-endpoint retention window, `0` = unlimited
+
+New `endpoints.max_age_seconds` (BigInteger, `NOT NULL DEFAULT 0`, validated `>= 0`) bounding how
+recently a Vault record must have been updated to be published in that endpoint's feed. `0` means
+unlimited and is the default, so every pre-existing endpoint keeps its exact previous behaviour —
+`SCHEMA.MD` §2 documents the column and its constraint.
+
+### The one real design decision: filter at feed time, not at sync time
+
+The brief allowed either. Filtering during sync is simpler but wrong in three ways an operator would
+experience as the feature being broken, so `cache::IpCache::snapshot_within` applies the cutoff at
+feed generation instead:
+
+1. **Config edits would not take effect.** Lowering the window would leave already-cached stale
+   records published until the next sync — up to `ttl_seconds`, or 24h for a full sync. Applied at
+   feed time, an edit lands on the very next fetch.
+2. **It would be destructive and irreversible.** Records dropped at sync time are gone; *raising*
+   the window back could not restore them without a full re-sync. The window is now a pure view over
+   a complete cache — `narrowing_then_widening_the_window_restores_records_without_a_resync` pins
+   this, and e2e §4c proves it end-to-end by widening a feed back to unlimited and watching both
+   records return with no sync in between.
+3. **The window would drift.** The cutoff is relative to *now*; a record fresh at sync time goes
+   stale minutes later and would keep being served until the next sync happened to re-evaluate it.
+
+The cost is that `CachedRecord` now carries `updated_at` alongside its network — a small, bounded
+addition to a cache that already held the record. `snapshot()` is retained as a thin
+`snapshot_within(id, 0, now)` wrapper so every existing caller and test is untouched.
+
+`snapshot_within` takes `now` as a parameter rather than reading the clock itself, which is what
+lets the unit tests pin time and assert the boundary exactly instead of sleeping. The boundary is
+inclusive (`updated_at >= cutoff`): an exclusive comparison would silently drop a record on every
+tick in a system that refreshes records on an interval equal to the window. A negative window is
+treated as unlimited rather than emptying the feed — the API validates `>= 0`, but a hand-edited
+database row must not be able to blank a feed silently.
+
+### Migration portability
+
+`ColumnDef::big_integer().not_null().default(0)` via SeaORM's vendor-agnostic builder, no raw SQL,
+so it applies unchanged on SQLite/PostgreSQL/MariaDB per `AGENT.MD`. `big_integer` (i64) rather than
+`integer` so a window can exceed i32's ~68-year second ceiling and so it hands straight to
+`chrono::Duration::seconds`, which takes an i64. `NOT NULL DEFAULT 0` rather than nullable because
+"unlimited" is a real, expressible value here — a `NULL` would force every read site to re-decide
+what absence means.
+
+### Verification
+
+- 6 new `cache` unit tests: zero-is-unlimited; a positive window dropping only what is outside it;
+  the inclusive boundary (kept at exactly the cutoff, dropped one second past); narrow-then-widen
+  restoring without a re-sync; a negative window treated as unlimited; and a differential upsert
+  refreshing a record's age (a delta must re-register `updated_at`, or a record Vault considers
+  current would age out).
+- 1 new integration test covering the API surface: omitted → `0`, explicit set on create, negative
+  refused on *both* create and update, update round-trip, and — the part worth having — that the
+  refused update left the stored value unchanged.
+- New e2e §4c: three feeds over the *same* Vault group holding one fresh and one 2h-stale record
+  (seeded with an explicit `updated_at` through Vault's batch API, so "stale" is deterministic
+  rather than a sleep), differing only in `max_age_seconds` — `0` publishes both, `3600` publishes
+  only the fresh one, `10` publishes nothing (the elapsed test runtime alone exceeds it, which is
+  the boundary case proving the cutoff is evaluated against *now* per request rather than frozen at
+  sync). Then widens the tight feed back to `0` and watches both records return with no re-sync.
+  A negative `max_age_seconds` is also refused at creation.
+- UI: "Max IP Age / Time Window (seconds)" on both endpoint modals with the specified hint, and a
+  new endpoints-table column rendering `0` as a muted "Unlimited" (a bare "0s" would read as the
+  exact opposite of what it means) and otherwise `3600s / 1h` — raw value plus the largest whole
+  unit that divides it evenly, so the configured number stays visible.
+- Gates: `cargo check`/`clippy -D warnings` clean; `cargo test` 129 lib + 4 main + 41 integration +
+  13 hygiene = 187 passed; `verify_convergence.sh` all checks pass; `test_e2e.sh` **166/166** (was
+  141 — §4c plus the fixture, with three pre-existing hardcoded counts updated for the new group and
+  endpoints).
+
 ## 2026-08-26 (session 18) — The ~50-record truncation: `fetch_ips` never paginated
 
 Production published only ~50 IPs regardless of how many Vault held. Root cause confirmed in

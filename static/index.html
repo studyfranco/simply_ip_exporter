@@ -76,7 +76,7 @@
         </div>
         <div class="table-container">
           <table class="data-table">
-            <thead><tr><th>Name / Groups</th><th>Feed URL</th><th>TTL</th><th>Filters</th><th>Bound IPs</th><th>Last synced</th><th></th></tr></thead>
+            <thead><tr><th>Name / Groups</th><th>Feed URL</th><th>TTL</th><th>Max IP Age</th><th>Filters</th><th>Bound IPs</th><th>Last synced</th><th></th></tr></thead>
             <tbody id="endpoints-body"></tbody>
           </table>
         </div>
@@ -264,6 +264,11 @@
           <input type="number" id="ep-ttl" class="input-field" value="3600" min="1" />
         </div>
         <div class="form-group">
+          <label for="ep-max-age">Max IP Age / Time Window (seconds)</label>
+          <input type="number" id="ep-max-age" class="input-field" value="0" min="0" />
+          <small class="field-hint">Maximum age in seconds since an IP was last updated to be included in the feed. Set to 0 for unlimited (default).</small>
+        </div>
+        <div class="form-group">
           <label for="ep-bound-ips">Bound IPs (comma-separated CIDR, IP, or hostname, optional)</label>
           <input type="text" id="ep-bound-ips" class="input-field" placeholder="203.0.113.0/24, vpn.internal" />
           <small class="field-hint">Restricts which client IPs may fetch this feed. Leave blank
@@ -313,6 +318,11 @@
         <div class="form-group">
           <label for="edit-ep-ttl">TTL seconds</label>
           <input type="number" id="edit-ep-ttl" class="input-field" min="1" />
+        </div>
+        <div class="form-group">
+          <label for="edit-ep-max-age">Max IP Age / Time Window (seconds)</label>
+          <input type="number" id="edit-ep-max-age" class="input-field" min="0" />
+          <small class="field-hint">Maximum age in seconds since an IP was last updated to be included in the feed. Set to 0 for unlimited (default).</small>
         </div>
         <div class="form-group">
           <label for="edit-ep-bound-ips">Bound IPs (comma-separated CIDR, IP, or hostname, optional)</label>

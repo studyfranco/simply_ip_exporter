@@ -37,6 +37,7 @@ pub struct EndpointResponse {
     feed_path: String,
     vault_groups: String,
     ttl_seconds: i32,
+    max_age_seconds: i64,
     bound_ips: Option<String>,
     filter_rfc1918: bool,
     filter_bogons: bool,
@@ -57,6 +58,7 @@ impl From<endpoint::Model> for EndpointResponse {
             token_secret: m.token_secret,
             vault_groups: m.vault_groups,
             ttl_seconds: m.ttl_seconds,
+            max_age_seconds: m.max_age_seconds,
             bound_ips: m.bound_ips,
             filter_rfc1918: m.filter_rfc1918,
             filter_bogons: m.filter_bogons,
@@ -77,6 +79,8 @@ pub struct CreateEndpointPayload {
     description: Option<String>,
     vault_groups: String,
     ttl_seconds: Option<i32>,
+    /// Retention window in seconds; `0`/omitted means unlimited. See `entities::endpoint`.
+    max_age_seconds: Option<i64>,
     bound_ips: Option<String>,
     #[serde(default)]
     filter_rfc1918: bool,
@@ -89,6 +93,17 @@ pub struct CreateEndpointPayload {
 fn validate_groups(raw: &str) -> Result<(), AppError> {
     if raw.split(',').map(str::trim).all(str::is_empty) {
         return Err(AppError::InvalidInput("vault_groups must name at least one group".to_owned()));
+    }
+    Ok(())
+}
+
+/// Refuses a negative retention window. `0` is explicitly legal — it is the documented spelling of
+/// "unlimited", not a missing value — so only strictly-negative input is rejected.
+fn validate_max_age(max_age_seconds: i64) -> Result<(), AppError> {
+    if max_age_seconds < 0 {
+        return Err(AppError::InvalidInput(
+            "max_age_seconds must be zero (unlimited) or a positive number of seconds".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -142,6 +157,8 @@ pub async fn create_endpoint(
     if ttl_seconds <= 0 {
         return Err(AppError::InvalidInput("ttl_seconds must be positive".to_owned()));
     }
+    let max_age_seconds = payload.max_age_seconds.unwrap_or(0);
+    validate_max_age(max_age_seconds)?;
 
     let now = Utc::now().naive_utc();
     let model = endpoint::ActiveModel {
@@ -152,6 +169,7 @@ pub async fn create_endpoint(
         token_secret: Set(generate_token_secret()),
         vault_groups: Set(payload.vault_groups),
         ttl_seconds: Set(ttl_seconds),
+        max_age_seconds: Set(max_age_seconds),
         bound_ips: Set(bound_ips),
         filter_rfc1918: Set(payload.filter_rfc1918),
         filter_bogons: Set(payload.filter_bogons),
@@ -202,6 +220,7 @@ pub struct UpdateEndpointPayload {
     description: Option<String>,
     vault_groups: Option<String>,
     ttl_seconds: Option<i32>,
+    max_age_seconds: Option<i64>,
     bound_ips: Option<String>,
     filter_rfc1918: Option<bool>,
     filter_bogons: Option<bool>,
@@ -249,6 +268,11 @@ pub async fn update_endpoint(
         }
         active.ttl_seconds = Set(ttl_seconds);
         changed.push("ttl_seconds");
+    }
+    if let Some(max_age_seconds) = payload.max_age_seconds {
+        validate_max_age(max_age_seconds)?;
+        active.max_age_seconds = Set(max_age_seconds);
+        changed.push("max_age_seconds");
     }
     if let Some(bound_ips) = payload.bound_ips {
         let trimmed = bound_ips.trim();

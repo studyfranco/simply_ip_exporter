@@ -458,6 +458,36 @@ api_call "$VAULT_URL" GET "/api/ips?groups=pfBlocker_Pagination_Test" "$VAULT_MA
 check "200" "Vault serves the pagination group"
 check_jq "length" "50" "Vault truncates to its default limit=50 when no limit is supplied (the bug's root cause)"
 
+# ── Retention-window fixture (§4c) ──────────────────────────────────────────
+# Two records in one group, differing only in age, so `max_age_seconds` is the single variable
+# distinguishing what the three §4c feeds publish. Vault's batch API accepts an explicit
+# `updated_at` per record, which makes "stale" deterministic — no sleeping, no wall-clock racing.
+# Both are lone hosts in distinct /24s, so neither aggregates and a line count is a record count.
+log "Creating pfBlocker_Age_Test with one fresh and one deliberately stale record..."
+api_call "$VAULT_URL" POST "/api/groups" "$VAULT_MASTER_KEY" '{"name":"pfBlocker_Age_Test"}'
+check "200" "pfBlocker_Age_Test group is created"
+AGE_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+AGE_BATCH=$(python3 <<'PY'
+import datetime, json
+now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+stale = now - datetime.timedelta(hours=2)
+fmt = lambda t: t.strftime("%Y-%m-%dT%H:%M:%S")
+print(json.dumps({
+    "group_name": "pfBlocker_Age_Test",
+    "mode": "upsert",
+    "skip_webhooks": True,
+    "records": [
+        {"target_address": "52.0.0.1", "cause": "fresh", "updated_at": fmt(now)},
+        {"target_address": "52.0.1.1", "cause": "stale (2h old)", "updated_at": fmt(stale)},
+    ],
+}))
+PY
+)
+api_call "$VAULT_URL" POST "/api/records/batch" "$VAULT_MASTER_KEY" "$AGE_BATCH"
+check "200" "the fresh + stale record pair is seeded into pfBlocker_Age_Test"
+check_jq ".created" "2" "Vault reports both age-fixture records created"
+
 log "Seeding pfBlocker_Blacklist with a contiguous/overlapping pair and a CGN (bogon) address..."
 # 8.8.8.0/24 + 8.8.8.1/32 (a host fully inside that block) is the aggregation fixture: a
 # spec-compliant ipnet::IpNet::aggregate() must collapse them into the single block 8.8.8.0/24.
@@ -503,6 +533,9 @@ check "200" "can_read granted on pfBlocker_Secondary_Test"
 api_call "$VAULT_URL" POST "/api/keys/$EXPORTER_VAULT_KEY_ID/groups" "$VAULT_MASTER_KEY" \
     "{\"group_id\":\"$PAGINATION_GROUP_ID\",\"can_read\":true,\"can_write\":false,\"can_delete\":false}"
 check "200" "can_read granted on pfBlocker_Pagination_Test"
+api_call "$VAULT_URL" POST "/api/keys/$EXPORTER_VAULT_KEY_ID/groups" "$VAULT_MASTER_KEY" \
+    "{\"group_id\":\"$AGE_GROUP_ID\",\"can_read\":true,\"can_write\":false,\"can_delete\":false}"
+check "200" "can_read granted on pfBlocker_Age_Test"
 
 api_call "$VAULT_URL" GET "/api/ips?groups=pfBlocker_Blacklist,pfBlocker_Private_Test,pfBlocker_Secondary_Test" "$EXPORTER_VAULT_KEY"
 check "200" "the scoped Exporter key can read across all three groups"
@@ -546,7 +579,7 @@ check "401" "an unsigned admin API request is rejected"
 log "Listing Vault groups via Exporter's GET /api/vault-groups (live Vault call)..."
 api_call "$EXPORTER_URL" GET "/api/vault-groups" "$EXPORTER_MASTER_KEY"
 check "200" "GET /api/vault-groups returns 200 OK against live Vault"
-check_jq "length" "4" "sees all 4 Vault groups accessible to Exporter's Vault key (Blacklist, Private, Secondary, Pagination)"
+check_jq "length" "5" "sees all 5 Vault groups accessible to Exporter's Vault key (Blacklist, Private, Secondary, Pagination, Age)"
 check_contains "$RESP_BODY" "pfBlocker_Blacklist" "pfBlocker_Blacklist is returned by live Vault group listing"
 check_contains "$RESP_BODY" "pfBlocker_Private_Test" "pfBlocker_Private_Test is returned by live Vault group listing"
 check_contains "$RESP_BODY" "pfBlocker_Secondary_Test" "pfBlocker_Secondary_Test is returned by live Vault group listing"
@@ -627,6 +660,31 @@ check "200" "the large-dataset feed endpoint is created"
 PAGINATION_FEED_PATH=$(echo "$RESP_BODY" | jq -r '.feed_path')
 log "Pagination feed path: $PAGINATION_FEED_PATH"
 
+# Three endpoints over the SAME group, differing only in max_age_seconds — so §4c's differing
+# results can only be attributable to the retention window. Created here so they sync in the same
+# background pass the wait below already covers.
+log "Creating three retention-window feeds over pfBlocker_Age_Test (max_age_seconds 0 / 3600 / 10)..."
+api_call "$EXPORTER_URL" POST "/api/endpoints" "$EXPORTER_MASTER_KEY" \
+    '{"name":"Age Unlimited Feed","vault_groups":"pfBlocker_Age_Test","ttl_seconds":2,"max_age_seconds":0}'
+check "200" "the unlimited-retention feed is created"
+AGE_UNLIMITED_PATH=$(echo "$RESP_BODY" | jq -r '.feed_path')
+check_jq ".max_age_seconds" "0" "it reports max_age_seconds=0 (unlimited)"
+
+api_call "$EXPORTER_URL" POST "/api/endpoints" "$EXPORTER_MASTER_KEY" \
+    '{"name":"Age Windowed Feed","vault_groups":"pfBlocker_Age_Test","ttl_seconds":2,"max_age_seconds":3600}'
+check "200" "the 1-hour-window feed is created"
+AGE_WINDOWED_PATH=$(echo "$RESP_BODY" | jq -r '.feed_path')
+check_jq ".max_age_seconds" "3600" "it reports max_age_seconds=3600"
+
+api_call "$EXPORTER_URL" POST "/api/endpoints" "$EXPORTER_MASTER_KEY" \
+    '{"name":"Age Tight Feed","vault_groups":"pfBlocker_Age_Test","ttl_seconds":2,"max_age_seconds":10}'
+check "200" "the 10-second-window feed is created"
+AGE_TIGHT_PATH=$(echo "$RESP_BODY" | jq -r '.feed_path')
+
+api_call "$EXPORTER_URL" POST "/api/endpoints" "$EXPORTER_MASTER_KEY" \
+    '{"name":"Rejected Age Feed","vault_groups":"pfBlocker_Age_Test","max_age_seconds":-1}'
+check "400" "a negative max_age_seconds is refused at creation" 
+
 # sync_all_endpoints() (src/sync.rs) syncs every due endpoint sequentially within one 15s tick,
 # each a real HTTP round-trip to Vault — two endpoints due at once (as here) take measurably
 # longer than one, so the old 18s margin (15s tick + 3s slack, sized for a single endpoint) was
@@ -699,6 +757,54 @@ check_contains "$RESP_BODY" "51.0.49.1/32" "the 50th record (the last of Vault's
 check_contains "$RESP_BODY" "51.0.50.1/32" "the 51st record is present — the first one the old single-page fetch always lost"
 check_contains "$RESP_BODY" "51.0.150.1/32" "a record from the middle of page four is present"
 check_contains "$RESP_BODY" "51.0.249.1/32" "the final record is present — the walk ran to completion, not just past the first boundary"
+
+# ── 4c. Retention window (max_age_seconds) ──────────────────────────────────
+
+log_section "4c. Retention Window (max_age_seconds)"
+
+# All three feeds below read the SAME Vault group, holding exactly two records that differ only in
+# age (one fresh, one stamped 2h old at seed time). Any difference in what they publish is therefore
+# attributable to max_age_seconds alone.
+
+log "max_age_seconds=0 — unlimited, the default: both records must appear..."
+raw_call GET "$EXPORTER_URL$AGE_UNLIMITED_PATH" -H "X-Forwarded-For: 198.51.100.61"
+check "200" "the unlimited-retention feed is served"
+check_contains "$RESP_BODY" "52.0.0.1/32" "the fresh record is present"
+check_contains "$RESP_BODY" "52.0.1.1/32" "the 2h-old record is present too — 0 means no age cutoff at all"
+AGE_UNLIMITED_COUNT=$(echo "$RESP_BODY" | grep -c . || true)
+check_local "$AGE_UNLIMITED_COUNT" "2" "exactly two lines — nothing was filtered by age"
+
+log "max_age_seconds=3600 — the 2h-old record falls outside the window..."
+raw_call GET "$EXPORTER_URL$AGE_WINDOWED_PATH" -H "X-Forwarded-For: 198.51.100.62"
+check "200" "the 1-hour-window feed is served"
+check_contains "$RESP_BODY" "52.0.0.1/32" "the fresh record is still published"
+check_not_contains "$RESP_BODY" "52.0.1.1" "the 2h-old record is excluded — older than the 1h window"
+AGE_WINDOWED_COUNT=$(echo "$RESP_BODY" | grep -c . || true)
+check_local "$AGE_WINDOWED_COUNT" "1" "exactly one line survives the retention window"
+
+# The "fresh" record was stamped at seed time in §2; by the time this runs, the §3 sync wait alone
+# has put well over 10 seconds between then and now, so a 10-second window excludes even it. This is
+# the boundary case that proves the cutoff is evaluated against *now* at every feed generation
+# rather than frozen at sync time — a sync-time filter would still be publishing it.
+log "max_age_seconds=10 — a window tighter than the elapsed test runtime empties the feed..."
+raw_call GET "$EXPORTER_URL$AGE_TIGHT_PATH" -H "X-Forwarded-For: 198.51.100.63"
+check "200" "the 10-second-window feed is still served (an empty feed is not an error)"
+check_not_contains "$RESP_BODY" "52.0.0.1" "even the fresher record has aged out of a 10s window"
+check_not_contains "$RESP_BODY" "52.0.1.1" "the older record is likewise absent"
+AGE_TIGHT_COUNT=$(echo "$RESP_BODY" | grep -c . || true)
+check_local "$AGE_TIGHT_COUNT" "0" "the feed is empty — every record is older than 10 seconds"
+
+# Non-destructive by design: the cache still holds both records, so widening the window back out
+# republishes them immediately, with no re-sync required. This is the property that makes the
+# window a view over the cache rather than a filter applied during sync.
+log "Widening the tight feed's window back to unlimited must restore both records with no re-sync..."
+AGE_TIGHT_ID=$(echo "$RESP_BODY" >/dev/null; api_call "$EXPORTER_URL" GET "/api/endpoints" "$EXPORTER_MASTER_KEY" >/dev/null; echo "$RESP_BODY" | jq -r '.[] | select(.name == "Age Tight Feed") | .id')
+api_call "$EXPORTER_URL" PUT "/api/endpoints/$AGE_TIGHT_ID" "$EXPORTER_MASTER_KEY" '{"max_age_seconds":0}'
+check "200" "the retention window is widened back to unlimited"
+raw_call GET "$EXPORTER_URL$AGE_TIGHT_PATH" -H "X-Forwarded-For: 198.51.100.64"
+check "200" "the widened feed is served"
+AGE_RESTORED_COUNT=$(echo "$RESP_BODY" | grep -c . || true)
+check_local "$AGE_RESTORED_COUNT" "2" "both records are back immediately — the window is a view, not a destructive filter"
 
 # ── 5. HTTP optimizations & anti-DoS ────────────────────────────────────────
 
@@ -1091,11 +1197,13 @@ fi
 
 # The audit trail is written to the same SQLite database as everything else, so it must have
 # survived §9's restart intact — entries from both before and after the restart should be present.
-# Five endpoints are created before the restart: the main DMZ feed, §4's group-scoping "Secondary
-# Group Only Feed", §4b's large-dataset "Pagination Feed", Daughter Blacklist Feed, and §8's
-# bound_ips-restricted "Restricted Feed".
+# Eight endpoints are created before the restart: the main DMZ feed, §4's group-scoping "Secondary
+# Group Only Feed", §4b's large-dataset "Pagination Feed", §4c's three retention-window feeds,
+# Daughter Blacklist Feed, and §8's bound_ips-restricted "Restricted Feed". (The negative
+# max_age_seconds attempt in §3 was refused, so it writes no audit entry — which this count
+# incidentally confirms.)
 PRE_RESTART_COUNT=$(echo "$RESP_BODY" | jq --arg a "ENDPOINT_CREATE" '[.[] | select(.action == $a)] | length')
-check_local "$PRE_RESTART_COUNT" "5" "all five ENDPOINT_CREATE entries (created before the restart) survived it"
+check_local "$PRE_RESTART_COUNT" "8" "all eight ENDPOINT_CREATE entries (created before the restart) survived it"
 
 log "Confirming a Daughter key cannot read the audit log..."
 api_call "$EXPORTER_URL" GET "/api/audit-logs" "$DAUGHTER_KEY"

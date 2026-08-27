@@ -21,6 +21,10 @@ pub fn parse_target_address(raw: &str) -> Option<IpNet> {
 #[derive(Clone, Debug)]
 struct CachedRecord {
     network: IpNet,
+    /// Vault's `updated_at` for this record — retained (2026-08-26) so an endpoint's
+    /// `max_age_seconds` retention window can be evaluated at feed-generation time. See
+    /// [`IpCache::snapshot_within`] for why the age cutoff is applied there rather than at sync.
+    updated_at: NaiveDateTime,
 }
 
 /// The in-memory state for a single endpoint's feed.
@@ -69,7 +73,10 @@ impl IpCache {
             }
             let Some(network) = parse_target_address(&record.target_address) else { continue };
             max_updated = Some(max_updated.map_or(record.updated_at, |m| m.max(record.updated_at)));
-            entry.records.insert(record.target_address.clone(), CachedRecord { network });
+            entry.records.insert(
+                record.target_address.clone(),
+                CachedRecord { network, updated_at: record.updated_at },
+            );
         }
         entry.last_synced_at = max_updated;
         entry.last_full_sync_at = Some(tokio::time::Instant::now());
@@ -87,18 +94,64 @@ impl IpCache {
                 continue;
             }
             let Some(network) = parse_target_address(&record.target_address) else { continue };
-            entry.records.insert(record.target_address.clone(), CachedRecord { network });
+            entry.records.insert(
+                record.target_address.clone(),
+                CachedRecord { network, updated_at: record.updated_at },
+            );
         }
         entry.last_synced_at = max_updated;
     }
 
     /// The networks currently cached for an endpoint, unaggregated and unfiltered.
     pub async fn snapshot(&self, endpoint_id: Uuid) -> Vec<IpNet> {
+        self.snapshot_within(endpoint_id, 0, chrono::Utc::now().naive_utc()).await
+    }
+
+    /// As [`snapshot`](Self::snapshot), but dropping records older than an endpoint's
+    /// `max_age_seconds` retention window.
+    ///
+    /// `max_age_seconds == 0` means **unlimited** — no cutoff is computed and every cached record
+    /// is returned, which is the default and the pre-2026-08-26 behaviour exactly. A negative value
+    /// is treated the same way (the column is validated `>= 0` at the API boundary; this is
+    /// belt-and-braces so a hand-edited database row cannot make a feed mysteriously empty).
+    /// Otherwise a record survives when `updated_at >= now - max_age_seconds`.
+    ///
+    /// # Why the cutoff is applied here and not during sync
+    ///
+    /// Filtering at sync time would be simpler but wrong in three ways, all of which an operator
+    /// would experience as the feature not working:
+    ///
+    /// 1. **Config changes wouldn't take effect.** Lowering `max_age_seconds` would leave already-
+    ///    cached stale records published until the next sync — up to `ttl_seconds`, or 24h for a
+    ///    full sync. Applied here, an edit takes effect on the very next feed fetch.
+    /// 2. **It would be destructive and irreversible.** Records dropped at sync time are gone from
+    ///    the cache, so *raising* the window back up could not restore them without waiting for a
+    ///    full re-sync. Here the cache stays complete and the window is a pure view over it.
+    /// 3. **The window would drift.** The cutoff is relative to *now*; a record fresh at sync time
+    ///    goes stale minutes later and would keep being served until the next sync happened to
+    ///    re-evaluate it. Evaluating per request keeps the window continuously accurate.
+    ///
+    /// `now` is passed in rather than read here so tests can pin it.
+    pub async fn snapshot_within(
+        &self,
+        endpoint_id: Uuid,
+        max_age_seconds: i64,
+        now: NaiveDateTime,
+    ) -> Vec<IpNet> {
         let guard = self.inner.read().await;
-        guard
-            .get(&endpoint_id)
-            .map(|e| e.records.values().map(|r| r.network).collect())
-            .unwrap_or_default()
+        let Some(entry) = guard.get(&endpoint_id) else { return Vec::new() };
+
+        if max_age_seconds <= 0 {
+            return entry.records.values().map(|r| r.network).collect();
+        }
+
+        let cutoff = now - chrono::Duration::seconds(max_age_seconds);
+        entry
+            .records
+            .values()
+            .filter(|r| r.updated_at >= cutoff)
+            .map(|r| r.network)
+            .collect()
     }
 
     /// The `since` cursor for the next differential sync.
@@ -175,6 +228,126 @@ mod tests {
         assert!(cache.full_sync_due(id, std::time::Duration::from_secs(86_400)).await);
         cache.apply_full(id, &[]).await;
         assert!(!cache.full_sync_due(id, std::time::Duration::from_secs(86_400)).await);
+    }
+
+    // ── max_age_seconds retention window ──────────────────────────────────────
+
+    /// A record with an explicit `updated_at`, so a test can place it precisely relative to a
+    /// pinned "now" rather than depending on wall-clock timing.
+    fn record_at(addr: &str, updated_at: NaiveDateTime) -> VaultRecord {
+        VaultRecord { target_address: addr.to_owned(), updated_at, is_deleted: false }
+    }
+
+    fn at(s: &str) -> NaiveDateTime {
+        NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").expect("a valid fixture timestamp")
+    }
+
+    /// `0` is the documented spelling of "unlimited", and the default every pre-existing endpoint
+    /// carries — it must return everything, including a record old enough that any finite window
+    /// would drop it.
+    #[tokio::test]
+    async fn a_max_age_of_zero_means_unlimited_and_filters_nothing() {
+        let cache = IpCache::new();
+        let id = Uuid::new_v4();
+        let now = at("2026-08-26T12:00:00");
+        cache
+            .apply_full(
+                id,
+                &[
+                    record_at("10.1.2.3/32", at("2026-08-26T11:59:00")), // 60s old
+                    record_at("10.1.2.4/32", at("2020-01-01T00:00:00")), // years old
+                ],
+            )
+            .await;
+
+        assert_eq!(cache.snapshot_within(id, 0, now).await.len(), 2);
+    }
+
+    /// The core behaviour: a finite window keeps what is inside it and drops what is outside.
+    #[tokio::test]
+    async fn a_positive_max_age_drops_only_records_older_than_the_cutoff() {
+        let cache = IpCache::new();
+        let id = Uuid::new_v4();
+        let now = at("2026-08-26T12:00:00");
+        cache
+            .apply_full(
+                id,
+                &[
+                    record_at("10.0.0.1/32", at("2026-08-26T11:59:30")), // 30s old — inside 60s
+                    record_at("10.0.0.2/32", at("2026-08-26T11:58:00")), // 120s old — outside
+                ],
+            )
+            .await;
+
+        let kept = cache.snapshot_within(id, 60, now).await;
+        assert_eq!(kept.len(), 1, "only the record inside the window survives");
+        assert_eq!(kept[0].to_string(), "10.0.0.1/32");
+    }
+
+    /// The boundary is inclusive (`updated_at >= cutoff`), so a record exactly at the edge is kept.
+    /// Worth pinning: an exclusive comparison would silently drop a record every window-length tick
+    /// in a system where records are refreshed on a fixed interval equal to the window.
+    #[tokio::test]
+    async fn a_record_exactly_at_the_cutoff_is_kept() {
+        let cache = IpCache::new();
+        let id = Uuid::new_v4();
+        let now = at("2026-08-26T12:00:00");
+        cache.apply_full(id, &[record_at("10.0.0.1/32", at("2026-08-26T11:59:00"))]).await;
+
+        assert_eq!(cache.snapshot_within(id, 60, now).await.len(), 1, "exactly 60s old, window 60s");
+        assert!(
+            cache.snapshot_within(id, 59, now).await.is_empty(),
+            "one second past the window, it goes"
+        );
+    }
+
+    /// The window is a *view*, not a mutation: narrowing it then widening it again must restore the
+    /// record without a re-sync. This is the property that makes feed-time filtering non-destructive
+    /// and is the main reason the cutoff is not applied during sync.
+    #[tokio::test]
+    async fn narrowing_then_widening_the_window_restores_records_without_a_resync() {
+        let cache = IpCache::new();
+        let id = Uuid::new_v4();
+        let now = at("2026-08-26T12:00:00");
+        cache.apply_full(id, &[record_at("10.0.0.9/32", at("2026-08-26T11:00:00"))]).await;
+
+        assert!(cache.snapshot_within(id, 60, now).await.is_empty(), "an hour old, 60s window");
+        assert_eq!(
+            cache.snapshot_within(id, 7_200, now).await.len(),
+            1,
+            "widened to 2h — the record was never evicted, so it comes straight back"
+        );
+    }
+
+    /// Defensive: the API validates `max_age_seconds >= 0`, but a hand-edited database row must not
+    /// be able to turn a feed silently empty. A negative window is treated as unlimited.
+    #[tokio::test]
+    async fn a_negative_max_age_is_treated_as_unlimited_rather_than_emptying_the_feed() {
+        let cache = IpCache::new();
+        let id = Uuid::new_v4();
+        let now = at("2026-08-26T12:00:00");
+        cache.apply_full(id, &[record_at("10.0.0.1/32", at("2020-01-01T00:00:00"))]).await;
+
+        assert_eq!(cache.snapshot_within(id, -1, now).await.len(), 1);
+    }
+
+    /// A differential sync must carry `updated_at` through too, not just a full one — otherwise a
+    /// record refreshed by a delta would keep its original age and age out while Vault considers it
+    /// current.
+    #[tokio::test]
+    async fn a_differential_upsert_refreshes_a_records_age() {
+        let cache = IpCache::new();
+        let id = Uuid::new_v4();
+        let now = at("2026-08-26T12:00:00");
+        cache.apply_full(id, &[record_at("10.0.0.1/32", at("2026-08-26T10:00:00"))]).await;
+        assert!(cache.snapshot_within(id, 60, now).await.is_empty(), "2h old, outside a 60s window");
+
+        cache.apply_diff(id, &[record_at("10.0.0.1/32", at("2026-08-26T11:59:45"))]).await;
+        assert_eq!(
+            cache.snapshot_within(id, 60, now).await.len(),
+            1,
+            "the delta re-registered it, so it is inside the window again"
+        );
     }
 
     #[test]

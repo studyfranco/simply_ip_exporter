@@ -54,7 +54,14 @@ pub async fn serve_feed(
         }
     }
 
-    let raw = state.ip_cache.snapshot(ep.id).await;
+    // The endpoint's retention window is applied here, at feed generation, rather than during sync:
+    // the cutoff is relative to *now*, and an operator editing `max_age_seconds` expects the next
+    // fetch to reflect it rather than the next sync (up to 24h away). `0` means unlimited. See
+    // `cache::IpCache::snapshot_within` for the full rationale.
+    let raw = state
+        .ip_cache
+        .snapshot_within(ep.id, ep.max_age_seconds, chrono::Utc::now().naive_utc())
+        .await;
     let aggregated =
         filter_and_aggregate(&raw, ep.filter_rfc1918, ep.filter_bogons, ep.filter_loopback);
 

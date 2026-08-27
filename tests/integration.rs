@@ -1448,3 +1448,92 @@ async fn reassign_to_naming_a_nonexistent_key_is_rejected_and_changes_nothing() 
         endpoints.as_array().unwrap().iter().find(|e| e["id"] == ep_id).expect("the endpoint must still exist");
     assert_eq!(unchanged["owner_key_id"], owner.model.id.to_string());
 }
+
+/// `max_age_seconds` round-trips through create/update and is validated at both. `0` must be
+/// accepted explicitly (it is the documented spelling of "unlimited", not a missing value), and a
+/// negative window refused — including on update, where a separate code path does the checking.
+#[tokio::test]
+async fn max_age_seconds_defaults_to_unlimited_round_trips_and_refuses_negatives() {
+    let db = setup_test_db().await;
+    let master = insert_key(&db, true, true).await;
+    let state = test_state(&db).with_pinned_master(master.model.id);
+    let app = create_app(state);
+
+    // Omitted entirely -> 0 (unlimited), so every pre-existing endpoint keeps its old behaviour.
+    let created = app
+        .clone()
+        .oneshot(signed_request(
+            "POST",
+            "/api/endpoints",
+            &master,
+            r#"{"name":"Default Age","vault_groups":"g1"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let body = body_json(created).await;
+    assert_eq!(body["max_age_seconds"], 0, "omitting the field must mean unlimited");
+    let id = body["id"].as_str().unwrap().to_owned();
+
+    // Explicitly set on create.
+    let with_window = app
+        .clone()
+        .oneshot(signed_request(
+            "POST",
+            "/api/endpoints",
+            &master,
+            r#"{"name":"Windowed","vault_groups":"g1","max_age_seconds":3600}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(with_window.status(), StatusCode::OK);
+    assert_eq!(body_json(with_window).await["max_age_seconds"], 3600);
+
+    // Negative refused at create.
+    let bad_create = app
+        .clone()
+        .oneshot(signed_request(
+            "POST",
+            "/api/endpoints",
+            &master,
+            r#"{"name":"Bad","vault_groups":"g1","max_age_seconds":-1}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(bad_create.status(), StatusCode::BAD_REQUEST);
+
+    // Updated on an existing endpoint.
+    let updated = app
+        .clone()
+        .oneshot(signed_request(
+            "PUT",
+            &format!("/api/endpoints/{id}"),
+            &master,
+            r#"{"max_age_seconds":86400}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(updated.status(), StatusCode::OK);
+    assert_eq!(body_json(updated).await["max_age_seconds"], 86400);
+
+    // Negative refused at update too, and the stored value is left alone.
+    let bad_update = app
+        .clone()
+        .oneshot(signed_request(
+            "PUT",
+            &format!("/api/endpoints/{id}"),
+            &master,
+            r#"{"max_age_seconds":-5}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(bad_update.status(), StatusCode::BAD_REQUEST);
+
+    let after = app
+        .oneshot(signed_request("GET", "/api/endpoints", &master, ""))
+        .await
+        .unwrap();
+    let rows = body_json(after).await;
+    let row = rows.as_array().unwrap().iter().find(|r| r["id"] == id.as_str()).unwrap();
+    assert_eq!(row["max_age_seconds"], 86400, "the refused update must not have changed anything");
+}
