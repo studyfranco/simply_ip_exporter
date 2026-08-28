@@ -1,5 +1,74 @@
 # Agent Worklog — `simply_ip_exporter`
 
+## 2026-08-26 (session 24) — Proving the refresh lifecycle: TTL deltas, 24h drift reset, non-blocking reads
+
+Three behaviours the crate has always claimed but never asserted end to end, plus a live progressive
+e2e scenario. No production code changed — this session is entirely test coverage over existing
+guarantees, which is why `cargo check`/`clippy` were clean on the first run.
+
+### The non-blocking property, and the specific ordering that provides it
+
+`public_feed_reads_stay_fast_and_non_empty_while_a_full_resync_runs` is the one worth explaining.
+Feed reads survive a resync because of a single ordering in `sync::sync_endpoint`: the Vault fetch
+is awaited to completion **before** `cache::apply_full` takes the write lock, so the lock covers
+only the in-memory swap and never the network. Invert that — take a guard before the fetch — and
+every reader blocks for the whole multi-page sync. The test pins it with two assertions that only
+mean something together: the flood must finish *before* the resync does (proving the reads really
+overlapped it), and the slowest read must be under one page delay (proving none waited on the lock).
+
+The zero-byte assertion carries equal weight. `apply_full` clears the record map before refilling
+it, so a reader admitted mid-swap would see an *empty* feed and answer `200` with no body — which
+pfBlockerNG installs as an empty alias, silently unblocking everything the list was meant to block.
+"Available" is not sufficient here; "available and non-empty" is the actual contract.
+
+Forcing that scenario needed care. After a sync, `last_full_sync_at` is set and the next pass would
+be a cheap differential. The cache is therefore pre-warmed through `apply_diff` — which deliberately
+does *not* set that clock — leaving the endpoint due for a genuine **full** pass, so the readers
+contend with the only cache-emptying operation the worker performs. That used existing public API
+rather than adding a test-only accessor to `IpCache`.
+
+### 24h drift, stated as what a differential pass structurally cannot do
+
+`a_full_sync_replaces_the_cache_and_purges_records_vault_no_longer_lists` seeds the cache with two
+orphans Vault never lists and one record it still has. A differential pass can only add what Vault
+reports changed and remove what it reports as a tombstone — so a hard delete, a group reassignment,
+or a tombstone that fell outside a `since` window during an outage leaves a record cached forever,
+published to firewalls long after Vault stopped listing it. `apply_full`'s `records.clear()` is what
+bounds that at 24 hours, and the test asserts the cache ends up *exactly* equal to Vault's state,
+plus that the 24h clock restarts.
+
+### A fixture bug the aggregator caught
+
+The first TTL test used `203.0.113.10/32` and `.11/32`, and the feed returned `203.0.113.10/31` —
+`ipnet::IpNet::aggregate()` correctly collapsing an even-aligned pair. Correct product behaviour,
+wrong fixture: the assertions would have been testing the aggregator rather than the delta logic.
+Addresses are now spaced (`.10`/`.20`/`.30`), and the same reasoning is applied to §4e's live
+fixtures.
+
+### Live e2e §4e — progressive lifecycle under load
+
+Stage A seeds and syncs a dedicated group. Stage B mutates the *running* Vault (adds IP_C, soft-
+deletes IP_A) and waits out the TTL, asserting the differential pass both adds and purges — the
+purge being the half that would otherwise fail silently forever. Stage C floods the large
+3,714-record feed with 120 concurrent reads across three rounds spanning ~24s, which guarantees the
+flood overlaps at least one 15s worker tick and therefore a real multi-page resync. Every request
+uses a distinct `X-Forwarded-For`, since the feed throttles one full body per source IP per two
+minutes and reusing an address would measure the rate limiter instead of availability. Beyond
+"no non-200, no empty body", it asserts **min bytes == max bytes** across all 120 responses: a
+partial read caused by a concurrent cache swap would be a non-empty `200` that the other checks
+would happily pass.
+
+### Verification
+
+- 1 new `sync` unit test (24h full reset), 2 new integration tests (TTL delta progression; 100-task
+  concurrent flood vs. a deliberately slow 3-page resync).
+- e2e §4e added (Stages A/B/C). Two fixture errors of my own were caught and fixed on the first run:
+  Vault answers a soft delete with `200` + `{"deleted":"soft"}`, not `204`; and §3's
+  `/api/vault-groups` count assertion runs *before* §4e creates its group, so it stays at 7 rather
+  than 8.
+- Gates: `cargo check`/`clippy -D warnings` clean; `cargo test` 143 + 4 + 45 + 13 = 205 passed;
+  `verify_convergence.sh` all pass; `test_e2e.sh` **235/235**.
+
 ## 2026-08-26 (session 23) — IPv6 across the large-scale pagination fixture
 
 The 3,214-record scale fixture proved multi-page parallel paging for IPv4 only. Both the unit mock

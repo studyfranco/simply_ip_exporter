@@ -688,7 +688,7 @@ check "401" "an unsigned admin API request is rejected"
 log "Listing Vault groups via Exporter's GET /api/vault-groups (live Vault call)..."
 api_call "$EXPORTER_URL" GET "/api/vault-groups" "$EXPORTER_MASTER_KEY"
 check "200" "GET /api/vault-groups returns 200 OK against live Vault"
-check_jq "length" "7" "sees the 7 Vault groups this key may read (Blacklist, Private, Secondary, Pagination, Age, Group_Alpha, Group_Beta) — Group_Gamma is ungranted and correctly absent"
+check_jq "length" "7" "sees the 7 Vault groups this key may read at this point (Blacklist, Private, Secondary, Pagination, Age, Group_Alpha, Group_Beta) — Group_Gamma is ungranted and correctly absent; §4e adds an eighth later"
 check_contains "$RESP_BODY" "pfBlocker_Blacklist" "pfBlocker_Blacklist is returned by live Vault group listing"
 check_contains "$RESP_BODY" "pfBlocker_Private_Test" "pfBlocker_Private_Test is returned by live Vault group listing"
 check_contains "$RESP_BODY" "pfBlocker_Secondary_Test" "pfBlocker_Secondary_Test is returned by live Vault group listing"
@@ -1009,6 +1009,110 @@ if grep -q "403 Forbidden" "$EXPORTER_LOG"; then
 else
     check_local "none" "none" "the Exporter logged no Vault 403 Forbidden during the run"
 fi
+
+# ── 4e. Progressive sync lifecycle & concurrent availability ────────────────
+
+log_section "4e. Progressive Sync Lifecycle & Concurrent Feed Availability"
+
+# Stages A→C walk one endpoint through the hybrid refresh lifecycle against the live Vault, then
+# hold the public feed under concurrent load while the background worker keeps resyncing.
+
+# ── Stage A: initial sync ────────────────────────────────────────────────────
+log "Stage A: seeding a dedicated progressive group and syncing it..."
+api_call "$VAULT_URL" POST "/api/groups" "$VAULT_MASTER_KEY" '{"name":"pfBlocker_Progressive_Test"}'
+check "200" "pfBlocker_Progressive_Test group is created"
+PROGRESSIVE_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
+api_call "$VAULT_URL" POST "/api/keys/$EXPORTER_VAULT_KEY_ID/groups" "$VAULT_MASTER_KEY" \
+    "{\"group_id\":\"$PROGRESSIVE_GROUP_ID\",\"can_read\":true,\"can_write\":false,\"can_delete\":false}"
+check "200" "can_read granted on pfBlocker_Progressive_Test"
+
+# Non-adjacent hosts on purpose: ipnet::IpNet::aggregate() collapses an even-aligned /32 pair into a
+# /31, which would make these per-address assertions test the aggregator rather than the sync delta.
+api_call "$VAULT_URL" POST "/api/ban" "$VAULT_MASTER_KEY" '{"target_address":"81.0.0.10/32","group_name":"pfBlocker_Progressive_Test","cause":"stage A"}'
+check "200" "IP_A (81.0.0.10) seeded"
+api_call "$VAULT_URL" POST "/api/ban" "$VAULT_MASTER_KEY" '{"target_address":"81.0.0.20/32","group_name":"pfBlocker_Progressive_Test","cause":"stage A"}'
+check "200" "IP_B (81.0.0.20) seeded"
+
+api_call "$EXPORTER_URL" POST "/api/endpoints" "$EXPORTER_MASTER_KEY" \
+    '{"name":"Progressive Feed","vault_groups":"pfBlocker_Progressive_Test","ttl_seconds":2}'
+check "200" "the progressive feed endpoint is created"
+PROGRESSIVE_FEED_PATH=$(echo "$RESP_BODY" | jq -r '.feed_path')
+
+log "Waiting for the worker's next tick to perform this endpoint's initial full sync..."
+sleep 18
+
+raw_call GET "$EXPORTER_URL$PROGRESSIVE_FEED_PATH" -H "X-Forwarded-For: 198.51.100.101"
+check "200" "Stage A: the progressive feed is served"
+check_contains "$RESP_BODY" "81.0.0.10/32" "Stage A: IP_A is published"
+check_contains "$RESP_BODY" "81.0.0.20/32" "Stage A: IP_B is published"
+STAGE_A_COUNT=$(echo "$RESP_BODY" | grep -c . || true)
+check_local "$STAGE_A_COUNT" "2" "Stage A: exactly the two seeded records"
+
+# ── Stage B: mutate Vault, then cross the TTL boundary ───────────────────────
+# The addition and the soft delete together exercise both halves of a differential pass: `since=`
+# carries the new record in, and `include_deleted=true` carries the tombstone that must remove the
+# old one. A merge that ignored tombstones would keep publishing a de-listed address forever.
+log "Stage B: adding IP_C and soft-deleting IP_A in the live Vault..."
+api_call "$VAULT_URL" POST "/api/ban" "$VAULT_MASTER_KEY" '{"target_address":"81.0.0.30/32","group_name":"pfBlocker_Progressive_Test","cause":"stage B addition"}'
+check "200" "IP_C (81.0.0.30) added to Vault"
+
+api_call "$VAULT_URL" GET "/api/ips?ip=81.0.0.10" "$VAULT_MASTER_KEY"
+check "200" "IP_A is looked up for deletion"
+PROGRESSIVE_DELETE_ID=$(echo "$RESP_BODY" | jq -r '.[0].id')
+api_call "$VAULT_URL" DELETE "/api/ips/$PROGRESSIVE_DELETE_ID" "$VAULT_MASTER_KEY"
+check "200" "IP_A is soft-deleted in Vault"
+check_jq ".deleted" "soft" "the deletion is soft, so a tombstone exists for the differential pass to replicate"
+
+log "Waiting for the TTL (2s) to expire and the worker to run a differential sync..."
+sleep 18
+
+raw_call GET "$EXPORTER_URL$PROGRESSIVE_FEED_PATH" -H "X-Forwarded-For: 198.51.100.102"
+check "200" "Stage B: the progressive feed is still served"
+check_contains "$RESP_BODY" "81.0.0.20/32" "Stage B: IP_B was untouched and is still published"
+check_contains "$RESP_BODY" "81.0.0.30/32" "Stage B: IP_C was added and is now published"
+check_not_contains "$RESP_BODY" "81.0.0.10" "Stage B: the soft-deleted IP_A is purged from the feed"
+STAGE_B_COUNT=$(echo "$RESP_BODY" | grep -c . || true)
+check_local "$STAGE_B_COUNT" "2" "Stage B: exactly IP_B and IP_C remain"
+
+# ── Stage C: concurrent load while the worker keeps resyncing ────────────────
+# Aimed at the large 3,714-record pagination feed rather than the tiny one above, so each background
+# resync is a genuine multi-page parallel fetch rather than a trivial one. Three rounds spaced over
+# ~24s guarantee the flood spans at least one full 15s worker tick, so reads and a sync really do
+# overlap. Every request uses a distinct X-Forwarded-For: the feed throttles one full body per
+# source IP per 2 minutes, so reusing an address would measure the rate limiter, not availability.
+log "Stage C: flooding the $PAGINATION_TOTAL_COUNT-record feed with concurrent reads across worker sync ticks..."
+FLOOD_RESULTS="$WORK_DIR/flood_results"
+: > "$FLOOD_RESULTS"
+export EXPORTER_URL PAGINATION_FEED_PATH WORK_DIR FLOOD_RESULTS
+
+for round in 1 2 3; do
+    export round
+    seq 1 40 | xargs -P 8 -I{} sh -c '
+        body="$WORK_DIR/flood_body_${round}_{}"
+        code=$(curl -s -o "$body" -w "%{http_code}" --max-time 20 \
+            -H "X-Forwarded-For: 10.20.${round}.{}" \
+            "$EXPORTER_URL$PAGINATION_FEED_PATH")
+        printf "%s %s\n" "$code" "$(wc -c < "$body")" >> "$FLOOD_RESULTS"
+        rm -f "$body"
+    '
+    [ "$round" -lt 3 ] && sleep 8
+done
+
+FLOOD_TOTAL=$(grep -c . "$FLOOD_RESULTS" || true)
+check_local "$FLOOD_TOTAL" "120" "Stage C: all 120 concurrent feed requests completed"
+
+# A non-200, a 5xx, or a zero-byte body are each independently disqualifying: an empty 200 is the
+# specific glitch a reader admitted mid-`apply_full` (which clears before it refills) would observe,
+# and pfBlockerNG would install it as an empty alias.
+FLOOD_NOT_200=$(awk '$1 != "200"' "$FLOOD_RESULTS" | wc -l)
+check_local "$FLOOD_NOT_200" "0" "Stage C: zero non-200 responses under concurrent load during resyncs"
+FLOOD_EMPTY=$(awk '$2 == "0"' "$FLOOD_RESULTS" | wc -l)
+check_local "$FLOOD_EMPTY" "0" "Stage C: zero empty-body responses — no reader ever saw a mid-resync empty cache"
+
+# Every body must be the full feed, not a partial one truncated by a concurrent cache swap.
+FLOOD_MIN_BYTES=$(awk '{print $2}' "$FLOOD_RESULTS" | sort -n | head -1)
+FLOOD_MAX_BYTES=$(awk '{print $2}' "$FLOOD_RESULTS" | sort -n | tail -1)
+check_local "$FLOOD_MIN_BYTES" "$FLOOD_MAX_BYTES" "Stage C: every response carried an identical full-length body (min == max bytes) — no partial reads"
 
 # ── 5. HTTP optimizations & anti-DoS ────────────────────────────────────────
 
@@ -1401,13 +1505,13 @@ fi
 
 # The audit trail is written to the same SQLite database as everything else, so it must have
 # survived §9's restart intact — entries from both before and after the restart should be present.
-# Nine endpoints are created before the restart: the main DMZ feed, §4's group-scoping "Secondary
+# Ten endpoints are created before the restart: the main DMZ feed, §4's group-scoping "Secondary
 # Group Only Feed", §4b's large-dataset "Pagination Feed", §4c's three retention-window feeds,
 # Daughter Blacklist Feed, and §8's bound_ips-restricted "Restricted Feed". (The negative
 # max_age_seconds attempt in §3 was refused, so it writes no audit entry — which this count
 # incidentally confirms.)
 PRE_RESTART_COUNT=$(echo "$RESP_BODY" | jq --arg a "ENDPOINT_CREATE" '[.[] | select(.action == $a)] | length')
-check_local "$PRE_RESTART_COUNT" "9" "all nine ENDPOINT_CREATE entries (created before the restart) survived it"
+check_local "$PRE_RESTART_COUNT" "10" "all ten ENDPOINT_CREATE entries (created before the restart) survived it"
 
 log "Confirming a Daughter key cannot read the audit log..."
 api_call "$EXPORTER_URL" GET "/api/audit-logs" "$DAUGHTER_KEY"

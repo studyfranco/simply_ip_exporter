@@ -276,6 +276,68 @@ mod tests {
         }
     }
 
+    // ── The 24h full resync: drift resolution ───────────────────────────────
+
+    /// The whole point of the 24h full pass: it *replaces* the cache rather than merging into it,
+    /// so records that drifted out of sync — anything a differential pass could never learn about —
+    /// are flushed.
+    ///
+    /// A differential sync can only ever add what Vault reports as changed and remove what Vault
+    /// reports as a tombstone. A record deleted from Vault without a tombstone the exporter ever
+    /// saw (a hard delete, a group reassignment, a tombstone that fell outside a `since` window
+    /// during an outage) would otherwise sit in the cache forever, published to firewalls long after
+    /// Vault stopped listing it. `cache::apply_full`'s `records.clear()` is what bounds that drift
+    /// at 24 hours, and this test pins it at the sync layer rather than only at the cache layer.
+    #[tokio::test]
+    async fn a_full_sync_replaces_the_cache_and_purges_records_vault_no_longer_lists() {
+        let (url, _server) = spawn_mock_vault(
+            axum::http::StatusCode::OK,
+            serde_json::json!([
+                {"target_address": "203.0.113.10/32", "updated_at": "2026-08-11T10:00:00", "is_deleted": false},
+                {"target_address": "203.0.113.11/32", "updated_at": "2026-08-11T10:00:00", "is_deleted": false}
+            ]),
+        )
+        .await;
+        let db = test_db().await;
+        let state = test_state(&db, url);
+        let client = state.vault_client.clone().expect("configured");
+        let ep = insert_test_endpoint(&db, None).await;
+
+        // Stale state a differential pass could never clean up: one record Vault still has, and two
+        // orphans it does not — the drift this pass exists to resolve.
+        state
+            .ip_cache
+            .apply_diff(
+                ep.id,
+                &[
+                    seed_record("203.0.113.10/32"),
+                    seed_record("198.51.100.99/32"),
+                    seed_record("192.0.2.50/32"),
+                ],
+            )
+            .await;
+        assert_eq!(state.ip_cache.snapshot(ep.id).await.len(), 3, "precondition: three cached");
+
+        // `last_full_sync_at` is still None (only apply_diff ran), so this endpoint is due a full
+        // pass — exactly the state a process is in 24h after its last one.
+        assert!(state.ip_cache.full_sync_due(ep.id, FULL_SYNC_INTERVAL).await);
+        sync_endpoint(&state, &client, ep.clone()).await;
+
+        let mut cached: Vec<String> =
+            state.ip_cache.snapshot(ep.id).await.iter().map(|n| n.to_string()).collect();
+        cached.sort();
+        assert_eq!(
+            cached,
+            vec!["203.0.113.10/32".to_owned(), "203.0.113.11/32".to_owned()],
+            "the cache must equal Vault's canonical state exactly — the survivor kept, the new one \
+             added, and both orphans purged"
+        );
+        assert!(
+            !state.ip_cache.full_sync_due(ep.id, FULL_SYNC_INTERVAL).await,
+            "and the 24h clock restarts, so the next tick does a differential pass instead"
+        );
+    }
+
     // ── Startup sync ────────────────────────────────────────────────────────
 
     /// The property the boot sync exists for: an endpoint already in the database is synced during

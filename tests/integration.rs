@@ -1665,3 +1665,299 @@ async fn an_unreachable_vault_at_startup_does_not_prevent_the_service_from_servi
         .unwrap();
     assert_eq!(ready.status(), StatusCode::OK, "readiness is unaffected by Vault being down at boot");
 }
+
+/// Boots a Vault that answers a **full** query (no `since`) and a **differential** one
+/// (`since=…&include_deleted=true`) with different bodies, so one server can drive an endpoint
+/// through a complete TTL progression.
+async fn spawn_staged_mock_vault(
+    full: serde_json::Value,
+    differential: serde_json::Value,
+) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+    use axum::{Router, extract::RawQuery, routing::get};
+
+    let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+    let seen_for_handler = std::sync::Arc::clone(&seen);
+
+    let app = Router::new().route(
+        "/api/ips",
+        get(move |RawQuery(query): RawQuery| {
+            let (full, differential) = (full.clone(), differential.clone());
+            let seen = std::sync::Arc::clone(&seen_for_handler);
+            async move {
+                let query = query.unwrap_or_default();
+                if let Ok(mut guard) = seen.lock() {
+                    guard.push(query.clone());
+                }
+                // `since=` is present only on a differential fetch — the exporter adds it (together
+                // with include_deleted=true) exactly when it has a last_synced_at to page from.
+                let body = if query.contains("since=") { differential } else { full };
+                axum::Json(body)
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback bind always succeeds");
+    let addr = listener.local_addr().expect("a bound listener has a local address");
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}"), seen, handle)
+}
+
+fn record(address: &str, deleted: bool) -> serde_json::Value {
+    serde_json::json!({
+        "target_address": address,
+        "updated_at": "2026-08-11T10:00:00",
+        "is_deleted": deleted,
+    })
+}
+
+async fn feed_body(app: axum::Router, path: &str, source: [u8; 4]) -> String {
+    let response = app.oneshot(feed_request(path, source)).await.expect("the feed responds");
+    assert_eq!(response.status(), StatusCode::OK, "the feed must always answer 200");
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("body reads");
+    String::from_utf8(bytes.to_vec()).expect("the feed is UTF-8")
+}
+
+/// The hybrid refresh lifecycle across a TTL boundary: a full sync establishes the baseline, then a
+/// differential pass must both **add** what Vault gained and **purge** what Vault soft-deleted.
+///
+/// The purge half is the one worth pinning. Additions are self-evident in the output, but a
+/// tombstone is a record that must *stop* being published — and a differential merge that silently
+/// ignored `is_deleted` would keep serving a de-listed address to every firewall consuming the
+/// feed, indefinitely, with no error anywhere to notice.
+#[tokio::test]
+async fn a_delta_sync_after_ttl_expiry_adds_new_records_and_purges_soft_deleted_ones() {
+    // Deliberately non-adjacent: `ipnet::IpNet::aggregate()` collapses an even-aligned pair of
+    // /32s into a /31 (as .10 + .11 would be), which is correct behaviour but would make these
+    // per-address assertions test the aggregator instead of the delta logic.
+    const IP_A: &str = "203.0.113.10/32";
+    const IP_B: &str = "203.0.113.20/32";
+    const IP_C: &str = "203.0.113.30/32";
+
+    let (vault_url, seen, _vault) = spawn_staged_mock_vault(
+        // Full sync: the initial pair.
+        serde_json::json!([record(IP_A, false), record(IP_B, false)]),
+        // Differential: IP_C appears, IP_A arrives as a tombstone.
+        serde_json::json!([record(IP_C, false), record(IP_A, true)]),
+    )
+    .await;
+
+    let db = setup_test_db().await;
+    let master = insert_key(&db, true, true).await;
+    let state = test_state_with_vault(&db, vault_url).with_pinned_master(master.model.id);
+    let app = create_app(state.clone());
+
+    // ttl_seconds = 1 so a real (short) TTL boundary can be crossed without mocking the clock.
+    let created = app
+        .clone()
+        .oneshot(signed_request(
+            "POST",
+            "/api/endpoints",
+            &master,
+            r#"{"name":"TTL Progression Feed","vault_groups":"g1","ttl_seconds":1}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let feed_path = body_json(created).await["feed_path"].as_str().unwrap().to_owned();
+
+    // ── Stage 1: the initial full sync ───────────────────────────────────────
+    simply_ip_exporter::sync::run_boot_sync(&state).await;
+
+    let stage1 = feed_body(app.clone(), &feed_path, [198, 51, 100, 91]).await;
+    assert!(stage1.contains(IP_A), "IP_A must be published after the full sync: {stage1:?}");
+    assert!(stage1.contains(IP_B), "IP_B must be published after the full sync: {stage1:?}");
+    assert_eq!(stage1.lines().count(), 2, "exactly the two seeded records: {stage1:?}");
+
+    assert!(
+        !seen.lock().expect("not poisoned")[0].contains("since="),
+        "the first pass must be a full sync, not a differential one"
+    );
+
+    // ── Stage 2: cross the TTL boundary ──────────────────────────────────────
+    // `sync_endpoint` treats an endpoint as due when `now - last_synced_at >= ttl_seconds`, so
+    // waiting out the 1s TTL is what makes the next pass differential rather than a no-op.
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+
+    // ── Stage 3: the differential pass ───────────────────────────────────────
+    simply_ip_exporter::sync::run_boot_sync(&state).await;
+
+    let queries = seen.lock().expect("not poisoned").clone();
+    let differential = queries
+        .last()
+        .expect("a second pass ran");
+    assert!(differential.contains("since="), "the second pass must carry a cutoff: {differential}");
+    assert!(
+        differential.contains("include_deleted=true"),
+        "and must ask for tombstones, or a deletion could never be replicated: {differential}"
+    );
+
+    // ── Stage 4: the cache reflects both halves of the delta ─────────────────
+    let stage2 = feed_body(app, &feed_path, [198, 51, 100, 92]).await;
+    assert!(stage2.contains(IP_B), "IP_B was untouched and must still be published: {stage2:?}");
+    assert!(stage2.contains(IP_C), "IP_C was added and must now be published: {stage2:?}");
+    assert!(
+        !stage2.contains(IP_A),
+        "IP_A was soft-deleted in Vault and must be purged from the feed entirely: {stage2:?}"
+    );
+    assert_eq!(stage2.lines().count(), 2, "exactly IP_B and IP_C remain: {stage2:?}");
+}
+
+/// Boots a Vault whose every page response is delayed, simulating the heavy multi-page fetch a
+/// large full resync performs. Paginates via the `include_total` envelope so the delay is paid
+/// across several real page requests rather than one.
+async fn spawn_slow_paginating_vault(
+    total: usize,
+    page_delay: std::time::Duration,
+) -> (String, tokio::task::JoinHandle<()>) {
+    use axum::{Router, extract::RawQuery, routing::get};
+
+    let app = Router::new().route(
+        "/api/ips",
+        get(move |RawQuery(query): RawQuery| async move {
+            tokio::time::sleep(page_delay).await;
+
+            let query = query.unwrap_or_default();
+            let param = |name: &str| -> Option<u64> {
+                query
+                    .split('&')
+                    .find_map(|kv| kv.strip_prefix(&format!("{name}=")))
+                    .and_then(|v| v.parse().ok())
+            };
+            let limit = param("limit").unwrap_or(50) as usize;
+            let offset = param("offset").unwrap_or(0) as usize;
+            // Lone hosts in distinct /24s: nothing aggregates, so a line count is a record count.
+            let page: Vec<serde_json::Value> = (offset..total.min(offset + limit))
+                .map(|i| record(&format!("51.{}.{}.1/32", i / 256, i % 256), false))
+                .collect();
+
+            if query.contains("include_total=true") {
+                let total_pages = if limit == 0 { 0 } else { total.div_ceil(limit) };
+                return axum::Json(serde_json::json!({
+                    "data": page, "total": total, "limit": limit,
+                    "offset": offset, "total_pages": total_pages,
+                }));
+            }
+            axum::Json(serde_json::Value::Array(page))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback bind always succeeds");
+    let addr = listener.local_addr().expect("a bound listener has a local address");
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}"), handle)
+}
+
+/// Public feed reads must not be blocked, delayed, or emptied by a full resync running behind them.
+///
+/// This is the property `AGENT.MD`'s "keep serving the cache" contract rests on, and it holds
+/// because of one specific ordering in `sync::sync_endpoint`: the Vault fetch is awaited to
+/// completion *before* `cache::apply_full` takes the write lock, so the lock is held only for the
+/// in-memory swap and never across the network. If that ordering were ever inverted — a write guard
+/// taken before the fetch — every reader would block for the full duration of a multi-page sync, and
+/// this test is what would catch it.
+///
+/// The zero-byte assertion matters just as much as the status one: `apply_full` clears the record
+/// map before refilling it, so a reader admitted mid-swap would observe an *empty* feed and answer
+/// `200` with no body — which pfBlockerNG installs as an empty alias, silently unblocking
+/// everything the list was meant to block.
+#[tokio::test]
+async fn public_feed_reads_stay_fast_and_non_empty_while_a_full_resync_runs() {
+    const RECORDS: usize = 3_000; // 3 pages at PAGE_SIZE 1000
+    const PAGE_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
+    const READERS: usize = 100;
+
+    let (vault_url, _vault) = spawn_slow_paginating_vault(RECORDS, PAGE_DELAY).await;
+
+    let db = setup_test_db().await;
+    let master = insert_key(&db, true, true).await;
+    let state = test_state_with_vault(&db, vault_url).with_pinned_master(master.model.id);
+    let app = create_app(state.clone());
+
+    let created = app
+        .clone()
+        .oneshot(signed_request(
+            "POST",
+            "/api/endpoints",
+            &master,
+            r#"{"name":"Concurrency Feed","vault_groups":"g1","ttl_seconds":1}"#,
+        ))
+        .await
+        .unwrap();
+    let created = body_json(created).await;
+    let feed_path = created["feed_path"].as_str().unwrap().to_owned();
+    let endpoint_id: uuid::Uuid = created["id"].as_str().unwrap().parse().expect("a uuid");
+
+    // Warm the cache directly through `apply_diff` rather than by running a sync. Two reasons:
+    // an empty feed during the *first* ever sync is expected (that is what `run_boot_sync` exists
+    // to prevent) so the property under test is specifically about a resync over an already-warm
+    // cache; and `apply_diff` deliberately does not set `last_full_sync_at`, which leaves the
+    // endpoint due for a **full** pass — so the readers below contend with `apply_full`'s
+    // clear-then-refill, the heaviest and only cache-emptying operation the worker performs.
+    let warm: Vec<simply_ip_exporter::cache::VaultRecord> = (0..RECORDS)
+        .map(|i| simply_ip_exporter::cache::VaultRecord {
+            target_address: format!("51.{}.{}.1/32", i / 256, i % 256),
+            updated_at: chrono::NaiveDateTime::parse_from_str("2026-08-11T10:00:00", "%Y-%m-%dT%H:%M:%S")
+                .expect("a valid fixture timestamp"),
+            is_deleted: false,
+        })
+        .collect();
+    state.ip_cache.apply_diff(endpoint_id, &warm).await;
+
+    let warmed = feed_body(app.clone(), &feed_path, [198, 51, 100, 95]).await;
+    assert_eq!(
+        warmed.lines().count(),
+        RECORDS,
+        "precondition: the cache is fully warm before the concurrent phase"
+    );
+
+    let sync_state = state.clone();
+    let sync_started = std::time::Instant::now();
+    let syncing = tokio::spawn(async move {
+        simply_ip_exporter::sync::run_boot_sync(&sync_state).await;
+        sync_started.elapsed()
+    });
+
+    // 100 concurrent readers, each from a distinct source address — the public feed throttles one
+    // full body per source IP per 2 minutes, so reusing one address would measure the rate limiter
+    // instead of the lock.
+    let flood_started = std::time::Instant::now();
+    let mut readers = Vec::with_capacity(READERS);
+    for i in 0..READERS {
+        let app = app.clone();
+        let path = feed_path.clone();
+        readers.push(tokio::spawn(async move {
+            let source = [10, 0, (i / 256) as u8, (i % 256) as u8];
+            let started = std::time::Instant::now();
+            let response = app.oneshot(feed_request(&path, source)).await.expect("the feed responds");
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("body reads");
+            (status, bytes.len(), started.elapsed())
+        }));
+    }
+
+    let mut slowest = std::time::Duration::ZERO;
+    for reader in readers {
+        let (status, body_len, latency) = reader.await.expect("no reader task panicked");
+        assert_eq!(status, StatusCode::OK, "every feed read must be 200 during a resync");
+        assert!(body_len > 0, "no reader may observe an empty feed mid-resync");
+        slowest = slowest.max(latency);
+    }
+    let flood_elapsed = flood_started.elapsed();
+    let sync_elapsed = syncing.await.expect("the sync task did not panic");
+
+    // The readers must have genuinely overlapped the sync, or this proves nothing.
+    assert!(
+        flood_elapsed < sync_elapsed,
+        "the flood ({flood_elapsed:?}) must finish while the resync ({sync_elapsed:?}) is still \
+         running, otherwise the reads were not concurrent with it at all"
+    );
+    // And none of them may have waited on the sync's write lock. A reader blocked behind a guard
+    // held across the fetch would show a latency on the order of the sync itself.
+    assert!(
+        slowest < PAGE_DELAY,
+        "slowest read was {slowest:?}, which is at least one page delay ({PAGE_DELAY:?}) — that is \
+         lock starvation, not a cache read"
+    );
+}
