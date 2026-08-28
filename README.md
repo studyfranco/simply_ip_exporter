@@ -16,6 +16,9 @@ alias-list importers.
 - [Probes](#probes)
 - [Testing](#testing)
 
+For an exhaustive per-endpoint catalogue — every route, parameter, DTO and response code — see
+[`API_REFERENCE.md`](API_REFERENCE.md).
+
 ## Architecture
 
 ```

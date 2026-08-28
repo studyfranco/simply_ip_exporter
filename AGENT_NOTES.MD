@@ -1,5 +1,48 @@
 # Agent Worklog — `simply_ip_exporter`
 
+## 2026-08-26 (session 25) — `API_REFERENCE.md`: the full endpoint catalogue
+
+New root-level `API_REFERENCE.md` covering all 21 registered routes plus the static fallback,
+audited out of `src/lib.rs`'s route table and every handler, extractor, guard and middleware it
+reaches — not written from memory. Structured to mirror `example/simply_ip_vault/API_REFERENCE.md`
+section for section, so an operator moving between the pair reads the same document twice.
+
+### Findings worth recording, beyond transcription
+
+- **No path aliases exist here.** Vault serves `/api/groups` and `/api/ip_groups` (and several other
+  pairs) as synonyms; this crate registers every route exactly once. Documented explicitly, since
+  the natural assumption when moving from Vault's reference is that the same aliases exist.
+- **An unmatched `/api/...` path does not return this service's error envelope.** `ServeDir` is the
+  router *fallback*, so a typo'd API path is answered by the static file service's own `404` with a
+  non-JSON body. That is a genuinely surprising debugging detail — a client seeing a non-JSON `404`
+  is looking at a route that does not exist at all, not at a resource that is missing.
+- **`GET /api/vault-groups` degrades a Vault `403` to `[]` rather than propagating it** (verified in
+  `api::groups`, not assumed), so a restricted Vault key yields an empty picker instead of a broken
+  dashboard. Documented alongside the `503`/`502` cases so the three Vault-dependent outcomes are
+  distinguishable.
+- **`POST /api/endpoints` is the one mutating route that is not Master-only** — any authenticated
+  key may create an endpoint and becomes its owner. Easy to misread from the route table alone,
+  so the Auth column says "signed (any key)" rather than leaving it implied.
+- **`GET /api/keys/{id}/groups` is self-or-Master, not Master-only**, deliberately: a Daughter's own
+  endpoint form needs to know what it may use without holding `can_manage_keys`.
+- The `PUT` clearing convention (`""` clears, absent leaves unchanged, `null` does *not* clear) is
+  stated once in §4 Conventions rather than repeated per field — it has caused a real bug in this
+  crate before (session 14's `value || null` frontend defect).
+
+### Accuracy pass
+
+Every claim that could drift was checked against source rather than inferred: the 11 audit action
+names (grepped, matched exactly), the `409` conflict body's literal message and `owned_endpoints`
+shape, `204` vs `200` on both delete routes, `400` on a nonexistent `reassign_to`/`owner_key_id`,
+the audit `limit` cap of 500 being a silent clamp rather than a rejection, and the `CANONICAL_V1`
+payload layout from `crypto::canonical_v1_payload` itself.
+
+### Verification
+
+Documentation-only; no source changed. Gates run to confirm nothing regressed: `cargo check`/
+`clippy -D warnings` clean; `cargo test` 143 + 4 + 45 + 13 = 205 passed; `verify_convergence.sh` all
+pass; `test_e2e.sh` 235/235.
+
 ## 2026-08-26 (session 24) — Proving the refresh lifecycle: TTL deltas, 24h drift reset, non-blocking reads
 
 Three behaviours the crate has always claimed but never asserted end to end, plus a live progressive
