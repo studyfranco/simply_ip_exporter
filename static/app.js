@@ -313,14 +313,21 @@ async function loadEndpoints() {
   for (const ep of endpoints) {
     const tr = document.createElement('tr');
     const feedUrl = window.location.origin + REQUEST_BASE + ep.feed_path;
+    const filters =
+      [ep.filter_rfc1918 && 'RFC1918', ep.filter_bogons && 'Bogons', ep.filter_loopback && 'Loopback']
+        .filter(Boolean)
+        .join(', ') || '—';
     tr.innerHTML = `
-      <td>${escapeHtml(ep.name)}<div class="text-muted text-sm">${escapeHtml(ep.vault_groups)}</div></td>
-      <td class="font-mono break-all">${escapeHtml(feedUrl)}</td>
+      <td class="name-cell">
+        <span class="cell-line" title="${escapeHtml(ep.name)}">${escapeHtml(ep.name)}</span>
+        <div class="cell-line text-muted text-sm" title="${escapeHtml(ep.vault_groups)}">${escapeHtml(ep.vault_groups)}</div>
+      </td>
+      <td class="font-mono" title="${escapeHtml(feedUrl)}">${escapeHtml(feedUrl)}</td>
       <td>${ep.ttl_seconds}s</td>
       <td>${formatMaxAge(ep.max_age_seconds)}</td>
-      <td>${[ep.filter_rfc1918 && 'RFC1918', ep.filter_bogons && 'Bogons', ep.filter_loopback && 'Loopback'].filter(Boolean).join(', ') || '—'}</td>
-      <td class="font-mono text-sm">${ep.bound_ips ? escapeHtml(ep.bound_ips) : '<span class="text-muted">Unrestricted</span>'}</td>
-      <td>${ep.last_synced_at || 'never'}</td>
+      <td title="${escapeHtml(filters)}">${escapeHtml(filters)}</td>
+      <td class="font-mono text-sm" title="${ep.bound_ips ? escapeHtml(ep.bound_ips) : ''}">${ep.bound_ips ? escapeHtml(ep.bound_ips) : '<span class="text-muted">Unrestricted</span>'}</td>
+      <td class="text-sm" title="${ep.last_synced_at ? escapeHtml(ep.last_synced_at) : ''}">${ep.last_synced_at ? escapeHtml(formatTimestamp(ep.last_synced_at)) : '<span class="text-muted">never</span>'}</td>
       <td class="row">
         <button class="btn btn-secondary btn-sm" data-edit-endpoint="${ep.id}">Edit</button>
         <button class="btn btn-secondary btn-sm" data-copy="${escapeHtml(feedUrl)}">Copy URL</button>

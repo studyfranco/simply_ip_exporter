@@ -1,5 +1,81 @@
 # Agent Worklog — `simply_ip_exporter`
 
+## 2026-09-26 (session 26) — Dashboard layout: wider container, Endpoints table no longer wraps
+
+Reported by the user directly, with screenshots: the dashboard rendered in roughly half the
+available window width on a wide monitor, and the Endpoints table's Feed URL column collapsed into
+a column of single characters, one per line, for the whole row height — plus "Last synced" showing
+a raw, nanosecond-precision ISO timestamp instead of a formatted one. Root-caused before touching
+anything, not assumed: `.container`'s `max-width: 1280px` (unchanged since the original vault
+convergence) and the Endpoints table using plain `.data-table` (browser auto-layout) with no
+`<colgroup>`, so once 8 columns competed for space inside that cap, the long feed URL under
+`.break-all` had nowhere to go but straight down.
+
+### Container: converged with `example/simply_hook_executor`, not `simply_ip_vault`
+
+The user pointed at `example/` for precedent. `simply_ip_vault`'s own `.container` is *also*
+`1280px` — no help here. `simply_hook_executor`'s is `max-width: 1800px; width: 100%; padding: 2rem
+clamp(1rem, 3vw, 4rem);` — fluid horizontal padding, fixed vertical, and a real upper bound rather
+than a fixed size (`width: 100%` is what lets it still shrink on a narrower viewport instead of
+forcing page-wide horizontal scroll). Adopted verbatim.
+
+The one wrinkle hook_executor's own dashboard doesn't have: this crate's sticky `.top-bar` cancels
+`.container`'s padding via a matched negative margin (`margin: -2rem -2rem 0` against
+`.container`'s `padding: 2rem`), so it can extend flush to the container's edges while staying
+sticky. Making the padding fluid would have silently broken that pairing the moment the two literals
+diverged across a breakpoint. Fixed by factoring both into `--container-padding-x`/`-y` custom
+properties on `:root`, with `.top-bar`'s margin/padding built from the same properties via
+`calc(-1 * var(...))` — the two can now never drift apart, and the existing mobile breakpoint
+overrides the *properties* rather than `.container.padding` directly, so `.top-bar` stays in sync
+there too without needing its own copy of the override.
+
+### Endpoints table: the Audit Logs table's own fix, applied to itself
+
+`.data-table-fixed` (a `<colgroup>`-sized, ellipsis-truncating variant) already existed for exactly
+this failure mode — it was built for the Audit Logs table in an earlier session for the identical
+reason (a long `target_resource`/`details` string wrapping badly). Applied it to Endpoints too,
+with a colgroup sized for its 8 columns, rather than reinventing a second mechanism.
+
+Two cells needed to opt out of the blanket truncation rule, both real layout hazards rather than
+cosmetic nitpicks:
+
+- **Name/Groups** holds two independently-meaningful lines (name, then the muted Vault-groups CSV),
+  not one run of text. The blanket rule's `white-space: nowrap` would force both onto one line, and
+  `text-overflow: ellipsis` is unreliable on a cell mixing a bare text node with a block-level
+  child. New `.cell-line` utility (block, its own `overflow`/`ellipsis`) truncates each line on its
+  own; the cell itself (`.name-cell`) resets to normal flow.
+- **The action-button cell** (`.row`, the class already shared with the API Keys table) must never
+  be truncated — `overflow: hidden` would clip a button, not shorten text.
+
+**A latent bug this surfaced, not introduced:** the truncation rule was `td`-only; `<th>` had no
+`overflow`/`text-overflow` of its own, relying only on the base `.data-table th`'s bare
+`white-space: nowrap`. Harmless in the Audit table so far because its headers are short enough to
+fit even when squeezed — but the Endpoints table's two-word headers ("Bound IPs", "Last Synced")
+genuinely overflowed into their neighbours once a new intermediate breakpoint (`min-width: 900px`
+under 900px viewport, forcing `.table-container`'s existing `overflow-x: auto` to do its job rather
+than let 8 columns fight over too little space) made the squeeze real. Caught via screenshot at
+800px, not assumed fixed — the fix (`th` added alongside `td`) also hardens the pre-existing Audit
+table for the same scenario, which had simply never been tested that narrow before.
+
+"Last synced" was also rendering `ep.last_synced_at` raw (a `chrono::NaiveDateTime` Debug/Display
+string with full sub-second precision) instead of through `formatTimestamp()` — the same function
+the Audit Logs tab already uses. Switched to match, full raw value moved to `title`.
+
+### Verification
+
+Screenshot QA at 2000px/1400px/800px (the established stub-`fetch` scratch-copy technique) before
+touching any gate: confirmed the Feed URL truncates to one line with an ellipsis, "Last synced"
+reads `26/09/2026, 15:06:03`, the container fills a wide viewport without dead space either side,
+and the 800px case degrades to a horizontally-scrollable table with intact (not overlapping)
+headers — caught and fixed the `th`-truncation gap this way before it ever reached a gate. Re-checked
+the Audit Logs tab at 1400px to confirm the shared-class change didn't regress it.
+
+No Rust source touched this session; gates run anyway per the user's explicit request: `cargo
+check`/`clippy -D warnings` clean; `cargo test` 143 + 4 + 45 + 13 = 205 passed (includes
+`source_hygiene`'s real `oxc_parser` parse of the edited `app.js` and its cross-check of every
+`el(...)` id against `index.html`); `verify_convergence.sh` all pass; `test_e2e.sh` 235/235
+unchanged (a static/-only change; nothing e2e exercises the CSS layout itself).
+
 ## 2026-08-26 (session 25) — `API_REFERENCE.md`: the full endpoint catalogue
 
 New root-level `API_REFERENCE.md` covering all 21 registered routes plus the static fallback,

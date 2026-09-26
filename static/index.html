@@ -75,7 +75,17 @@
           <button type="button" id="open-create-endpoint" class="btn btn-primary">+ Add Endpoint</button>
         </div>
         <div class="table-container">
-          <table class="data-table">
+          <table class="data-table data-table-fixed">
+            <colgroup>
+              <col style="width: 18%" />
+              <col style="width: 26%" />
+              <col style="width: 5rem" />
+              <col style="width: 8rem" />
+              <col style="width: 11%" />
+              <col style="width: 15%" />
+              <col style="width: 10rem" />
+              <col style="width: 13rem" />
+            </colgroup>
             <thead><tr><th>Name / Groups</th><th>Feed URL</th><th>TTL</th><th>Max IP Age</th><th>Filters</th><th>Bound IPs</th><th>Last synced</th><th></th></tr></thead>
             <tbody id="endpoints-body"></tbody>
           </table>

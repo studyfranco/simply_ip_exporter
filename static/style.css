@@ -34,6 +34,15 @@
     --transition-fast: 150ms ease;
     --transition-base: 200ms ease;
     --transition-slow: 300ms ease;
+
+    /* `.container`'s own padding, factored out to custom properties (2026-09-26) so `.top-bar`
+       below can cancel it out exactly via `calc()` regardless of viewport width — the sticky header
+       needs to extend flush to the container's edges, and hardcoding both sides to the same literal
+       (as this crate did before) silently drifts apart the moment either one changes. Horizontal
+       padding is fluid (`clamp()`), vertical stays fixed — same split `example/simply_hook_executor`
+       uses for its own wide, responsive container. */
+    --container-padding-x: clamp(1rem, 3vw, 4rem);
+    --container-padding-y: 2rem;
 }
 
 /* ─── Reset & Base ──────────────────────────────────────── */
@@ -70,9 +79,17 @@ body {
 /* ─── Layout ────────────────────────────────────────────── */
 
 .container {
-    max-width: 1280px;
+    /* Widened 1280px → 1800px (2026-09-26), converging with `example/simply_hook_executor`'s own
+       container: at 1280px this dashboard's Endpoints table (8 columns, one of them a full feed
+       URL) had less usable width than its content needed on anything but a narrow window, and on a
+       wide monitor the fixed cap just left the difference as dead space either side rather than
+       giving the table room to breathe. `width: 100%` alongside `max-width` is what makes the cap
+       an upper bound rather than a fixed size — the container still shrinks to fit a narrower
+       viewport instead of forcing horizontal scroll on the whole page. */
+    max-width: 1800px;
+    width: 100%;
     margin: 0 auto;
-    padding: 2rem;
+    padding: var(--container-padding-y) var(--container-padding-x);
     transition: opacity var(--transition-slow);
 }
 
@@ -97,8 +114,11 @@ body {
     top: 0;
     z-index: 30;
     background-color: var(--bg-main);
-    margin: -2rem -2rem 0;
-    padding: 2rem 2rem 0;
+    /* Cancels `.container`'s own padding via the same custom properties (see `:root`), rather than
+       a hardcoded `-2rem`/`2rem` pair — `--container-padding-x` is now fluid (`clamp()`), so a
+       literal would silently stop matching the moment the viewport crossed a breakpoint. */
+    margin: calc(-1 * var(--container-padding-y)) calc(-1 * var(--container-padding-x)) 0;
+    padding: var(--container-padding-y) var(--container-padding-x) 0;
 }
 
 .tab-nav {
@@ -781,6 +801,15 @@ input[type='checkbox']:checked::after {
     width: 100%;
 }
 
+/* `th` alongside `td` (2026-09-26, was `td`-only): `.data-table th`'s own base rule only sets
+   `white-space: nowrap`, with no `overflow`/`text-overflow` — harmless for a normal auto-layout
+   table, but under `table-layout: fixed` a header wider than its assigned column (a two-word label
+   like "Bound IPs" or "Last Synced" squeezed into a narrow colgroup column, e.g. once the Endpoints
+   table's columns are genuinely tight) has nothing to hide its own overflow, and spills visibly into
+   the neighbouring header cell instead of the neighbour's own text simply wrapping. Truncating the
+   header exactly like its column's body cells is the correct fixed-layout behaviour, not a special
+   case. */
+.data-table-fixed th,
 .data-table-fixed td {
     overflow: hidden;
     text-overflow: ellipsis;
@@ -802,6 +831,38 @@ input[type='checkbox']:checked::after {
     overflow: hidden;
     text-overflow: ellipsis;
     vertical-align: middle;
+}
+
+/* Endpoints table (2026-09-26): the same fixed-layout/ellipsis treatment as Audit Logs, and for the
+   same reason. A feed URL is a single long, unbroken token — under the old auto-layout table plus
+   `.break-all`, once 8 columns were squeezed into a narrow container the Feed URL column collapsed
+   to only a few px wide and the URL wrapped one character per line down the whole row. `Bound IPs`
+   has the identical failure mode for a long CIDR/hostname list. Fixed-width columns from a
+   `<colgroup>` plus ellipsis truncation (full value one hover away via `title`) bound both.
+   Two cells need to opt out of the blanket `td` rule above:
+
+   - `.name-cell` holds two independently-truncating lines (name, then the muted Vault-groups line)
+     rather than one run of text. The blanket rule's `white-space: nowrap` would force the name and
+     that div onto a single line, and `text-overflow: ellipsis` is unreliable on a cell that mixes a
+     bare text node with a block-level child — so this cell resets to normal flow, and each line
+     truncates itself independently via `.cell-line`.
+   - `.row` (the shared action-button-group class this crate already uses identically in the API
+     Keys table) must never be truncated: `overflow: hidden` would clip a button, not shorten text. */
+.data-table-fixed td.name-cell,
+.data-table-fixed td.row {
+    overflow: visible;
+    white-space: normal;
+    text-overflow: clip;
+}
+
+/* One independently-truncating line within a cell that otherwise needs more than one — see
+   `.name-cell` above. Not folded into `.data-table-fixed td` itself because that rule truncates the
+   whole cell as a unit; this truncates one block-level line within it. */
+.cell-line {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 /* Shown in place of a table body when a fetch yields zero rows, so an empty state reads as "there
@@ -1171,9 +1232,23 @@ input[type='checkbox']:checked::after {
 
 /* ─── Responsive ─────────────────────────────────────────── */
 
+@media (max-width: 900px) {
+    /* An intermediate step before the mobile rewrite below — `clamp()` already shrinks the
+       container's own horizontal padding smoothly down to this point, but the Endpoints table's
+       8 columns (colgroup widths sized for the 1800px cap) still need explicit relief once the
+       viewport itself gets this narrow, or several columns start fighting `table-layout: fixed`
+       for the same shrinking space. Scrolls horizontally within `.table-container` instead. */
+    #tab-endpoints .data-table-fixed {
+        min-width: 900px;
+    }
+}
+
 @media (max-width: 640px) {
-    .container {
-        padding: 1rem;
+    /* Overriding the custom properties (not `.container.padding` directly) is what keeps `.top-bar`
+       in sync automatically — it cancels whatever these two currently resolve to via `calc()`. */
+    :root {
+        --container-padding-x: 1rem;
+        --container-padding-y: 1rem;
     }
 
     .header {
