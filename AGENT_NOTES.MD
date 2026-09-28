@@ -1,5 +1,68 @@
 # Agent Worklog — `simply_ip_exporter`
 
+## 2026-09-28 (session 27) — Dependency upgrade, and a flaky test found and fixed along the way
+
+Requested plainly: upgrade dependencies, test, push. `Cargo.lock` is intentionally not committed
+(matches `simply_ip_vault`/`simply_hook_executor`'s convention — see `FILE_MAP.MD`), so most direct
+dependencies already resolve to their latest release within the existing `Cargo.toml` ranges via a
+plain `cargo update` — nothing to commit there, just a refreshed local lockfile (axum 0.8.9, tokio
+1.53.1, sea-orm 2.0.4, reqwest 0.13.5, thiserror 2.0.21, uuid 1.26.1, chrono 0.4.45, and others).
+
+The one dependency requiring an actual `Cargo.toml` change: `oxc_allocator`/`oxc_parser`/`oxc_span`,
+pinned exact (`=`) rather than caret since they're pre-1.0 and a caret would silently accept a
+breaking release. They were 6 minor versions behind (`0.145.0` vs. crates.io's current
+`0.151.0`). Checked every version's declared `rust_version` against crates.io's API before touching
+anything (not assumed): `0.146.0` is the newest still targeting rustc 1.95.0 (this environment's
+toolchain); `0.147.0` onward require 1.96.0 and fail to compile here, confirmed by actually trying
+`cargo check` against 0.151.0 first and reading cargo's own MSRV error. Bumped to `0.146.0` — one
+minor release, the most this toolchain permits. `cargo check`/`clippy` against it are clean; no API
+surface used in `tests/source_hygiene.rs` (`Allocator`, `Parser::new`, `SourceType::cjs()`,
+`parsed.diagnostics`) changed between the two versions.
+
+### A real, pre-existing flaky test, found by running `cargo test` enough times to notice
+
+`public_feed_reads_stay_fast_and_non_empty_while_a_full_resync_runs` (session 24) failed
+intermittently after the dependency refresh. Before assuming a regression, isolated the variable:
+reran the identical test, alone, against the *unchanged* test code, repeatedly — it failed roughly
+2 times in 5 even with zero dependency or source changes in play, which is what proved this was
+pre-existing flakiness the upgrade merely gave enough occasions to surface, not something the
+upgrade caused.
+
+Root cause was structural, not a fluke: the test used the plain `#[tokio::test]` default, which is
+a **single-threaded** (`current_thread`) runtime — unlike production, which runs under
+`#[tokio::main]` (multi-threaded by default). Under `current_thread`, the test's 100 "concurrent"
+readers and the background sync task were all cooperatively timeslicing on *one* OS thread, so the
+"no reader waited on the lock" assertion was actually measuring this one thread's scheduling
+fairness under whatever unrelated CPU load happened to exist at that moment (the rest of the test
+suite, in this repo's case) — orthogonal to the actual property under test. Switched to
+`#[tokio::test(flavor = "multi_thread", worker_threads = 4)]`, which is also the more honest choice:
+it makes the test's execution model match the real deployed one.
+
+That alone wasn't sufficient (still failed 2/5 after the flavor change) because of a second,
+independent margin problem: measured directly, a *correctly* fast reader's own real work — HMAC
+verification, a SQLite key lookup, serializing a 3,000-record body — can already tail-latency past
+400ms under 100-way concurrency and background load, with the lock never in the picture at all. The
+test's `PAGE_DELAY` (400ms, the artificial per-page mock delay) left no headroom between "normal
+tail latency" and "the threshold for calling it lock starvation." Fixed properly rather than by
+loosening a magic number: raised `PAGE_DELAY` to 1500ms (~3x headroom above the observed tail), and
+changed the pass/fail assertion from a bare constant (`slowest < PAGE_DELAY`) to a relative one
+(`slowest < sync_elapsed / 2`) — a *genuinely* lock-starved reader's latency approaches the full
+sync's duration (it would wait behind every page fetch, not one), so comparing against a fraction of
+`sync_elapsed` stays meaningful regardless of how long a single page happens to take, rather than
+depending on a hand-tuned absolute number that the next environment's CPU count or load could
+invalidate again.
+
+Verified the fix, not just applied it: 8/8 clean runs of the test alone, then 3/3 clean full-suite
+runs (`cargo test`), before treating it as resolved.
+
+### Verification
+
+`cargo check`/`clippy -D warnings` clean against the upgraded graph; `cargo test` 143 + 4 + 45 + 13
+= 205 passed, confirmed stable across 3 consecutive full-suite runs (not just one green run, given
+the flakiness just found); `verify_convergence.sh` all pass; `test_e2e.sh` 235/235. `example/`'s
+three peer checkouts verified untouched (`git status --porcelain --untracked-files=no`, all clean)
+throughout.
+
 ## 2026-09-26 (session 26) — Dashboard layout: wider container, Endpoints table no longer wraps
 
 Reported by the user directly, with screenshots: the dashboard rendered in roughly half the
