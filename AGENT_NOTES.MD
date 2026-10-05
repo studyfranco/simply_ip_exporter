@@ -1,5 +1,15 @@
 # Agent Worklog — `simply_ip_exporter`
 
+## 2026-10-05 (session 28) — Dependency refresh: oxc 0.146 → 0.152
+
+The toolchain moved from rustc 1.95 to 1.96.1, which lifted the MSRV ceiling that had capped the
+oxc pins at 0.146.0 in session 27. oxc_allocator/oxc_parser/oxc_span are bumped to 0.152.0, the
+newest release (requires rustc 1.96.0). Lockfile refreshed within existing ranges: tokio 1.53.2,
+uuid 1.27.0, quinn 0.11.19, tokio-rustls 0.26.6, among others.
+
+Verification: cargo check and clippy -D warnings clean; cargo test 205 passed; verify_convergence.sh
+all pass; test_e2e.sh 235/235.
+
 ## 2026-09-28 (session 27) — Dependency upgrade, and a flaky test found and fixed along the way
 
 Requested plainly: upgrade dependencies, test, push. `Cargo.lock` is intentionally not committed
