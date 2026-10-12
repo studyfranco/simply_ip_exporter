@@ -554,8 +554,10 @@ seed_group Group_Gamma 63 166
 # ── Retention-window fixture (§4c) ──────────────────────────────────────────
 # Two records in one group, differing only in age, so `max_age_seconds` is the single variable
 # distinguishing what the three §4c feeds publish. Vault's batch API accepts an explicit
-# `updated_at` per record, which makes "stale" deterministic — no sleeping, no wall-clock racing.
-# Both are lone hosts in distinct /24s, so neither aggregates and a line count is a record count.
+# `last_seen_at` per record (`updated_at` also works but is a deprecated alias as of peer commit
+# e96ed75, 2026-10-12 — this uses the current field), which makes "stale" deterministic — no
+# sleeping, no wall-clock racing. Both are lone hosts in distinct /24s, so neither aggregates and a
+# line count is a record count.
 log "Creating pfBlocker_Age_Test with one fresh and one deliberately stale record..."
 api_call "$VAULT_URL" POST "/api/groups" "$VAULT_MASTER_KEY" '{"name":"pfBlocker_Age_Test"}'
 check "200" "pfBlocker_Age_Test group is created"
@@ -571,8 +573,8 @@ print(json.dumps({
     "mode": "upsert",
     "skip_webhooks": True,
     "records": [
-        {"target_address": "52.0.0.1", "cause": "fresh", "updated_at": fmt(now)},
-        {"target_address": "52.0.1.1", "cause": "stale (2h old)", "updated_at": fmt(stale)},
+        {"target_address": "52.0.0.1", "cause": "fresh", "last_seen_at": fmt(now)},
+        {"target_address": "52.0.1.1", "cause": "stale (2h old)", "last_seen_at": fmt(stale)},
     ],
 }))
 PY
@@ -1056,12 +1058,12 @@ log "Stage B: adding IP_C and soft-deleting IP_A in the live Vault..."
 api_call "$VAULT_URL" POST "/api/ban" "$VAULT_MASTER_KEY" '{"target_address":"81.0.0.30/32","group_name":"pfBlocker_Progressive_Test","cause":"stage B addition"}'
 check "200" "IP_C (81.0.0.30) added to Vault"
 
-api_call "$VAULT_URL" GET "/api/ips?ip=81.0.0.10" "$VAULT_MASTER_KEY"
-check "200" "IP_A is looked up for deletion"
-PROGRESSIVE_DELETE_ID=$(echo "$RESP_BODY" | jq -r '.[0].id')
-api_call "$VAULT_URL" DELETE "/api/ips/$PROGRESSIVE_DELETE_ID" "$VAULT_MASTER_KEY"
-check "200" "IP_A is soft-deleted in Vault"
-check_jq ".deleted" "soft" "the deletion is soft, so a tombstone exists for the differential pass to replicate"
+# DELETE /api/ips is addressed by target_address+group_name directly (peer commit e96ed75,
+# 2026-10-12) — the earlier id-path route (DELETE /api/ips/{id}, looked up via a preceding GET) is
+# gone, and the new contract never needs a database id at all. No `hard` field, so this is a soft
+# delete; the response is a bare 204, with no body to inspect.
+api_call "$VAULT_URL" DELETE "/api/ips" "$VAULT_MASTER_KEY" '{"target_address":"81.0.0.10/32","group_name":"pfBlocker_Progressive_Test"}'
+check "204" "IP_A is soft-deleted in Vault — a tombstone now exists for the differential pass to replicate"
 
 log "Waiting for the TTL (2s) to expire and the worker to run a differential sync..."
 sleep 18
@@ -1147,16 +1149,12 @@ raw_call GET "$EXPORTER_URL$FEED_PATH" -H "X-Forwarded-For: 198.51.100.21"
 check "200" "feed is served before the soft-delete"
 check_contains "$RESP_BODY" "8.8.4.4" "8.8.4.4/32 is present in the feed (synced during §3's wait)"
 
-log "Looking up 8.8.4.4/32's Vault record id..."
-api_call "$VAULT_URL" GET "/api/ips?ip=8.8.4.4" "$VAULT_MASTER_KEY"
-check "200" "the record lookup succeeds"
-check_jq "length" "1" "exactly one matching record"
-SOFT_DELETE_RECORD_ID=$(echo "$RESP_BODY" | jq -r '.[0].id')
-
-log "Soft-deleting 8.8.4.4/32 in Vault (DELETE /api/ips/<id>, no ?hard=true)..."
-api_call "$VAULT_URL" DELETE "/api/ips/$SOFT_DELETE_RECORD_ID" "$VAULT_MASTER_KEY"
-check "200" "the soft-delete request succeeds"
-check_jq ".deleted" "soft" "the deletion is soft (deleted_at set), not permanent"
+# DELETE /api/ips is addressed by target_address+group_name directly (peer commit e96ed75,
+# 2026-10-12) — no id lookup needed, and no `hard` field, so this is a soft delete. The response is
+# a bare 204, with no body to inspect.
+log "Soft-deleting 8.8.4.4/32 in Vault (DELETE /api/ips, no hard flag)..."
+api_call "$VAULT_URL" DELETE "/api/ips" "$VAULT_MASTER_KEY" '{"target_address":"8.8.4.4/32","group_name":"pfBlocker_Blacklist"}'
+check "204" "the soft-delete request succeeds (deleted_at set, not permanent)"
 
 # Both the DMZ feed and §4's secondary-group-only feed have ttl_seconds=2, so both are due and
 # sync sequentially in the same pass here too — same margin reasoning as §3/§4's wait above.

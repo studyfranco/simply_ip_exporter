@@ -1,5 +1,68 @@
 # Agent Worklog — `simply_ip_exporter`
 
+## 2026-10-12 (session 29) — Peer sync: Vault dropped `updated_at` from `GET /api/ips` entirely
+
+Pulled `example/simply_ip_vault` from `b2115a1` to `e49d062`, and — because `verify_convergence.sh`'s
+own peer-sync step re-pulled mid-session — ultimately to `b883c97` (`fix(migration): dialect-aware
+UUID generation in the membership refactor`, purely internal to Vault's own migration file,
+re-audited and confirmed to touch nothing API-contract-relevant; the live e2e run below was already
+against this exact commit). **`b883c97` is the SHA this session verified against.**
+
+### The actual contract break: `e96ed75 refactor(schema): unify timestamps on last_seen_at`
+
+`GET /api/ips`'s response no longer has an `updated_at` field at all. Each item is now one
+*membership* (an address's state within one group, not the address generally), and the one
+timestamp that survives is `last_seen_at` — "the latest observation of this address in this
+group." `since`/`max_age` are scoped against it the same way `updated_at` used to be. This is not
+cosmetic: `VaultApiRecord.updated_at` was a **required** (non-`Option`) field, so every real sync
+against the new Vault would have failed to deserialize outright — `cargo check` doesn't catch this
+class of break (it's a runtime JSON-shape mismatch, not a Rust type error), which is exactly why the
+task asked for a live e2e run against the real peer rather than trusting the unit suite alone.
+
+Audited `API_REFERENCE.md`'s diff line by line before touching code, not just the commit subject —
+confirmed via `git show` and crates.io-style source reading of `src/api/records.rs` directly, not
+assumed from the changelog prose alone.
+
+### Fix: renamed the field throughout, not just at the deserialization boundary
+
+Could have kept the Rust field named `updated_at` with `#[serde(rename = "last_seen_at")]` — one
+line, no other files touched. Chose the fuller rename instead (`VaultApiRecord.last_seen_at`,
+`cache::VaultRecord.last_seen_at`, `cache::CachedRecord.last_seen_at`, and every doc comment,
+test helper, and JSON test fixture built on top of them) because the field's *meaning* changed, not
+just its wire name — it is now explicitly membership-scoped, and keeping the old name internally
+would leave every future reader cross-referencing Vault's own (accurate) docs against a locally
+misleading one. Naming it `last_seen_at` in Rust also matches the JSON key exactly, so no
+`#[serde(rename)]` is needed at all — simpler, not just more honest. Local, unrelated `updated_at`
+columns (`endpoints.updated_at`, `api_keys.updated_at` — this crate's own SeaORM entities, a
+different concept entirely) were left untouched throughout; every edit was checked against its
+surrounding `Set(...)`-vs-bare-field-literal syntax to tell the two apart before changing anything.
+
+### Two routes this crate's own `test_e2e.sh` called directly, both restructured
+
+`DELETE /api/ips/{id}` is gone — merged into `DELETE /api/ips`, now addressed by
+`target_address`+`group_name` in the query or JSON body rather than a database id, and answering a
+bare `204` instead of `200` with a `{"deleted": "soft", ...}` body. `POST /api/ips/{id}/restore`
+moved the same way, to `POST /api/ips/restore` (not used by this crate's own script, audited and
+ruled out). §4e (Progressive) and §6 (soft-delete propagation) both used the old id-path form,
+preceded by a `GET /api/ips?ip=...` lookup to find the id — the lookup is now unnecessary (the new
+contract never needs a database id), so both sites dropped it entirely rather than keeping a
+pointless round-trip. The live e2e run is what would have caught this if it had been missed: a unit
+test can't exercise a route path that only exists in the peer's own router.
+
+Also migrated §4c's retention-window batch-seed fixture off `updated_at` (still accepted as a
+**deprecated** alias per the same commit, "kept for existing sync clients" — i.e., kept specifically
+for consumers like this one) onto `last_seen_at`, the current field. Working but deprecated is not
+a reason to leave it; nothing stops Vault from removing the alias later.
+
+### Verification
+
+`cargo check`/`clippy -D warnings` clean; `cargo test` 143 + 4 + 45 + 13 = 205 passed;
+`verify_convergence.sh` all pass; `test_e2e.sh` **230/230** (down from 235, expected and exact: the
+two now-unnecessary `GET /api/ips?ip=...` lookups plus the two now-bodyless-204 response assertions
+account for the 5 fewer checks — not a reduction in coverage, a reduction in steps the new contract
+no longer requires). `example/`'s peer checkout confirmed clean throughout
+(`git status --porcelain --untracked-files=no`).
+
 ## 2026-10-05 (session 28) — Dependency refresh: oxc 0.146 → 0.152
 
 The toolchain moved from rustc 1.95 to 1.96.1, which lifted the MSRV ceiling that had capped the

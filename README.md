@@ -274,7 +274,7 @@ cargo test                     # 143 unit + 4 main.rs unit + 45 integration + 13
 
 `scripts/test_e2e.sh` builds and boots both services against throwaway SQLite databases with
 deterministic bootstrap keys, provisions Vault, configures an exporter endpoint, and asserts —
-across 235 checks in 18 sections — the feed pipeline (aggregation, filtering, ETag/304, rate
+across 230 checks in 18 sections — the feed pipeline (aggregation, filtering, ETag/304, rate
 limiting), Vault soft-delete propagation via differential sync, hot-reload of endpoint config with
 no restart, `bound_ips` client-IP restriction, a full graceful-restart-with-encryption cycle
 (Master key, a Daughter key's encrypted secret, and the endpoint row all surviving a `SIGTERM` and

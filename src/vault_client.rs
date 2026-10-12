@@ -24,12 +24,19 @@ use crate::crypto::{canonical_v1_payload, compute_signature};
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// One record as returned by Vault's `GET /api/ips` contract.
+///
+/// `last_seen_at`, not `updated_at` (2026-10-12, peer commit `e96ed75`): Vault's response no
+/// longer carries an `updated_at` field at all — each item is now one *membership* (an address's
+/// state within one group), and `last_seen_at` is that membership's latest observation. The field
+/// name here matches the wire format exactly (no `#[serde(rename)]` needed), which is also more
+/// honest than the old name: this was never "last modified" in a general sense, it is specifically
+/// "last seen in this group".
 #[derive(Debug, Clone, Deserialize)]
 pub struct VaultApiRecord {
     /// The IP address or CIDR range, exactly as Vault stored it.
     pub target_address: String,
-    /// Last activity timestamp, UTC naive ISO-8601.
-    pub updated_at: NaiveDateTime,
+    /// The latest observation of this address in this group, UTC naive ISO-8601.
+    pub last_seen_at: NaiveDateTime,
     /// Whether this is a soft-deleted tombstone (only present with `include_deleted=true`).
     #[serde(default)]
     pub is_deleted: bool,
@@ -168,8 +175,8 @@ impl VaultClient {
     ///
     /// # Consistency caveat
     ///
-    /// Vault orders this listing by `updated_at DESC` with no tiebreaker, so an offset walk is not
-    /// a stable snapshot: a record re-registered mid-walk sorts to the front and can shift rows
+    /// Vault orders this listing by `last_seen_at DESC` with no tiebreaker, so an offset walk is
+    /// not a stable snapshot: a record re-registered mid-walk sorts to the front and can shift rows
     /// across a page boundary, which may duplicate or skip one. Duplicates are harmless (the cache
     /// is keyed by address), and a skipped record is picked up by the next sync cycle. Vault
     /// exposes no cursor that would avoid this; a larger [`PAGE_SIZE`] reduces the number of
@@ -470,7 +477,7 @@ mod tests {
                         .map(|i| {
                             serde_json::json!({
                                 "target_address": format!("51.{}.{}.1", i / 256, i % 256),
-                                "updated_at": "2026-08-11T10:00:00",
+                                "last_seen_at": "2026-08-11T10:00:00",
                                 "is_deleted": false,
                             })
                         })
@@ -629,7 +636,7 @@ mod tests {
                         .map(|i| {
                             serde_json::json!({
                                 "target_address": format!("51.{}.{}.1", i / 256, i % 256),
-                                "updated_at": "2026-08-11T10:00:00",
+                                "last_seen_at": "2026-08-11T10:00:00",
                                 "is_deleted": false,
                             })
                         })
@@ -705,7 +712,7 @@ mod tests {
                     .map(|i| {
                         serde_json::json!({
                             "target_address": mixed_fixture_address(i),
-                            "updated_at": "2026-08-11T10:00:00",
+                            "last_seen_at": "2026-08-11T10:00:00",
                             "is_deleted": false,
                         })
                     })
@@ -875,7 +882,7 @@ mod tests {
                         .map(|i| {
                             serde_json::json!({
                                 "target_address": format!("51.{}.{}.1", i / 256, i % 256),
-                                "updated_at": "2026-08-11T10:00:00",
+                                "last_seen_at": "2026-08-11T10:00:00",
                                 "is_deleted": false,
                             })
                         })
@@ -1097,7 +1104,7 @@ mod tests {
         let (url, _server) = spawn_mock_vault(
             axum::http::StatusCode::OK,
             serde_json::json!([
-                {"target_address": "8.8.8.8/32", "updated_at": "2026-08-11T10:00:00", "is_deleted": false}
+                {"target_address": "8.8.8.8/32", "last_seen_at": "2026-08-11T10:00:00", "is_deleted": false}
             ]),
         )
         .await;

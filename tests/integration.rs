@@ -266,12 +266,12 @@ async fn feed_aggregates_filters_etags_and_rate_limits() {
             &[
                 simply_ip_exporter::cache::VaultRecord {
                     target_address: "203.0.113.5/32".to_owned(),
-                    updated_at: chrono::Utc::now().naive_utc(),
+                    last_seen_at: chrono::Utc::now().naive_utc(),
                     is_deleted: false,
                 },
                 simply_ip_exporter::cache::VaultRecord {
                     target_address: "10.0.0.5/32".to_owned(),
-                    updated_at: chrono::Utc::now().naive_utc(),
+                    last_seen_at: chrono::Utc::now().naive_utc(),
                     is_deleted: false,
                 },
             ],
@@ -1577,8 +1577,8 @@ fn feed_request(path: &str, source: [u8; 4]) -> Request<Body> {
 #[tokio::test]
 async fn the_startup_sync_populates_endpoints_before_the_first_feed_request_is_served() {
     let (vault_url, _vault) = spawn_mock_vault_ips(serde_json::json!([
-        {"target_address": "203.0.113.7/32", "updated_at": "2026-08-11T10:00:00", "is_deleted": false},
-        {"target_address": "198.51.100.9/32", "updated_at": "2026-08-11T10:00:00", "is_deleted": false}
+        {"target_address": "203.0.113.7/32", "last_seen_at": "2026-08-11T10:00:00", "is_deleted": false},
+        {"target_address": "198.51.100.9/32", "last_seen_at": "2026-08-11T10:00:00", "is_deleted": false}
     ]))
     .await;
 
@@ -1706,7 +1706,7 @@ async fn spawn_staged_mock_vault(
 fn record(address: &str, deleted: bool) -> serde_json::Value {
     serde_json::json!({
         "target_address": address,
-        "updated_at": "2026-08-11T10:00:00",
+        "last_seen_at": "2026-08-11T10:00:00",
         "is_deleted": deleted,
     })
 }
@@ -1917,7 +1917,7 @@ async fn public_feed_reads_stay_fast_and_non_empty_while_a_full_resync_runs() {
     let warm: Vec<simply_ip_exporter::cache::VaultRecord> = (0..RECORDS)
         .map(|i| simply_ip_exporter::cache::VaultRecord {
             target_address: format!("51.{}.{}.1/32", i / 256, i % 256),
-            updated_at: chrono::NaiveDateTime::parse_from_str("2026-08-11T10:00:00", "%Y-%m-%dT%H:%M:%S")
+            last_seen_at: chrono::NaiveDateTime::parse_from_str("2026-08-11T10:00:00", "%Y-%m-%dT%H:%M:%S")
                 .expect("a valid fixture timestamp"),
             is_deleted: false,
         })

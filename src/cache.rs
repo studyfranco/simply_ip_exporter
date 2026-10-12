@@ -21,17 +21,19 @@ pub fn parse_target_address(raw: &str) -> Option<IpNet> {
 #[derive(Clone, Debug)]
 struct CachedRecord {
     network: IpNet,
-    /// Vault's `updated_at` for this record — retained (2026-08-26) so an endpoint's
-    /// `max_age_seconds` retention window can be evaluated at feed-generation time. See
+    /// Vault's `last_seen_at` for this record (2026-08-26, field renamed 2026-10-12 to match
+    /// Vault's own contract — see `VaultRecord`) — retained so an endpoint's `max_age_seconds`
+    /// retention window can be evaluated at feed-generation time. See
     /// [`IpCache::snapshot_within`] for why the age cutoff is applied there rather than at sync.
-    updated_at: NaiveDateTime,
+    last_seen_at: NaiveDateTime,
 }
 
 /// The in-memory state for a single endpoint's feed.
 #[derive(Clone, Debug, Default)]
 struct EndpointCache {
     records: HashMap<String, CachedRecord>,
-    /// The most recent `updated_at` seen from Vault, used as the next differential sync's `since`.
+    /// The most recent `last_seen_at` seen from Vault, used as the next differential sync's
+    /// `since`.
     last_synced_at: Option<NaiveDateTime>,
     /// When the last full (unconstrained) sync completed, in-process monotonic time.
     last_full_sync_at: Option<tokio::time::Instant>,
@@ -42,8 +44,10 @@ struct EndpointCache {
 pub struct VaultRecord {
     /// The raw `target_address` as Vault stored it.
     pub target_address: String,
-    /// Last activity timestamp, UTC naive.
-    pub updated_at: NaiveDateTime,
+    /// The latest observation of this address in this group, UTC naive (2026-10-12, renamed from
+    /// `last_seen_at` to track Vault's own `last_seen_at` field — see `vault_client::VaultApiRecord`
+    /// for why Vault dropped `last_seen_at` entirely).
+    pub last_seen_at: NaiveDateTime,
     /// Whether this record is a soft-deleted tombstone.
     pub is_deleted: bool,
 }
@@ -66,19 +70,20 @@ impl IpCache {
         let mut guard = self.inner.write().await;
         let entry = guard.entry(endpoint_id).or_default();
         entry.records.clear();
-        let mut max_updated = entry.last_synced_at;
+        let mut max_last_seen = entry.last_synced_at;
         for record in records {
             if record.is_deleted {
                 continue;
             }
             let Some(network) = parse_target_address(&record.target_address) else { continue };
-            max_updated = Some(max_updated.map_or(record.updated_at, |m| m.max(record.updated_at)));
+            max_last_seen =
+                Some(max_last_seen.map_or(record.last_seen_at, |m| m.max(record.last_seen_at)));
             entry.records.insert(
                 record.target_address.clone(),
-                CachedRecord { network, updated_at: record.updated_at },
+                CachedRecord { network, last_seen_at: record.last_seen_at },
             );
         }
-        entry.last_synced_at = max_updated;
+        entry.last_synced_at = max_last_seen;
         entry.last_full_sync_at = Some(tokio::time::Instant::now());
     }
 
@@ -86,9 +91,10 @@ impl IpCache {
     pub async fn apply_diff(&self, endpoint_id: Uuid, records: &[VaultRecord]) {
         let mut guard = self.inner.write().await;
         let entry = guard.entry(endpoint_id).or_default();
-        let mut max_updated = entry.last_synced_at;
+        let mut max_last_seen = entry.last_synced_at;
         for record in records {
-            max_updated = Some(max_updated.map_or(record.updated_at, |m| m.max(record.updated_at)));
+            max_last_seen =
+                Some(max_last_seen.map_or(record.last_seen_at, |m| m.max(record.last_seen_at)));
             if record.is_deleted {
                 entry.records.remove(&record.target_address);
                 continue;
@@ -96,10 +102,10 @@ impl IpCache {
             let Some(network) = parse_target_address(&record.target_address) else { continue };
             entry.records.insert(
                 record.target_address.clone(),
-                CachedRecord { network, updated_at: record.updated_at },
+                CachedRecord { network, last_seen_at: record.last_seen_at },
             );
         }
-        entry.last_synced_at = max_updated;
+        entry.last_synced_at = max_last_seen;
     }
 
     /// The networks currently cached for an endpoint, unaggregated and unfiltered.
@@ -114,7 +120,7 @@ impl IpCache {
     /// is returned, which is the default and the pre-2026-08-26 behaviour exactly. A negative value
     /// is treated the same way (the column is validated `>= 0` at the API boundary; this is
     /// belt-and-braces so a hand-edited database row cannot make a feed mysteriously empty).
-    /// Otherwise a record survives when `updated_at >= now - max_age_seconds`.
+    /// Otherwise a record survives when `last_seen_at >= now - max_age_seconds`.
     ///
     /// # Why the cutoff is applied here and not during sync
     ///
@@ -149,7 +155,7 @@ impl IpCache {
         entry
             .records
             .values()
-            .filter(|r| r.updated_at >= cutoff)
+            .filter(|r| r.last_seen_at >= cutoff)
             .map(|r| r.network)
             .collect()
     }
@@ -181,7 +187,7 @@ mod tests {
     fn record(addr: &str, deleted: bool) -> VaultRecord {
         VaultRecord {
             target_address: addr.to_owned(),
-            updated_at: NaiveDateTime::parse_from_str("2026-08-11T10:00:00", "%Y-%m-%dT%H:%M:%S")
+            last_seen_at: NaiveDateTime::parse_from_str("2026-08-11T10:00:00", "%Y-%m-%dT%H:%M:%S")
                 .unwrap(),
             is_deleted: deleted,
         }
@@ -214,7 +220,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn last_synced_at_tracks_the_max_updated_at_seen() {
+    async fn last_synced_at_tracks_the_max_last_seen_at_observed() {
         let cache = IpCache::new();
         let id = Uuid::new_v4();
         cache.apply_diff(id, &[record("10.1.2.3/32", false)]).await;
@@ -232,10 +238,10 @@ mod tests {
 
     // ── max_age_seconds retention window ──────────────────────────────────────
 
-    /// A record with an explicit `updated_at`, so a test can place it precisely relative to a
+    /// A record with an explicit `last_seen_at`, so a test can place it precisely relative to a
     /// pinned "now" rather than depending on wall-clock timing.
-    fn record_at(addr: &str, updated_at: NaiveDateTime) -> VaultRecord {
-        VaultRecord { target_address: addr.to_owned(), updated_at, is_deleted: false }
+    fn record_at(addr: &str, last_seen_at: NaiveDateTime) -> VaultRecord {
+        VaultRecord { target_address: addr.to_owned(), last_seen_at, is_deleted: false }
     }
 
     fn at(s: &str) -> NaiveDateTime {
@@ -284,7 +290,7 @@ mod tests {
         assert_eq!(kept[0].to_string(), "10.0.0.1/32");
     }
 
-    /// The boundary is inclusive (`updated_at >= cutoff`), so a record exactly at the edge is kept.
+    /// The boundary is inclusive (`last_seen_at >= cutoff`), so a record exactly at the edge is kept.
     /// Worth pinning: an exclusive comparison would silently drop a record every window-length tick
     /// in a system where records are refreshed on a fixed interval equal to the window.
     #[tokio::test]
@@ -331,7 +337,7 @@ mod tests {
         assert_eq!(cache.snapshot_within(id, -1, now).await.len(), 1);
     }
 
-    /// A differential sync must carry `updated_at` through too, not just a full one — otherwise a
+    /// A differential sync must carry `last_seen_at` through too, not just a full one — otherwise a
     /// record refreshed by a delta would keep its original age and age out while Vault considers it
     /// current.
     #[tokio::test]
@@ -368,10 +374,10 @@ mod tests {
     // threads, not just interleaved cooperatively on one) neither hangs nor corrupts state, and
     // that the `tokio::time::timeout` wrapper would catch it if a future change broke that.
 
-    fn record_with_updated_at(addr: &str, minute: u32) -> VaultRecord {
+    fn record_with_last_seen_at(addr: &str, minute: u32) -> VaultRecord {
         VaultRecord {
             target_address: addr.to_owned(),
-            updated_at: NaiveDateTime::parse_from_str("2026-08-11T10:00:00", "%Y-%m-%dT%H:%M:%S")
+            last_seen_at: NaiveDateTime::parse_from_str("2026-08-11T10:00:00", "%Y-%m-%dT%H:%M:%S")
                 .unwrap()
                 + chrono::Duration::minutes(minute as i64),
             is_deleted: false,
@@ -398,9 +404,9 @@ mod tests {
                     match i % 10 {
                         0 => cache.evict(id).await,
                         n if n % 2 == 0 => {
-                            cache.apply_full(id, &[record_with_updated_at("10.0.0.1/32", i)]).await
+                            cache.apply_full(id, &[record_with_last_seen_at("10.0.0.1/32", i)]).await
                         }
-                        _ => cache.apply_diff(id, &[record_with_updated_at("10.0.0.2/32", i)]).await,
+                        _ => cache.apply_diff(id, &[record_with_last_seen_at("10.0.0.2/32", i)]).await,
                     }
                 }
             });
@@ -452,7 +458,7 @@ mod tests {
                 for _ in 0..50 {
                     cache.apply_full(id, &[VaultRecord {
                         target_address: addr.clone(),
-                        updated_at: chrono::Utc::now().naive_utc(),
+                        last_seen_at: chrono::Utc::now().naive_utc(),
                         is_deleted: false,
                     }]).await;
                 }

@@ -114,7 +114,7 @@ To protect the underlying storage hardware, **IP records are kept strictly in-me
   2. **Full Daily Sync (24 Hours):** Once every 24 hours, clear the in-memory state for the feed and execute a full query (`GET /api/ips?groups=g1,g2`) to prevent state drift or orphaned deleted records.
 - **Vault API Contract (Commit 6ca29ab Alignment):**
   - **Restrict-not-Reject:** Queries with `include_deleted=true` return HTTP 200 with soft-deleted records (`is_deleted: true`, `deleted_at: ...`) for authorized groups. Restricted or unknown groups are silently filtered out by the Vault (no `403` error).
-  - **Timestamp Serialization:** All timestamp fields (`created_at`, `updated_at`, `deleted_at`) arrive as UTC Naive ISO-8601 strings (e.g. `"2026-08-11T10:26:46"`). Parse uniformly using `chrono::NaiveDateTime` for `since` delta filtering.
+  - **Timestamp Serialization:** All timestamp fields (`created_at`, `last_seen_at`, `deleted_at`) arrive as UTC Naive ISO-8601 strings (e.g. `"2026-08-11T10:26:46"`). Parse uniformly using `chrono::NaiveDateTime` for `since` delta filtering. `last_seen_at` is the field `since`/`max_age` are scoped against (2026-10-12, peer commit `e96ed75`) — Vault's `GET /api/ips` no longer returns `updated_at` at all; see `AGENT_NOTES.MD`.
 - **Fallbacks & Fault Tolerance:** If `simply_ip_vault` is offline or unreachable during a refresh cycle, `simply_ip_exporter` continues serving the existing in-memory cached list to public clients while logging a warning.
 
 ### 2. Public Feed Exposure (`/feed/v1/<token_secret>/list.txt`)

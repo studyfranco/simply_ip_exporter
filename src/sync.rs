@@ -34,7 +34,7 @@ fn map_records(records: Vec<VaultApiRecord>) -> Vec<VaultRecord> {
         .into_iter()
         .map(|r| VaultRecord {
             target_address: r.target_address,
-            updated_at: r.updated_at,
+            last_seen_at: r.last_seen_at,
             is_deleted: r.is_deleted,
         })
         .collect()
@@ -183,7 +183,7 @@ mod tests {
     fn map_records_preserves_deletion_state() {
         let raw = vec![VaultApiRecord {
             target_address: "10.0.0.1/32".to_owned(),
-            updated_at: Utc::now().naive_utc(),
+            last_seen_at: Utc::now().naive_utc(),
             is_deleted: true,
         }];
         let mapped = map_records(raw);
@@ -271,7 +271,7 @@ mod tests {
     fn seed_record(addr: &str) -> crate::cache::VaultRecord {
         crate::cache::VaultRecord {
             target_address: addr.to_owned(),
-            updated_at: Utc::now().naive_utc(),
+            last_seen_at: Utc::now().naive_utc(),
             is_deleted: false,
         }
     }
@@ -293,8 +293,8 @@ mod tests {
         let (url, _server) = spawn_mock_vault(
             axum::http::StatusCode::OK,
             serde_json::json!([
-                {"target_address": "203.0.113.10/32", "updated_at": "2026-08-11T10:00:00", "is_deleted": false},
-                {"target_address": "203.0.113.11/32", "updated_at": "2026-08-11T10:00:00", "is_deleted": false}
+                {"target_address": "203.0.113.10/32", "last_seen_at": "2026-08-11T10:00:00", "is_deleted": false},
+                {"target_address": "203.0.113.11/32", "last_seen_at": "2026-08-11T10:00:00", "is_deleted": false}
             ]),
         )
         .await;
@@ -348,8 +348,8 @@ mod tests {
         let (url, _server) = spawn_mock_vault(
             axum::http::StatusCode::OK,
             serde_json::json!([
-                {"target_address": "203.0.113.7/32", "updated_at": "2026-08-11T10:00:00", "is_deleted": false},
-                {"target_address": "198.51.100.9/32", "updated_at": "2026-08-11T10:00:00", "is_deleted": false}
+                {"target_address": "203.0.113.7/32", "last_seen_at": "2026-08-11T10:00:00", "is_deleted": false},
+                {"target_address": "198.51.100.9/32", "last_seen_at": "2026-08-11T10:00:00", "is_deleted": false}
             ]),
         )
         .await;
@@ -431,7 +431,7 @@ mod tests {
                 async move {
                     hits.fetch_add(1, Ordering::SeqCst);
                     axum::Json(serde_json::json!([
-                        {"target_address": "203.0.113.7/32", "updated_at": "2026-08-11T10:00:00", "is_deleted": false}
+                        {"target_address": "203.0.113.7/32", "last_seen_at": "2026-08-11T10:00:00", "is_deleted": false}
                     ]))
                 }
             }),
@@ -558,7 +558,7 @@ mod tests {
         let (url, _server) = spawn_mock_vault(
             axum::http::StatusCode::OK,
             serde_json::json!([
-                {"target_address": "9.9.9.9/32", "updated_at": "2026-08-11T10:00:00", "is_deleted": false}
+                {"target_address": "9.9.9.9/32", "last_seen_at": "2026-08-11T10:00:00", "is_deleted": false}
             ]),
         )
         .await;
