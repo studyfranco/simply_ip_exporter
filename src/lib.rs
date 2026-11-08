@@ -59,6 +59,7 @@ pub fn create_app(state: AppState) -> Router {
         .route("/endpoints/{id}", put(api::update_endpoint))
         .route("/endpoints/{id}", delete(api::delete_endpoint))
         .route("/endpoints/{id}/owner", put(api::reassign_endpoint_owner))
+        .route("/settings", get(api::get_settings))
         .route("/audit-logs", get(api::list_audit_logs))
         .route("/vault-groups", get(api::list_vault_groups))
         .route("/keys/{id}/groups", get(api::list_key_groups))

@@ -23,6 +23,10 @@ pub struct AuditLogQuery {
     pub client_ip: Option<String>,
     /// Filter by acting key name, prefix, or UUID.
     pub api_key: Option<String>,
+    /// Filter by start timestamp (inclusive, RFC 3339).
+    pub since: Option<String>,
+    /// Filter by end timestamp (inclusive, RFC 3339).
+    pub until: Option<String>,
     /// Pagination limit. Defaults to 50.
     pub limit: Option<u64>,
     /// Pagination offset. Defaults to 0.
@@ -71,6 +75,28 @@ pub async fn list_audit_logs(
             cond = cond.add(audit_log::Column::ApiKeyId.eq(uuid));
         }
         q = q.filter(cond);
+    }
+    if let Some(since_raw) = query
+        .since
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let since_dt = chrono::DateTime::parse_from_rfc3339(since_raw)
+            .map_err(|_| AppError::InvalidInput("Malformed 'since' RFC 3339 timestamp".to_owned()))?
+            .naive_utc();
+        q = q.filter(audit_log::Column::Timestamp.gte(since_dt));
+    }
+    if let Some(until_raw) = query
+        .until
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let until_dt = chrono::DateTime::parse_from_rfc3339(until_raw)
+            .map_err(|_| AppError::InvalidInput("Malformed 'until' RFC 3339 timestamp".to_owned()))?
+            .naive_utc();
+        q = q.filter(audit_log::Column::Timestamp.lte(until_dt));
     }
 
     let limit = query.limit.unwrap_or(50).min(500);

@@ -50,15 +50,19 @@
           <h1>Simply IP Exporter</h1>
         </div>
         <div id="header-actions" class="header-actions hidden">
-          <span id="identity-badge" class="badge badge-tier"></span>
-          <button id="btn-refresh" type="button" class="btn btn-secondary btn-sm">Refresh</button>
-          <button id="btn-logout" type="button" class="btn btn-logout btn-sm">Logout</button>
+          <span id="current-key-tier" class="badge badge-tier"></span>
+          <span id="identity-badge" class="badge badge-tier hidden"></span>
+          <button id="refresh-btn" type="button" class="btn btn-secondary btn-sm">Refresh</button>
+          <button id="btn-refresh" type="button" class="hidden"></button>
+          <button id="logout-btn" type="button" class="btn btn-logout btn-sm">Logout</button>
+          <button id="btn-logout" type="button" class="hidden"></button>
         </div>
       </header>
 
       <nav class="tab-nav" role="tablist">
         <button class="tab-btn active" data-tab="endpoints" role="tab" aria-selected="true">Endpoints</button>
         <button class="tab-btn hidden" data-tab="keys" id="keys-tab-btn" role="tab" aria-selected="false">API Keys</button>
+        <button class="tab-btn hidden" data-tab="settings" id="settings-tab-btn" role="tab" aria-selected="false">System Settings</button>
         <button class="tab-btn hidden" data-tab="audit" id="audit-tab-btn" role="tab" aria-selected="false">Audit Logs</button>
       </nav>
     </div>
@@ -98,10 +102,15 @@
     <!-- ═══════════════════════════════════════ -->
     <main id="tab-keys" class="tab-panel">
       <section class="card admin-section" id="keys-card">
-        <h2>API Keys</h2>
-        <p class="subtitle">Create and manage Daughter keys. Master status is fixed at bootstrap and cannot be granted here.</p>
+        <div class="list-header">
+          <div>
+            <h2>API Keys</h2>
+            <p class="subtitle">Create and manage Daughter keys. Master status is fixed at bootstrap and cannot be granted here.</p>
+          </div>
+          <button type="button" id="btn-open-create-key" class="btn btn-primary">+ New Key</button>
+        </div>
 
-        <form id="key-form" class="admin-form">
+        <form id="key-form" class="admin-form hidden">
           <div class="form-grid">
             <div class="form-group">
               <label for="key-name">Name <span class="required-marker">*</span></label>
@@ -121,6 +130,7 @@
           </div>
           <div class="form-actions">
             <button type="submit" class="btn btn-primary">Create key</button>
+            <button type="button" id="btn-cancel-create-key" class="btn btn-cancel">Cancel</button>
           </div>
           <div id="key-error" class="message error hidden"></div>
         </form>
@@ -156,6 +166,19 @@
     </main>
 
     <!-- ═══════════════════════════════════════ -->
+    <!-- TAB: System Settings                     -->
+    <!-- ═══════════════════════════════════════ -->
+    <main id="tab-settings" class="tab-panel">
+      <section class="card admin-section">
+        <h2>System Configuration</h2>
+        <p class="subtitle">Effective runtime settings and system-wide counters. Master keys only.</p>
+        <div class="kv-grid" id="settings-grid">
+          <div class="text-muted text-sm">Loading system configuration...</div>
+        </div>
+      </section>
+    </main>
+
+    <!-- ═══════════════════════════════════════ -->
     <!-- TAB: Audit Logs                          -->
     <!-- ═══════════════════════════════════════ -->
     <main id="tab-audit" class="tab-panel">
@@ -165,10 +188,28 @@
             <h2>Audit Logs</h2>
             <p class="subtitle">Recent mutating actions across the system. Visible to Master keys only.</p>
           </div>
-          <div class="filters">
-            <input type="text" id="audit-action-filter" class="input-field" placeholder="Filter by action (e.g. KEY_CREATE)" />
-            <button type="button" id="audit-refresh-btn" class="btn btn-secondary btn-sm">Refresh</button>
-          </div>
+        </div>
+        <div class="filters mb-4">
+          <input type="text" id="audit-action-filter" class="input-field font-mono" list="audit-action-options" placeholder="Filter by action...">
+          <datalist id="audit-action-options">
+            <option value="KEY_CREATE"></option>
+            <option value="KEY_UPDATE"></option>
+            <option value="KEY_DELETE"></option>
+            <option value="KEY_ROTATE"></option>
+            <option value="KEY_SECRET_ROTATE"></option>
+            <option value="ENDPOINT_CREATE"></option>
+            <option value="ENDPOINT_UPDATE"></option>
+            <option value="ENDPOINT_DELETE"></option>
+            <option value="ENDPOINT_OWNER_REASSIGN"></option>
+            <option value="VAULT_GROUP_GRANT"></option>
+            <option value="VAULT_GROUP_REVOKE"></option>
+          </datalist>
+          <input type="text" id="audit-ip-filter" class="input-field font-mono" placeholder="Filter by client IP...">
+          <input type="text" id="audit-key-filter" class="input-field" placeholder="Filter by API key (name, prefix, or UUID)...">
+          <input type="datetime-local" id="audit-since-filter" class="input-field" title="Since (inclusive)">
+          <input type="datetime-local" id="audit-until-filter" class="input-field" title="Until (exclusive)">
+          <button type="button" id="audit-search-btn" class="btn btn-icon" title="Search">🔍</button>
+          <button type="button" id="audit-clear-btn" class="btn btn-secondary btn-sm">Clear</button>
         </div>
         <div class="table-container">
           <table class="data-table data-table-fixed">

@@ -239,10 +239,12 @@ async function tryLogin(apiKey, signingSecret) {
     await Promise.all([
       loadEndpoints(),
       me.is_master ? loadKeys() : Promise.resolve(),
+      me.is_master ? loadSettings() : Promise.resolve(),
       me.is_master ? loadAuditLogs() : Promise.resolve(),
     ]);
     if (me.is_master) {
       el('keys-tab-btn').classList.remove('hidden');
+      el('settings-tab-btn').classList.remove('hidden');
       el('audit-tab-btn').classList.remove('hidden');
     }
   } catch (e) {
@@ -255,9 +257,11 @@ async function tryLogin(apiKey, signingSecret) {
 // role badge only, no key name or prefix — those identify the *credential*, not something vault's
 // header shows either.
 function renderIdentity() {
-  const badge = el('identity-badge');
-  badge.textContent = me.is_master ? 'MASTER' : 'DAUGHTER';
-  badge.className = 'badge badge-tier ' + (me.is_master ? 'badge-tier-master' : 'badge-tier-daughter');
+  const badge = el('current-key-tier') || el('identity-badge');
+  if (badge) {
+    badge.textContent = me.is_master ? 'MASTER' : 'DAUGHTER';
+    badge.className = 'badge badge-tier ' + (me.is_master ? 'badge-tier-master' : 'badge-tier-daughter');
+  }
 }
 
 // Reloads whichever tab is currently active, without a full page reload (so scroll position, the
@@ -271,6 +275,7 @@ async function refreshActiveTab() {
   const tab = active.id.replace('tab-', '');
   if (tab === 'endpoints') await loadEndpoints();
   else if (tab === 'keys' && me && me.is_master) await loadKeys();
+  else if (tab === 'settings' && me && me.is_master) await loadSettings();
   else if (tab === 'audit' && me && me.is_master) await loadAuditLogs();
 }
 
@@ -298,6 +303,7 @@ function logout() {
   el('header-actions').classList.add('hidden');
   el('login-screen').classList.remove('hidden');
   el('keys-tab-btn').classList.add('hidden');
+  el('settings-tab-btn').classList.add('hidden');
   el('audit-tab-btn').classList.add('hidden');
   activateTab('endpoints');
 }
@@ -770,6 +776,7 @@ async function createKey(event) {
       can_manage_keys: el('key-can-manage-keys').checked,
     });
     event.target.reset();
+    el('key-form').classList.add('hidden');
     showMintedKey(minted);
     await loadKeys();
   } catch (e) {
@@ -897,6 +904,43 @@ async function submitEditKey(event) {
   }
 }
 
+// ── System Settings (Master only) ───────────────────────────────────────────
+async function loadSettings() {
+  if (!me?.is_master) return;
+  try {
+    const s = await apiCall('GET', '/api/settings');
+    renderSettings(s);
+  } catch (e) {
+    console.error('Failed to load settings', e);
+  }
+}
+
+function renderSettings(s) {
+  const grid = el('settings-grid');
+  if (!grid || !s) return;
+  const item = (label, value) => `
+    <div class="kv-item">
+      <span class="kv-key">${escapeHtml(label)}</span>
+      <span class="kv-value">${value}</span>
+    </div>
+  `;
+  const trustedProxiesDisplay = (s.trusted_proxies && s.trusted_proxies.length > 0)
+    ? `<div class="tag-list">${s.trusted_proxies.map((p) => `<span class="badge badge-scope font-mono">${escapeHtml(p)}</span>`).join(' ')}</div>`
+    : '<span class="text-muted">None configured</span>';
+
+  grid.innerHTML = [
+    item('Trusted Proxies', trustedProxiesDisplay),
+    item('Secrets at rest', s.encryption_enabled
+      ? '<span class="badge badge-success">encrypted</span>'
+      : '<span class="badge badge-timeout">unencrypted</span>'),
+    item('Vault Base URL', s.vault_base_url ? `<span class="font-mono">${escapeHtml(s.vault_base_url)}</span>` : '<span class="text-muted">None (standalone)</span>'),
+    item('Signature Max Age', `${s.signature_max_age_seconds}s`),
+    item('Public Endpoints', s.endpoint_count),
+    item('Active API keys', s.api_key_count),
+    item('Audit logs retained', s.audit_log_count),
+  ].join('');
+}
+
 // ── Audit Logs (Master only) ────────────────────────────────────────────────
 // Straightforward offset pagination against GET /api/audit-logs?limit=&offset= (src/api/audit.rs
 // already supports both) — no PagedCache/local-chunk layer like example/simply_ip_vault's own
@@ -912,12 +956,47 @@ function updateAuditPaginationUI() {
   el('audit-page-indicator').textContent = `Page ${Math.floor(auditOffset / AUDIT_PAGE_SIZE) + 1}`;
 }
 
+async function triggerAuditSearch() {
+  auditOffset = 0;
+  await loadAuditLogs();
+}
+
+async function clearAuditFilters() {
+  const action = el('audit-action-filter');
+  const ip = el('audit-ip-filter');
+  const key = el('audit-key-filter');
+  const since = el('audit-since-filter');
+  const until = el('audit-until-filter');
+  if (action) action.value = '';
+  if (ip) ip.value = '';
+  if (key) key.value = '';
+  if (since) since.value = '';
+  if (until) until.value = '';
+  await triggerAuditSearch();
+}
+
 async function loadAuditLogs() {
   hideError('audit-error');
   try {
-    const action = el('audit-action-filter').value.trim();
+    const action = el('audit-action-filter')?.value.trim();
+    const clientIp = el('audit-ip-filter')?.value.trim();
+    const apiKey = el('audit-key-filter')?.value.trim();
+    const since = el('audit-since-filter')?.value;
+    const until = el('audit-until-filter')?.value;
+
     const params = new URLSearchParams({ limit: String(AUDIT_PAGE_SIZE), offset: String(auditOffset) });
     if (action) params.set('action', action);
+    if (clientIp) params.set('client_ip', clientIp);
+    if (apiKey) params.set('api_key', apiKey);
+    if (since) {
+      const d = new Date(since);
+      if (!Number.isNaN(d.getTime())) params.set('since', d.toISOString());
+    }
+    if (until) {
+      const d = new Date(until);
+      if (!Number.isNaN(d.getTime())) params.set('until', d.toISOString());
+    }
+
     const logs = await apiCall('GET', `/api/audit-logs?${params.toString()}`);
     auditHasMore = logs.length === AUDIT_PAGE_SIZE;
     updateAuditPaginationUI();
@@ -994,10 +1073,19 @@ document.addEventListener('DOMContentLoaded', () => {
     Session.setApiBaseOverride(el('login-api-base').value);
     tryLogin(el('login-api-key').value.trim(), el('login-signing-secret').value.trim());
   });
-  el('btn-logout').addEventListener('click', logout);
-  el('btn-refresh').addEventListener('click', () => refreshActiveTab());
+  (el('logout-btn') || el('btn-logout'))?.addEventListener('click', logout);
+  (el('refresh-btn') || el('btn-refresh'))?.addEventListener('click', () => refreshActiveTab());
   el('endpoint-form').addEventListener('submit', createEndpoint);
   el('key-form').addEventListener('submit', createKey);
+
+  el('btn-open-create-key')?.addEventListener('click', () => {
+    el('key-form').classList.remove('hidden');
+    el('key-name').focus();
+  });
+  el('btn-cancel-create-key')?.addEventListener('click', () => {
+    el('key-form').classList.add('hidden');
+    el('key-form').reset();
+  });
 
   // Create Endpoint modal: open from the toolbar button, close on the × button, Cancel, a
   // backdrop click, or Escape — same conventions as the reassignment modal below.
@@ -1025,16 +1113,18 @@ document.addEventListener('DOMContentLoaded', () => {
     if (event.target.id === 'edit-key-modal') closeEditKeyModal();
   });
 
-  el('audit-refresh-btn').addEventListener('click', () => {
-    auditOffset = 0;
-    loadAuditLogs();
+  el('audit-search-btn')?.addEventListener('click', triggerAuditSearch);
+  el('audit-clear-btn')?.addEventListener('click', clearAuditFilters);
+  ['audit-action-filter', 'audit-ip-filter', 'audit-key-filter'].forEach((id) => {
+    el(id)?.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        triggerAuditSearch();
+      }
+    });
   });
-  el('audit-action-filter').addEventListener('keydown', (event) => {
-    if (event.key === 'Enter') {
-      event.preventDefault();
-      auditOffset = 0;
-      loadAuditLogs();
-    }
+  ['audit-since-filter', 'audit-until-filter'].forEach((id) => {
+    el(id)?.addEventListener('change', triggerAuditSearch);
   });
   el('audit-btn-prev').addEventListener('click', () => {
     auditOffset = Math.max(0, auditOffset - AUDIT_PAGE_SIZE);

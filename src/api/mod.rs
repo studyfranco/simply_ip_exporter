@@ -16,6 +16,8 @@ pub mod guards;
 pub mod groups;
 /// CRUD for `api_keys`.
 pub mod keys;
+/// `GET /api/settings`.
+pub mod settings;
 /// Shared key-minting/hashing helpers and the audit-log writer.
 pub mod support;
 
@@ -27,3 +29,4 @@ pub use health::{health_check, readiness_check};
 pub use keys::{
     create_api_key, delete_api_key, list_api_keys, rotate_api_key, rotate_signing_secret, update_api_key,
 };
+pub use settings::get_settings;

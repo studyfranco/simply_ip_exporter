@@ -1068,6 +1068,37 @@ async fn audit_log_action_filter_narrows_results() {
     assert!(logs.iter().all(|l| l["action"] == "KEY_CREATE"));
 }
 
+#[tokio::test]
+async fn settings_endpoint_requires_master_and_reports_config() {
+    let db = setup_test_db().await;
+    let master = insert_key(&db, true, true).await;
+    let daughter = insert_key(&db, false, true).await;
+    let state = test_state(&db).with_pinned_master(master.model.id);
+    let app = create_app(state);
+
+    // Daughter key is rejected with 403
+    let res = app
+        .clone()
+        .oneshot(signed_request("GET", "/api/settings", &daughter, ""))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+    // Master key succeeds with 200 and returns expected fields
+    let res = app
+        .oneshot(signed_request("GET", "/api/settings", &master, ""))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = body_json(res).await;
+    assert!(body.get("trusted_proxies").is_some());
+    assert!(body.get("encryption_enabled").is_some());
+    assert!(body.get("signature_max_age_seconds").is_some());
+    assert!(body.get("endpoint_count").is_some());
+    assert!(body.get("api_key_count").is_some());
+    assert!(body.get("audit_log_count").is_some());
+}
+
 // ── Malformed request handling (StrictJson / StrictPath) ────────────────────
 //
 // Axum's built-in `Json`/`Path` extractors reject a malformed request with a plain-text body of
