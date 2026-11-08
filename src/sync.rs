@@ -19,7 +19,7 @@ const TICK_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Wall-clock ceiling on the boot sync ([`run_boot_sync`]) before startup proceeds regardless.
 ///
-/// The boot pass is sequential and each endpoint's fetch can take up to `vault_client`'s own 15s
+/// The boot pass is sequential and each endpoint's fetch can take up to `vault_client`'s own 60s
 /// request timeout, so an unreachable Vault plus a handful of endpoints would otherwise hold the
 /// HTTP listener closed for minutes. To an orchestrator that is indistinguishable from a failed
 /// start: Docker's `HEALTHCHECK` and Kubernetes' probes cannot even open a connection while the

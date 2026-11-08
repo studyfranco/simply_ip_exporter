@@ -1875,16 +1875,15 @@ async fn spawn_slow_paginating_vault(
 /// threshold papering over the same false positive.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn public_feed_reads_stay_fast_and_non_empty_while_a_full_resync_runs() {
-    const RECORDS: usize = 3_000; // 3 pages at PAGE_SIZE 1000
-    // 1500ms, not the original 400ms: measured on this machine, a *correctly* fast reader's own
-    // real work (HMAC verification, a SQLite lookup, serializing a 3,000-record body) can already
-    // tail-latency past 400ms under 100-way concurrency and unrelated system load — nothing to do
-    // with the lock. 1500ms gives roughly 3x headroom above that observed tail while staying a
-    // small fraction of the full sync's ~4.5s duration (3 pages), so a *genuinely* lock-starved
-    // reader (which would wait on the order of the whole sync, not one page) is still caught
-    // immediately and unambiguously. Assertion below now compares against `sync_elapsed`, not this
-    // constant, for the same reason.
-    const PAGE_DELAY: std::time::Duration = std::time::Duration::from_millis(1500);
+    const RECORDS: usize = 3_000; // a single page at PAGE_SIZE 10,000
+    // 4500ms: measured on this machine, a *correctly* fast reader's own real work (HMAC
+    // verification, a SQLite lookup, serializing a 3,000-record body) can tail-latency past 400ms
+    // under 100-way concurrency and unrelated system load — nothing to do with the lock. The sync
+    // used to be 3 pages × 1500ms; since `PAGE_SIZE` went to 10,000 (2026-11-08) these records fit
+    // in one page, so the single page carries the whole ~4.5s instead, keeping the same gap between
+    // a correct reader and a *genuinely* lock-starved one (which would wait on the order of the
+    // whole sync). Assertion below compares against `sync_elapsed`, not this constant.
+    const PAGE_DELAY: std::time::Duration = std::time::Duration::from_millis(4500);
     const READERS: usize = 100;
 
     let (vault_url, _vault) = spawn_slow_paginating_vault(RECORDS, PAGE_DELAY).await;

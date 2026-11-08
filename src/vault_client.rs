@@ -21,7 +21,12 @@ use crate::crypto::{canonical_v1_payload, compute_signature};
 /// (`sync::sync_all_endpoints`), so an indefinitely hanging request would silently stall every
 /// other endpoint's sync ticks behind it rather than surfacing as the fast, logged failure the
 /// "keep serving the cache" resilience contract expects.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+///
+/// 60s rather than the original 15s (2026-11-08): with multi-million-row groups, a legitimately
+/// deep `offset` page costs Vault a few seconds of index walking, and 15s left too little headroom
+/// under the [`MAX_CONCURRENT_PAGES`] parallel load. 60s still turns a black-holed Vault into a
+/// bounded, logged failure.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// One record as returned by Vault's `GET /api/ips` contract.
 ///
@@ -66,6 +71,11 @@ pub enum VaultError {
     /// Vault answered with a non-success status.
     #[error("simply_ip_vault returned HTTP {0}")]
     Status(reqwest::StatusCode),
+    /// Vault kept serving the same page while `offset` advanced, so the walk could never end.
+    /// Reported as a failure rather than returned as a truncated result: a full sync has replace
+    /// semantics, and a silently short feed is worse than keeping the previous cache.
+    #[error("simply_ip_vault pagination made no progress for groups {0:?} (is it honouring `offset`?)")]
+    PaginationStalled(String),
 }
 
 /// How many records to request per `GET /api/ips` page.
@@ -74,11 +84,22 @@ pub enum VaultError {
 /// a cap: it keeps a single response comfortably small, and it puts the overwhelming majority of
 /// deployments in **one** page — which means zero page boundaries, and so no exposure at all to the
 /// ordering caveat documented on [`VaultClient::fetch_ips`].
-const PAGE_SIZE: u64 = 1_000;
+///
+/// 10,000 rather than the original 1,000 (2026-11-08): Vault only offers `limit`/`offset`, and each
+/// page costs it an index walk proportional to its offset, so a full walk is quadratic in the
+/// dataset size divided by the page size. With multi-million-row groups that made full syncs take
+/// hours; 10x the page size is 10x fewer pages and 10x less total walking. The upper bound is
+/// Vault's own: it resolves each page's causes with one `IN (...)` over the page's membership ids,
+/// and SQLite caps bind variables at 32,766 — so this must stay comfortably below that. One page is
+/// then a few MB of JSON, which is fine.
+const PAGE_SIZE: u64 = 10_000;
 
-/// Hard ceiling on pages walked in one [`VaultClient::fetch_ips`] call — a runaway guard, not a
-/// dataset limit. At [`PAGE_SIZE`] this allows a million records before it trips.
-const MAX_PAGES: u32 = 1_000;
+// There is deliberately **no** page-count ceiling (2026-11-08). A former `MAX_PAGES = 1_000` guard
+// silently truncated any dataset above one million memberships — a real deployment reported 6,952
+// pages — which on a full sync is exactly the destructive short-feed failure pagination exists to
+// prevent. The envelope path is bounded by Vault's own `total_pages`; the sequential fallback is
+// protected against a Vault that ignores `offset` by a no-progress check that fails the fetch
+// instead of truncating it (see `VaultClient::fetch_sequentially`).
 
 /// How many page requests may be in flight at once when Vault reports a page count up front.
 ///
@@ -181,7 +202,44 @@ impl VaultClient {
     /// is keyed by address), and a skipped record is picked up by the next sync cycle. Vault
     /// exposes no cursor that would avoid this; a larger [`PAGE_SIZE`] reduces the number of
     /// boundaries where it can happen at all, and most deployments fit in a single page.
+    ///
+    /// # One group at a time
+    ///
+    /// A multi-group scope (`"g1,g2,g3"`) is fetched as one independent walk **per group**, then
+    /// concatenated. Vault serves a multi-group page from its indexed per-group merge only while
+    /// `offset + limit <= 2000` (`MERGE_MAX_FETCH` in
+    /// `example/simply_ip_vault/src/api/records.rs`); past that it falls back to a single
+    /// `GroupId IN (...) ORDER BY last_seen_at` query that sorts every matching row — measured by
+    /// Vault itself at 56–91s on a large dataset. Every page from the third onwards therefore timed
+    /// out (the reported `offset=2000` failure). A single-group query never takes that path: it is
+    /// served straight from the `(group_id, last_seen_at DESC)` partial index at any offset.
+    /// Splitting changes nothing downstream — the cache is keyed by address, and the same address
+    /// in two groups already arrived twice from the combined query (one item per membership).
     pub async fn fetch_ips(
+        &self,
+        groups: &str,
+        since: Option<NaiveDateTime>,
+    ) -> Result<Vec<VaultApiRecord>, VaultError> {
+        let mut scopes: Vec<&str> = Vec::new();
+        for group in groups.split(',').map(str::trim).filter(|g| !g.is_empty()) {
+            if !scopes.contains(&group) {
+                scopes.push(group);
+            }
+        }
+        // Zero or one group: nothing to split, keep the request exactly as configured.
+        if scopes.len() <= 1 {
+            return self.fetch_ips_for_scope(groups, since).await;
+        }
+
+        let mut all = Vec::new();
+        for scope in scopes {
+            all.extend(self.fetch_ips_for_scope(scope, since).await?);
+        }
+        Ok(all)
+    }
+
+    /// Walks Vault's pagination to completion for one `groups=` scope. See [`Self::fetch_ips`].
+    async fn fetch_ips_for_scope(
         &self,
         groups: &str,
         since: Option<NaiveDateTime>,
@@ -257,15 +315,10 @@ impl VaultClient {
         if offsets.is_empty() {
             return Ok(all);
         }
-
-        if offsets.len() + 1 > MAX_PAGES as usize {
-            tracing::error!(
-                "simply_ip_vault reports {} pages for groups {groups:?}, beyond the {MAX_PAGES}-page \
-                 ceiling. Refusing to fetch them all; the result IS truncated.",
-                envelope.total_pages
-            );
-        }
-        let offsets: Vec<u64> = offsets.into_iter().take(MAX_PAGES as usize - 1).collect();
+        tracing::debug!(
+            "Fetching {} pages from simply_ip_vault for groups {groups:?}",
+            envelope.total_pages
+        );
 
         let pages: Vec<Vec<VaultApiRecord>> = stream::iter(offsets)
             .map(|offset| async move {
@@ -304,33 +357,35 @@ impl VaultClient {
         }
 
         let mut offset: u64 = if resume_at_second_page { self.page_size } else { 0 };
-        let mut pages: u32 = if resume_at_second_page { 1 } else { 0 };
+        // Identity of the previous page's first row, for the no-progress guard below. Seeded from
+        // the already-fetched page one when the walk resumes at page two.
+        let first_key = |r: &VaultApiRecord| (r.target_address.clone(), r.last_seen_at);
+        let mut previous_first = all.first().map(first_key);
 
         loop {
             let page: Vec<VaultApiRecord> = self
                 .signed_get(&format!("{base}&limit={}&offset={offset}", self.page_size))
                 .await?;
             let page_len = page.len() as u64;
+
+            // A Vault that ignores `offset` serves page one forever, and this response shape
+            // reports no total to stop at. Two consecutive full pages opening on the very same row
+            // means the walk is not advancing: fail loudly instead of looping or truncating.
+            // (No page-count cap any more — that is what silently truncated large datasets.)
+            let this_first = page.first().map(first_key);
+            if page_len == self.page_size && this_first.is_some() && this_first == previous_first {
+                tracing::error!(
+                    "simply_ip_vault served the same page again at offset {offset} for groups \
+                     {groups:?}; it does not appear to honour `offset`. Aborting this sync."
+                );
+                return Err(VaultError::PaginationStalled(groups.to_owned()));
+            }
+            previous_first = this_first;
             all.extend(page);
-            pages += 1;
 
             // A short page is Vault saying "that was the last of them" — the only correct
             // termination signal, since this response shape reports no total count.
             if page_len < self.page_size {
-                break;
-            }
-
-            if pages >= MAX_PAGES {
-                // Never reached by a well-behaved Vault: it means either a genuinely enormous
-                // dataset or a Vault that is ignoring `offset` and serving page one forever. Loud
-                // on purpose — this is the one path that still returns a truncated result, which is
-                // precisely the defect this function exists to prevent, so it must never be quiet.
-                tracing::error!(
-                    "Stopped paginating simply_ip_vault after {pages} pages ({} records) for \
-                     groups {groups:?}: refusing to loop further. The result IS truncated — a full \
-                     sync will publish a short feed. Check whether Vault is honouring `offset`.",
-                    all.len()
-                );
                 break;
             }
 
@@ -745,7 +800,7 @@ mod tests {
     #[tokio::test]
     async fn a_mixed_ipv4_and_ipv6_dataset_survives_the_parallel_multi_page_fetch() {
         let (url, _server) = spawn_mixed_protocol_mock_vault(3_500).await;
-        let client = client_at(url); // real PAGE_SIZE = 1000 → 4 pages
+        let client = client_at(url).with_page_size(1_000); // → 4 pages
 
         let records = client.fetch_ips("g1", None).await.expect("a mixed-family fetch succeeds");
 
@@ -793,7 +848,7 @@ mod tests {
     async fn an_envelope_fetch_pulls_3214_records_across_four_pages_in_parallel() {
         let (url, seen, _server) =
             spawn_flavoured_mock_vault(3_214, VaultFlavour::Envelope).await;
-        let client = client_at(url); // real PAGE_SIZE = 1000
+        let client = client_at(url).with_page_size(1_000);
 
         let records = client.fetch_ips("g1", None).await.expect("the parallel fetch succeeds");
 
@@ -855,7 +910,7 @@ mod tests {
         let (in_flight_h, peak_h) =
             (std::sync::Arc::clone(&in_flight), std::sync::Arc::clone(&peak));
 
-        let total = 12_000usize; // 12 pages at PAGE_SIZE 1000
+        let total = 12_000usize; // 12 pages at a page size of 1000
         let app = Router::new().route(
             "/api/ips",
             get(move |RawQuery(query): RawQuery| {
@@ -906,7 +961,7 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let client = client_at(format!("http://{addr}"));
+        let client = client_at(format!("http://{addr}")).with_page_size(1_000);
         let records = client.fetch_ips("g1", None).await.expect("fetch succeeds");
 
         assert_eq!(records.len(), 12_000);
@@ -929,21 +984,97 @@ mod tests {
     async fn parallel_pages_each_carry_since_include_deleted_and_groups() {
         let (url, seen, _server) =
             spawn_flavoured_mock_vault(2_500, VaultFlavour::Envelope).await;
-        let client = client_at(url);
+        let client = client_at(url).with_page_size(1_000);
         let since = chrono::DateTime::from_timestamp(1_700_000_000, 0)
             .expect("a valid timestamp")
             .naive_utc();
 
         let records = client.fetch_ips("g1,g2", Some(since)).await.expect("fetch succeeds");
-        assert_eq!(records.len(), 2_500);
+        // The mock ignores `groups`, so each of the two per-group walks returns all 2,500.
+        assert_eq!(records.len(), 5_000);
 
         let queries = seen.lock().expect("not poisoned").clone();
-        assert_eq!(queries.len(), 3, "one probe plus two follow-up pages");
+        assert_eq!(queries.len(), 6, "per group: one probe plus two follow-up pages");
         for query in &queries {
             assert!(query.contains("since=1700000000"), "every page keeps the cutoff: {query}");
             assert!(query.contains("include_deleted=true"), "every page keeps the flag: {query}");
-            assert!(query.contains("groups=g1,g2"), "every page keeps the group scope: {query}");
+            assert!(
+                query.contains("groups=g1&") || query.contains("groups=g2&"),
+                "every page is scoped to exactly one group: {query}"
+            );
         }
+    }
+
+    /// A multi-group scope is walked one group at a time, so no request ever asks Vault for a
+    /// multi-group page beyond its indexed merge window (the `offset=2000` timeouts). Each group
+    /// gets its own complete walk, duplicates in the list are collapsed, and blanks are ignored.
+    #[tokio::test]
+    async fn a_multi_group_scope_is_fetched_as_one_walk_per_group() {
+        let (url, seen, _server) =
+            spawn_flavoured_mock_vault(2_500, VaultFlavour::Envelope).await;
+        let client = client_at(url).with_page_size(1_000);
+
+        let records = client.fetch_ips("g1, g2,,g1,g3", None).await.expect("fetch succeeds");
+        assert_eq!(records.len(), 7_500, "three distinct groups × 2,500");
+
+        let queries = seen.lock().expect("not poisoned").clone();
+        assert_eq!(queries.len(), 9, "three groups × three pages");
+        for group in ["g1", "g2", "g3"] {
+            let scoped: Vec<&String> =
+                queries.iter().filter(|q| q.contains(&format!("groups={group}&"))).collect();
+            assert_eq!(scoped.len(), 3, "{group} gets its own complete walk");
+        }
+        assert!(queries.iter().all(|q| !q.contains("%2C") && !q.contains("g1,")));
+    }
+
+    /// No page ceiling: a dataset Vault reports as more than 1,000 pages is fetched in full. The
+    /// former `MAX_PAGES = 1_000` cap silently truncated exactly this case in production.
+    #[tokio::test]
+    async fn an_envelope_beyond_a_thousand_pages_is_fetched_without_truncation() {
+        let (url, seen, _server) =
+            spawn_flavoured_mock_vault(1_203, VaultFlavour::Envelope).await;
+        let client = client_at(url).with_page_size(1);
+
+        let records = client.fetch_ips("g1", None).await.expect("fetch succeeds");
+
+        assert_eq!(records.len(), 1_203, "every page beyond the old ceiling must arrive");
+        assert_eq!(seen.lock().expect("not poisoned").len(), 1_203);
+    }
+
+    /// No page ceiling on the sequential fallback either — but a Vault that ignores `offset` must
+    /// still not loop forever. It is reported as an error (keeping the previous cache), never
+    /// returned as a truncated result.
+    #[tokio::test]
+    async fn a_vault_that_ignores_offset_fails_the_sequential_walk_instead_of_looping() {
+        use axum::{Router, routing::get};
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_h = std::sync::Arc::clone(&calls);
+        let app = Router::new().route(
+            "/api/ips",
+            get(move || {
+                calls_h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async {
+                    // Always the same full page of two, whatever the offset; bare array = legacy.
+                    axum::Json(serde_json::json!([
+                        {"target_address": "51.0.0.1", "last_seen_at": "2026-08-11T10:00:00"},
+                        {"target_address": "51.0.1.1", "last_seen_at": "2026-08-11T09:00:00"},
+                    ]))
+                }
+            }),
+        );
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback bind always succeeds");
+        let addr = listener.local_addr().expect("a bound listener has a local address");
+        let _server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = client_at(format!("http://{addr}")).with_page_size(2);
+        let err = client.fetch_ips("g1", None).await.expect_err("a stalled walk must not be Ok");
+
+        assert!(matches!(err, VaultError::PaginationStalled(_)), "got {err:?}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2, "detected on the first repeat");
     }
 
     // ── Legacy tolerance: two distinct shapes of "older Vault" ────────────────

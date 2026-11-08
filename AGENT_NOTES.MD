@@ -2560,3 +2560,42 @@ In production, `simply_ip_exporter` logged loud warnings (`WARN: Skipping this c
 - `cargo test`: 163 tests pass (119 unit + 4 main + 40 integration + 13 source hygiene).
 - `./scripts/verify_convergence.sh`: All convergence checks pass.
 - `./scripts/test_e2e.sh`: 127/127 checks pass (exit code 0).
+
+## 2026-11-08 — No page ceiling; multi-group fetches split per group
+
+### Problem
+Production: `simply_ip_vault reports 6952 pages … beyond the 1000-page ceiling … result IS truncated`,
+then every full sync failed on `…&offset=2000` (request error = the 15s timeout).
+
+Two causes:
+1. `MAX_PAGES = 1_000` silently truncated anything above 1M memberships.
+2. Vault serves a multi-group page via its indexed per-group merge only while
+   `offset + limit <= MERGE_MAX_FETCH (2000)`; beyond that it runs `GroupId IN (...) ORDER BY
+   last_seen_at` with a full sort (Vault documents 56–91s). Hence offsets 0 and 1000 worked and
+   2000 timed out.
+
+### Changes (`src/vault_client.rs`)
+- `MAX_PAGES` removed. Envelope path is bounded by Vault's `total_pages`; the sequential fallback
+  detects a Vault ignoring `offset` (two consecutive full pages opening on the same row) and returns
+  the new `VaultError::PaginationStalled` instead of truncating.
+- `fetch_ips` splits a multi-group scope (deduped, trimmed) into one walk per group
+  (`fetch_ips_for_scope`), so Vault always stays on its `(group_id, last_seen_at DESC)` index path.
+- `REQUEST_TIMEOUT` 15s → 60s (deep single-group offsets cost Vault real index walking).
+- Tests: `a_multi_group_scope_is_fetched_as_one_walk_per_group`,
+  `an_envelope_beyond_a_thousand_pages_is_fetched_without_truncation`,
+  `a_vault_that_ignores_offset_fails_the_sequential_walk_instead_of_looping`;
+  `parallel_pages_each_carry_since_include_deleted_and_groups` updated for per-group scoping.
+
+### Pending / known limits
+- Offset pagination is still O(offset) per page on Vault's side, so a full sync of ~7M rows is
+  quadratic overall. The real fix is a keyset cursor on Vault's `GET /api/ips` (e.g.
+  `before=<last_seen_at>,<id>`); raising `PAGE_SIZE` (≤ ~30k, SQLite bind-variable limit on Vault's
+  cause lookup) is the cheap mitigation.
+
+### Follow-up (same day): `PAGE_SIZE` 1,000 → 10,000
+Cheap mitigation for the quadratic offset walk: 10x fewer pages, 10x less index walking on Vault.
+Bounded by SQLite's 32,766 bind variables (Vault's per-page cause `IN (...)`). Unit tests that
+exercise multi-page walks now pin `with_page_size(1_000)`; the integration lock-starvation test
+(3,000 records) is now one page, so its `PAGE_DELAY` went 1500ms → 4500ms to keep the same total
+sync duration. `scripts/test_e2e.sh` comment updated: the exporter now fetches its 3,714-record
+fixture in one page. The keyset cursor on Vault remains the real fix (not done — peer repo).

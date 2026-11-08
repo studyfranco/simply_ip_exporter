@@ -69,8 +69,10 @@ EXPORTER_URL="http://127.0.0.1:$EXPORTER_PORT"
 # Distinct per service so a copy-paste mistake between the two is loud, not silent.
 # How many records §2 seeds into pfBlocker_Pagination_Test, and §4b expects to survive intact.
 # Must stay > Vault's default page (50) for the truncation guard to mean anything, and is chosen at
-# 3214 to span exactly four pages at VaultClient's PAGE_SIZE of 1000 (1000+1000+1000+214) — so the
-# bounded-parallel envelope path is exercised at its real page size, not a shrunken test one.
+# 3214 to span exactly four pages at limit=1000 (1000+1000+1000+214) for the direct Vault envelope
+# check in §4b. Note: since 2026-11-08 VaultClient's own PAGE_SIZE is 10,000, so the exporter now
+# fetches this fixture in a single page; its multi-page parallel path is covered by the unit tests
+# in src/vault_client.rs (which pin a page size of 1000) rather than by this script.
 PAGINATION_RECORD_COUNT=3214
 # 500 IPv6 records seeded into the same group, so the large-scale fixture exercises both
 # families through one multi-page parallel fetch rather than proving IPv4 only.
