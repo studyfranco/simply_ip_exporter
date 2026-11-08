@@ -3,7 +3,7 @@
 //! regardless of what it owns.
 
 use axum::{Extension, Json, extract::State, response::IntoResponse};
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
+use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 use serde::Deserialize;
 
 use crate::entities::{api_key, audit_log, prelude::AuditLog};
@@ -19,6 +19,10 @@ use crate::state::AppState;
 pub struct AuditLogQuery {
     /// Filter by exact action type (e.g. `KEY_CREATE`).
     pub action: Option<String>,
+    /// Filter by client IP substring.
+    pub client_ip: Option<String>,
+    /// Filter by acting key name, prefix, or UUID.
+    pub api_key: Option<String>,
     /// Pagination limit. Defaults to 50.
     pub limit: Option<u64>,
     /// Pagination offset. Defaults to 0.
@@ -32,14 +36,41 @@ pub async fn list_audit_logs(
     StrictQuery(query): StrictQuery<AuditLogQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     if !caller.is_master {
-        return Err(AppError::Forbidden("Only the Master key can view audit logs".to_owned()));
+        return Err(AppError::Forbidden(
+            "Only the Master key can view audit logs".to_owned(),
+        ));
     }
 
     let mut q = AuditLog::find().order_by_desc(audit_log::Column::Timestamp);
-    if let Some(action) = &query.action
-        && !action.is_empty()
+    if let Some(action) = query
+        .action
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
     {
         q = q.filter(audit_log::Column::Action.eq(action));
+    }
+    if let Some(client_ip) = query
+        .client_ip
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        q = q.filter(audit_log::Column::ClientIp.contains(client_ip));
+    }
+    if let Some(key_filter) = query
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let mut cond = Condition::any()
+            .add(audit_log::Column::ApiKeyName.contains(key_filter))
+            .add(audit_log::Column::ApiKeyPrefix.contains(key_filter));
+        if let Ok(uuid) = uuid::Uuid::parse_str(key_filter) {
+            cond = cond.add(audit_log::Column::ApiKeyId.eq(uuid));
+        }
+        q = q.filter(cond);
     }
 
     let limit = query.limit.unwrap_or(50).min(500);

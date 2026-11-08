@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>simply_ip_exporter</title>
+  <title>Simply IP Exporter</title>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -13,30 +13,30 @@
     <div class="login-card">
       <div class="logo">
         <div class="logo-icon"></div>
-        <h1>simply_ip_exporter</h1>
+        <h1>Simply IP Exporter</h1>
       </div>
-      <h2>Sign in</h2>
-      <p class="subtitle">Enter a local admin API key and its signing secret. Every request is
+      <h2>Threat Feed Exporter</h2>
+      <p class="subtitle">Enter your API key and its signing secret to access the dashboard. Every request is
         signed client-side (CANONICAL_V1 HMAC-SHA256) — the secret never leaves this page except
         as part of a signature.</p>
       <form id="login-form" class="login-form">
         <div class="form-group">
-          <label for="login-api-key">X-API-Key</label>
+          <label for="login-api-key">API Key</label>
           <input type="password" id="login-api-key" class="input-field" placeholder="Enter X-API-Key..." autocomplete="off" required />
         </div>
         <div class="form-group">
-          <label for="login-signing-secret">Signing secret</label>
+          <label for="login-signing-secret">Signing Secret</label>
           <input type="password" id="login-signing-secret" class="input-field" placeholder="Enter HMAC signing secret..." autocomplete="off" required />
           <small class="field-hint">Used locally to sign every request (HMAC-SHA256). Never transmitted.</small>
         </div>
         <div class="form-group">
-          <label for="login-api-base">API base path override</label>
+          <label for="login-api-base">API Base Path Override</label>
           <input type="text" id="login-api-base" class="input-field" placeholder="/api" autocomplete="off" />
           <small class="field-hint">Leave blank unless this dashboard sits behind a reverse proxy
             that forwards its subpath prefix through to this service instead of stripping it —
             see AGENT.MD.</small>
         </div>
-        <button type="submit" class="btn btn-primary">Sign in</button>
+        <button type="submit" class="btn btn-primary">Unlock Dashboard</button>
       </form>
       <div id="login-error" class="message error hidden"></div>
     </div>
@@ -47,7 +47,7 @@
       <header class="header">
         <div class="logo">
           <div class="logo-icon"></div>
-          <h1>simply_ip_exporter</h1>
+          <h1>Simply IP Exporter</h1>
         </div>
         <div id="header-actions" class="header-actions hidden">
           <span id="identity-badge" class="badge badge-tier"></span>
