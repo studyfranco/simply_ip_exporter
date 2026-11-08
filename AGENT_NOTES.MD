@@ -2569,10 +2569,20 @@ then every full sync failed on `…&offset=2000` (request error = the 15s timeou
 
 Two causes:
 1. `MAX_PAGES = 1_000` silently truncated anything above 1M memberships.
-2. Vault serves a multi-group page via its indexed per-group merge only while
-   `offset + limit <= MERGE_MAX_FETCH (2000)`; beyond that it runs `GroupId IN (...) ORDER BY
-   last_seen_at` with a full sort (Vault documents 56–91s). Hence offsets 0 and 1000 worked and
-   2000 timed out.
+2. Vault (audited at `be355b2`, `src/api/records.rs::list_ips`) serves a multi-group page via its
+   indexed per-group merge only while `offset + limit <= MERGE_MAX_FETCH (2000)`; beyond that it
+   runs `GroupId IN (...) ORDER BY last_seen_at` with a full sort (Vault documents 56–91s). Hence
+   offsets 0 and 1000 worked and 2000 timed out.
+
+### Peer finding (`simply_ip_vault` @ `be355b2`, resolved in `eda0f41`)
+- `GET /api/ips` offered only `limit`/`offset`: multi-group deep pages fell off the index past
+  `MERGE_MAX_FETCH = 2000` (56–91s full sort), single-group `OFFSET n` was still `O(n)` per page so a
+  full walk was `O(N^2 / limit)`, and `ORDER BY last_seen_at DESC` had no tiebreaker so
+  concurrent updates could duplicate or skip a boundary row.
+- Resolved on Vault's side in `eda0f41`: opt-in keyset pagination (`cursor` / `next_cursor`) ordered
+  by `(last_seen_at DESC, id ASC)` with a planner-friendly `last_seen_at <= :cur_ts` range bound on
+  `idx_memberships_active_last_seen`, plus `format=minimal` (`target_address`, `last_seen_at`,
+  `is_deleted` only, skipping the per-page group and cause queries).
 
 ### Changes (`src/vault_client.rs`)
 - `MAX_PAGES` removed. Envelope path is bounded by Vault's `total_pages`; the sequential fallback
@@ -2598,4 +2608,20 @@ Bounded by SQLite's 32,766 bind variables (Vault's per-page cause `IN (...)`). U
 exercise multi-page walks now pin `with_page_size(1_000)`; the integration lock-starvation test
 (3,000 records) is now one page, so its `PAGE_DELAY` went 1500ms → 4500ms to keep the same total
 sync duration. `scripts/test_e2e.sh` comment updated: the exporter now fetches its 3,714-record
-fixture in one page. The keyset cursor on Vault remains the real fix (not done — peer repo).
+fixture in one page. ### Follow-up 2 (same day): Keyset `cursor` & `format=minimal` wired into `VaultClient`
+Following `simply_ip_vault` commit `eda0f41`, `VaultClient::fetch_ips_for_scope` now sends
+`include_total=true&format=minimal&limit={page_size}&offset=0` on page one and, when Vault returns
+`next_cursor`, walks pages `2..` via `fetch_remaining_pages_by_cursor`
+(`{base}&format=minimal&limit={page_size}&cursor={next_cursor}`):
+- Every follow-up page is an `O(limit)` seek on Vault's `idx_memberships_active_last_seen` covering
+  index, omitting `include_total` (no follow-up `COUNT(*)`) and `offset`.
+- `format=minimal` projects only `(target_address, last_seen_at, is_deleted)`, skipping Vault's
+  per-page `ip_groups` and `ip_record_causes` lookup queries.
+- Stalled-cursor guard (`seen_cursors`) aborts with `VaultError::PaginationStalled` if a broken
+  Vault ever repeats a cursor token.
+- Full backward compatibility preserved: pre-`eda0f41` Vaults (`next_cursor: None`) fall back to
+  `fetch_remaining_pages_in_parallel`, and pre-`b8bd281` Vaults fall back to `fetch_sequentially`.
+- Added 4 unit tests in `src/vault_client.rs` covering `VaultFlavour::Cursor` (multi-page walk,
+  exact-multiple lookahead termination, delta-sync filter propagation, and repeated-cursor stall
+  detection) and extended `scripts/test_e2e.sh` §2 to assert `next_cursor` and `format=minimal`
+  against live Vault.

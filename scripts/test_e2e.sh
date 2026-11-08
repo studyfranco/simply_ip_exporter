@@ -508,11 +508,18 @@ check_jq "length" "50" "Vault truncates to its default limit=50 when no limit is
 # the live daemon rather than assumed from the reference: if Vault ever stops reporting total_pages,
 # the Exporter silently falls back to sequential paging and §4b would still pass — so the envelope
 # itself needs its own check.
-api_call "$VAULT_URL" GET "/api/ips?groups=pfBlocker_Pagination_Test&include_total=true&limit=$PAGINATION_PAGE_SIZE" "$VAULT_MASTER_KEY"
-check "200" "Vault answers include_total=true"
+api_call "$VAULT_URL" GET "/api/ips?groups=pfBlocker_Pagination_Test&include_total=true&format=minimal&limit=$PAGINATION_PAGE_SIZE" "$VAULT_MASTER_KEY"
+check "200" "Vault answers include_total=true&format=minimal"
 check_jq ".total" "$PAGINATION_TOTAL_COUNT" "the envelope reports total=$PAGINATION_TOTAL_COUNT (IPv4 + IPv6) across all pages"
 check_jq ".total_pages" "$PAGINATION_EXPECTED_PAGES" "the envelope reports total_pages=$PAGINATION_EXPECTED_PAGES at limit=$PAGINATION_PAGE_SIZE"
 check_jq ".data | length" "$PAGINATION_PAGE_SIZE" "page one carries exactly $PAGINATION_PAGE_SIZE records under .data"
+check_jq ".next_cursor != null" "true" "page one emits a non-null keyset next_cursor (Vault eda0f41+)"
+check_jq "(.data[0] | keys | length)" "3" "format=minimal projects only target_address, last_seen_at, is_deleted"
+PAGE_ONE_CURSOR=$(echo "$RESP_BODY" | jq -r '.next_cursor')
+api_call "$VAULT_URL" GET "/api/ips?groups=pfBlocker_Pagination_Test&format=minimal&limit=$PAGINATION_PAGE_SIZE&cursor=$PAGE_ONE_CURSOR" "$VAULT_MASTER_KEY"
+check "200" "Vault serves page two via cursor=<next_cursor>&format=minimal"
+check_jq ".data | length" "$PAGINATION_PAGE_SIZE" "cursor page two carries $PAGINATION_PAGE_SIZE records"
+check_jq "has(\"total\")" "false" "cursor follow-up envelope omits total (skips COUNT(*))"
 
 # ── Restricted-key multi-group fixture (§4d) ────────────────────────────────
 # 500 records across three groups, with the Exporter's Vault key granted can_read on only two of

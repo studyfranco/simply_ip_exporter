@@ -112,26 +112,41 @@ const MAX_CONCURRENT_PAGES: usize = 5;
 
 /// Vault's `GET /api/ips?include_total=true` envelope.
 ///
-/// Only the two fields this client acts on are modelled; `total`, `limit` and `offset` are also
-/// present in Vault's response and deliberately ignored — `total_pages` already encodes everything
-/// needed to enumerate the remaining offsets, and re-deriving it from `total`/`limit` here would
-/// duplicate a calculation Vault has already made (and could disagree with it at the boundary).
+/// Only the three fields this client acts on are modelled; `total`, `limit` and `offset` are also
+/// present in Vault's response and deliberately ignored — `next_cursor` drives keyset continuation
+/// against a current (`eda0f41`+) Vault, while `total_pages` enumerates the remaining offsets when
+/// talking to a pre-`eda0f41` Vault that does not yet emit `next_cursor`.
 #[derive(Debug, Deserialize)]
 struct IpRecordsEnvelope {
     data: Vec<VaultApiRecord>,
     total_pages: u64,
+    #[serde(default)]
+    next_cursor: Option<String>,
 }
 
-/// What `GET /api/ips` answered with: the paginated envelope, or the historical bare array.
+/// Vault's `GET /api/ips?cursor=…` envelope (`eda0f41`+) when `include_total` is not requested.
 ///
-/// `untagged` so one deserialize attempt covers both shapes — an object with `data`/`total_pages`
-/// matches [`IpRecordsEnvelope`], and a root array matches [`Self::Legacy`]. That is the *response*
-/// half of legacy tolerance; see [`VaultClient::fetch_ips`] for the other, sharper half, where an
-/// older Vault rejects the request outright.
+/// Follow-up cursor pages omit `include_total` so Vault skips `COUNT(*)` on every page after the
+/// probe; the end of the walk is signalled by `next_cursor: None`.
+#[derive(Debug, Deserialize)]
+struct IpRecordsCursorEnvelope {
+    data: Vec<VaultApiRecord>,
+    next_cursor: Option<String>,
+}
+
+/// What `GET /api/ips` answered with: the paginated envelope (`include_total=true`), the
+/// cursor-only envelope (`cursor=…`), or the historical bare array.
+///
+/// `untagged` so one deserialize attempt covers all shapes — [`IpRecordsEnvelope`] must precede
+/// [`IpRecordsCursorEnvelope`] because `total_pages` is required on the former whereas
+/// `next_cursor` is optional on both. That is the *response* half of legacy tolerance; see
+/// [`VaultClient::fetch_ips`] for the other, sharper half, where an older Vault rejects the request
+/// outright.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum IpsResponse {
     Envelope(IpRecordsEnvelope),
+    Cursor(IpRecordsCursorEnvelope),
     Legacy(Vec<VaultApiRecord>),
 }
 
@@ -194,27 +209,28 @@ impl VaultClient {
     /// Note `limit=0` is **not** "unlimited" — it is `LIMIT 0`, which returns nothing (verified
     /// against the live daemon). Nothing here should ever send it.
     ///
-    /// # Consistency caveat
+    /// # Keyset cursor & minimal projection (`simply_ip_vault` `eda0f41`+)
     ///
-    /// Vault orders this listing by `last_seen_at DESC` with no tiebreaker, so an offset walk is
-    /// not a stable snapshot: a record re-registered mid-walk sorts to the front and can shift rows
-    /// across a page boundary, which may duplicate or skip one. Duplicates are harmless (the cache
-    /// is keyed by address), and a skipped record is picked up by the next sync cycle. Vault
-    /// exposes no cursor that would avoid this; a larger [`PAGE_SIZE`] reduces the number of
-    /// boundaries where it can happen at all, and most deployments fit in a single page.
+    /// Current Vault orders listings deterministically by `(last_seen_at DESC, id ASC)`, emits an
+    /// opaque `next_cursor` token on `include_total=true` / `cursor=…` responses, and supports
+    /// `format=minimal` (returning only `target_address`, `last_seen_at`, `is_deleted` and skipping
+    /// the per-page `ip_groups` and `ip_record_causes` queries). When the initial probe returns a
+    /// `next_cursor`, follow-up pages walk `cursor=<next_cursor>&format=minimal` (`O(limit)` seek
+    /// into Vault's `idx_memberships_active_last_seen` covering index at arbitrary depth, with no
+    /// `COUNT(*)` and no `OFFSET` scan). Older Vaults that omit `next_cursor` fall back to the
+    /// bounded-parallel `offset` walk or sequential paging automatically.
     ///
     /// # One group at a time
     ///
     /// A multi-group scope (`"g1,g2,g3"`) is fetched as one independent walk **per group**, then
-    /// concatenated. Vault serves a multi-group page from its indexed per-group merge only while
-    /// `offset + limit <= 2000` (`MERGE_MAX_FETCH` in
-    /// `example/simply_ip_vault/src/api/records.rs`); past that it falls back to a single
-    /// `GroupId IN (...) ORDER BY last_seen_at` query that sorts every matching row — measured by
-    /// Vault itself at 56–91s on a large dataset. Every page from the third onwards therefore timed
-    /// out (the reported `offset=2000` failure). A single-group query never takes that path: it is
-    /// served straight from the `(group_id, last_seen_at DESC)` partial index at any offset.
-    /// Splitting changes nothing downstream — the cache is keyed by address, and the same address
-    /// in two groups already arrived twice from the combined query (one item per membership).
+    /// concatenated. Even with cursor pagination, querying one group at a time keeps Vault on its
+    /// direct `WHERE group_id = ?` covering-index seek (`fetch_merged_page` across $k$ groups must
+    /// read $k \times \text{limit}$ rows per page and discard $(k-1) \times \text{limit}$ of them
+    /// after merging, and past 16 groups falls back to `GroupId IN (...)` with a temp B-tree sort);
+    /// against a pre-`eda0f41` Vault it also avoids the `offset + limit > 2000` (`MERGE_MAX_FETCH`)
+    /// full-sort cliff. Splitting changes nothing downstream — the cache is keyed by address, and
+    /// the same address in two groups already arrived twice from the combined query (one item per
+    /// membership).
     pub async fn fetch_ips(
         &self,
         groups: &str,
@@ -252,18 +268,39 @@ impl VaultClient {
             ));
         }
 
-        // Page one doubles as a capability probe: `include_total=true` asks Vault to report how
-        // many pages exist, and how it answers decides which strategy the rest of this fetch uses.
+        // Page one doubles as a capability probe: `include_total=true&format=minimal` asks a
+        // current (`eda0f41`+) Vault for lightweight rows and a keyset `next_cursor`, while still
+        // being accepted by pre-`eda0f41` Vaults (which ignore `format=minimal` and return
+        // `total_pages` without `next_cursor`).
         let first = self
             .signed_get::<IpsResponse>(&format!(
-                "{base}&include_total=true&limit={}&offset=0",
+                "{base}&include_total=true&format=minimal&limit={}&offset=0",
                 self.page_size
             ))
             .await;
 
         match first {
             Ok(IpsResponse::Envelope(envelope)) => {
-                self.fetch_remaining_pages_in_parallel(&base, envelope, groups).await
+                if let Some(cursor) = envelope.next_cursor.clone().filter(|c| !c.is_empty()) {
+                    self.fetch_remaining_pages_by_cursor(
+                        &base,
+                        envelope.data,
+                        cursor,
+                        Some(envelope.total_pages),
+                        groups,
+                    )
+                    .await
+                } else {
+                    self.fetch_remaining_pages_in_parallel(&base, envelope, groups).await
+                }
+            }
+            Ok(IpsResponse::Cursor(envelope)) => {
+                if let Some(cursor) = envelope.next_cursor.filter(|c| !c.is_empty()) {
+                    self.fetch_remaining_pages_by_cursor(&base, envelope.data, cursor, None, groups)
+                        .await
+                } else {
+                    Ok(envelope.data)
+                }
             }
             // Vault answered, but with the historical root array — it does not implement
             // `include_total` yet simply ignored the parameter. Page one is still perfectly good
@@ -286,6 +323,58 @@ impl VaultClient {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Walks pages `2..` via Vault's keyset cursor (`cursor=<next_cursor>&format=minimal`), merging
+    /// onto the already-fetched first page until `next_cursor` is `None`.
+    ///
+    /// Unlike [`Self::fetch_remaining_pages_in_parallel`], follow-up cursor pages omit
+    /// `include_total` (no per-page `COUNT(*)`) and `offset` (mutually exclusive with `cursor` on
+    /// Vault, and replaced by an `O(limit)` covering-index seek into
+    /// `idx_memberships_active_last_seen`). `format=minimal` skips Vault's per-page `ip_groups` and
+    /// `ip_record_causes` queries and projects only `(target_address, last_seen_at, is_deleted)`.
+    async fn fetch_remaining_pages_by_cursor(
+        &self,
+        base: &str,
+        mut all: Vec<VaultApiRecord>,
+        first_cursor: String,
+        total_pages: Option<u64>,
+        groups: &str,
+    ) -> Result<Vec<VaultApiRecord>, VaultError> {
+        if let Some(total_pages) = total_pages {
+            tracing::debug!(
+                "Fetching {total_pages} pages by keyset cursor from simply_ip_vault for groups \
+                 {groups:?}"
+            );
+        }
+
+        let mut seen_cursors = std::collections::HashSet::new();
+        let mut next = Some(first_cursor);
+
+        while let Some(cursor) = next {
+            if !seen_cursors.insert(cursor.clone()) {
+                tracing::error!(
+                    "simply_ip_vault repeated cursor {cursor:?} for groups {groups:?}; \
+                     it is not advancing. Aborting this sync."
+                );
+                return Err(VaultError::PaginationStalled(groups.to_owned()));
+            }
+
+            let page: IpRecordsCursorEnvelope = self
+                .signed_get(&format!(
+                    "{base}&format=minimal&limit={}&cursor={}",
+                    self.page_size,
+                    urlencode(&cursor)
+                ))
+                .await?;
+            if page.data.is_empty() {
+                break;
+            }
+            all.extend(page.data);
+            next = page.next_cursor.filter(|c| !c.is_empty());
+        }
+
+        Ok(all)
     }
 
     /// Fetches pages `2..=total_pages` concurrently, capped at [`MAX_CONCURRENT_PAGES`] in flight,
@@ -629,7 +718,11 @@ mod tests {
     /// this client has to survive.
     #[derive(Clone, Copy, PartialEq)]
     enum VaultFlavour {
-        /// Current Vault: honours `include_total=true` with the `{data, …, total_pages}` envelope.
+        /// Current (`eda0f41`+) Vault: emits `next_cursor` on `include_total=true` and `cursor=…`,
+        /// using `limit + 1` lookahead so the final page sets `next_cursor: null` immediately.
+        Cursor,
+        /// Pre-`eda0f41` (`b8bd281..be355b2`) Vault: honours `include_total=true` with the
+        /// `{data, …, total_pages}` envelope and no `next_cursor`.
         Envelope,
         /// A Vault that accepts the parameter but still answers with the historical root array.
         IgnoresIncludeTotal,
@@ -639,8 +732,8 @@ mod tests {
     }
 
     /// Boots a mock Vault that paginates exactly as the real one does — honouring `limit`/`offset`,
-    /// defaulting to `limit=50`, and (per `flavour`) implementing `include_total` the way a current,
-    /// an indifferent, or an outdated deployment would.
+    /// defaulting to `limit=50`, and (per `flavour`) implementing `cursor`/`include_total` the way a
+    /// current, a pre-`eda0f41`, an indifferent, or an outdated deployment would.
     ///
     /// Records are `51.<i/256>.<i%256>.1`: lone hosts in distinct /24s, so a count is a count.
     /// Every request's query string is recorded, letting a test assert *how* the fetch was
@@ -673,6 +766,12 @@ mod tests {
                             .find_map(|kv| kv.strip_prefix(&format!("{name}=")))
                             .and_then(|v| v.parse().ok())
                     };
+                    let str_param = |name: &str| -> Option<String> {
+                        query
+                            .split('&')
+                            .find_map(|kv| kv.strip_prefix(&format!("{name}=")))
+                            .map(str::to_owned)
+                    };
 
                     let wants_total = has("include_total");
                     if wants_total && flavour == VaultFlavour::RejectsIncludeTotal {
@@ -686,8 +785,16 @@ mod tests {
                     }
 
                     let limit = param("limit").unwrap_or(50) as usize;
-                    let offset = param("offset").unwrap_or(0) as usize;
-                    let page: Vec<serde_json::Value> = (offset..total.min(offset + limit))
+                    let cursor_token = str_param("cursor");
+                    let start = match (&cursor_token, flavour) {
+                        (Some(tok), VaultFlavour::Cursor) if !tok.is_empty() => {
+                            tok.strip_prefix("cur-").and_then(|v| v.parse().ok()).unwrap_or(0)
+                        }
+                        (Some(_), VaultFlavour::Cursor) => 0,
+                        _ => param("offset").unwrap_or(0) as usize,
+                    };
+                    let end = total.min(start + limit);
+                    let page: Vec<serde_json::Value> = (start..end)
                         .map(|i| {
                             serde_json::json!({
                                 "target_address": format!("51.{}.{}.1", i / 256, i % 256),
@@ -696,18 +803,33 @@ mod tests {
                             })
                         })
                         .collect();
+                    let next_cursor = (flavour == VaultFlavour::Cursor && limit > 0 && end < total)
+                        .then(|| format!("cur-{end}"));
 
-                    if wants_total && flavour == VaultFlavour::Envelope {
+                    if cursor_token.is_some() && !wants_total && flavour == VaultFlavour::Cursor {
+                        return axum::Json(serde_json::json!({
+                            "data": page,
+                            "next_cursor": next_cursor,
+                        }))
+                        .into_response();
+                    }
+
+                    if wants_total
+                        && matches!(flavour, VaultFlavour::Cursor | VaultFlavour::Envelope)
+                    {
                         let total_pages =
                             if limit == 0 { 0 } else { total.div_ceil(limit) } as u64;
-                        return axum::Json(serde_json::json!({
+                        let mut env = serde_json::json!({
                             "data": page,
                             "total": total,
                             "limit": limit,
-                            "offset": offset,
+                            "offset": start,
                             "total_pages": total_pages,
-                        }))
-                        .into_response();
+                        });
+                        if flavour == VaultFlavour::Cursor {
+                            env["next_cursor"] = serde_json::json!(next_cursor);
+                        }
+                        return axum::Json(env).into_response();
                     }
 
                     axum::Json(serde_json::Value::Array(page)).into_response()
@@ -1075,6 +1197,116 @@ mod tests {
 
         assert!(matches!(err, VaultError::PaginationStalled(_)), "got {err:?}");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2, "detected on the first repeat");
+    }
+
+    // ── Keyset cursor & format=minimal (`simply_ip_vault` `eda0f41`+) ─────────
+
+    /// Current Vault (`eda0f41`+) returns `next_cursor` on the probe and walks pages 2..N via
+    /// `cursor=<next_cursor>&format=minimal`, omitting `include_total` and `offset` on every
+    /// follow-up page so Vault never runs a second `COUNT(*)` or an `OFFSET` scan.
+    #[tokio::test]
+    async fn a_cursor_vault_walks_pages_via_next_cursor_with_minimal_format() {
+        let (url, seen, _server) =
+            spawn_flavoured_mock_vault(3_214, VaultFlavour::Cursor).await;
+        let client = client_at(url).with_page_size(1_000);
+
+        let records = client.fetch_ips("g1", None).await.expect("cursor fetch succeeds");
+
+        assert_eq!(records.len(), 3_214);
+        let distinct: std::collections::HashSet<_> =
+            records.iter().map(|r| r.target_address.clone()).collect();
+        assert_eq!(distinct.len(), 3_214, "no duplicates or boundary losses across cursor pages");
+
+        let queries = seen.lock().expect("not poisoned").clone();
+        assert_eq!(queries.len(), 4, "one probe plus three cursor pages");
+        assert!(queries[0].contains("include_total=true"));
+        assert!(queries[0].contains("format=minimal"));
+        assert!(queries[0].contains("offset=0"));
+
+        for (idx, expected_cursor) in [(1, "cur-1000"), (2, "cur-2000"), (3, "cur-3000")] {
+            let q = &queries[idx];
+            assert!(q.contains(&format!("cursor={expected_cursor}")), "page {}: {q}", idx + 1);
+            assert!(q.contains("format=minimal"), "every cursor page asks for minimal rows: {q}");
+            assert!(!q.contains("include_total"), "follow-up cursor pages skip COUNT(*): {q}");
+            assert!(!q.contains("offset="), "cursor and offset are mutually exclusive: {q}");
+        }
+    }
+
+    /// Vault's `limit + 1` lookahead sets `next_cursor: null` immediately on an exact-multiple
+    /// final page, so 2,000 records at `limit=1000` cost 2 requests, not 3.
+    #[tokio::test]
+    async fn a_cursor_walk_whose_total_is_an_exact_multiple_stops_without_an_extra_request() {
+        let (url, seen, _server) =
+            spawn_flavoured_mock_vault(2_000, VaultFlavour::Cursor).await;
+        let client = client_at(url).with_page_size(1_000);
+
+        let records = client.fetch_ips("g1", None).await.expect("cursor fetch succeeds");
+
+        assert_eq!(records.len(), 2_000);
+        assert_eq!(seen.lock().expect("not poisoned").len(), 2, "no empty trailing page needed");
+    }
+
+    /// Differential sync filters (`since` + `include_deleted=true`) and `format=minimal` must
+    /// ride along onto every cursor follow-up page across every group in a multi-group scope.
+    #[tokio::test]
+    async fn cursor_pages_each_carry_since_include_deleted_format_minimal_and_group() {
+        let (url, seen, _server) =
+            spawn_flavoured_mock_vault(2_500, VaultFlavour::Cursor).await;
+        let client = client_at(url).with_page_size(1_000);
+        let since = chrono::DateTime::from_timestamp(1_700_000_000, 0)
+            .expect("a valid timestamp")
+            .naive_utc();
+
+        let records = client.fetch_ips("g1,g2", Some(since)).await.expect("cursor fetch succeeds");
+        assert_eq!(records.len(), 5_000);
+
+        let queries = seen.lock().expect("not poisoned").clone();
+        assert_eq!(queries.len(), 6, "two groups × (one probe + two cursor follow-ups)");
+        for query in &queries {
+            assert!(query.contains("since=1700000000"), "every page keeps the cutoff: {query}");
+            assert!(query.contains("include_deleted=true"), "every page keeps the flag: {query}");
+            assert!(query.contains("format=minimal"), "every page asks for minimal rows: {query}");
+            assert!(
+                query.contains("groups=g1&") || query.contains("groups=g2&"),
+                "every page is scoped to a single group: {query}"
+            );
+        }
+    }
+
+    /// A misbehaving Vault that repeats a `next_cursor` token must fail with
+    /// [`VaultError::PaginationStalled`] rather than looping forever.
+    #[tokio::test]
+    async fn a_vault_that_repeats_a_cursor_fails_instead_of_looping() {
+        use axum::{Router, routing::get};
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_h = std::sync::Arc::clone(&calls);
+        let app = Router::new().route(
+            "/api/ips",
+            get(move || {
+                calls_h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async {
+                    axum::Json(serde_json::json!({
+                        "data": [
+                            {"target_address": "51.0.0.1", "last_seen_at": "2026-08-11T10:00:00"},
+                        ],
+                        "next_cursor": "stuck-cursor",
+                    }))
+                }
+            }),
+        );
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback bind always succeeds");
+        let addr = listener.local_addr().expect("a bound listener has a local address");
+        let _server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = client_at(format!("http://{addr}")).with_page_size(1);
+        let err = client.fetch_ips("g1", None).await.expect_err("a repeated cursor must fail");
+
+        assert!(matches!(err, VaultError::PaginationStalled(_)), "got {err:?}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2, "detected on first repeat");
     }
 
     // ── Legacy tolerance: two distinct shapes of "older Vault" ────────────────
