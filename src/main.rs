@@ -204,6 +204,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     db::run_migrations(&db).await?;
+    if let Err(e) = db::run_sqlite_optimize(&db).await {
+        tracing::warn!("Could not run SQLite optimization: {e}");
+    }
 
     let cipher = crypto::SecretCipher::from_env()?;
     if cipher.is_encrypting() {

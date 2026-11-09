@@ -35,7 +35,11 @@ pub async fn connect(db_url: &str) -> Result<DatabaseConnection, DbErr> {
         .foreign_keys(true)
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
-        .busy_timeout(std::time::Duration::from_millis(u64::from(SQLITE_BUSY_TIMEOUT_MS)));
+        .busy_timeout(std::time::Duration::from_millis(u64::from(SQLITE_BUSY_TIMEOUT_MS)))
+        .pragma("temp_store", "MEMORY")
+        .pragma("mmap_size", "268435456")
+        .pragma("cache_size", "-64000")
+        .pragma("analysis_limit", "1000");
 
     let pool = SqlitePoolOptions::new()
         .max_connections(SQLITE_MAX_CONNECTIONS)
@@ -146,12 +150,37 @@ pub async fn apply_sqlite_pragmas(db: &DatabaseConnection) -> Result<(), DbErr> 
         ("foreign key enforcement", "PRAGMA foreign_keys=ON;".to_owned()),
         ("synchronous mode", "PRAGMA synchronous=NORMAL;".to_owned()),
         ("busy timeout", format!("PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS};")),
+        ("temp store", "PRAGMA temp_store=MEMORY;".to_owned()),
+        ("mmap size", "PRAGMA mmap_size=268435456;".to_owned()),
+        ("cache size", "PRAGMA cache_size=-64000;".to_owned()),
+        ("analysis limit", "PRAGMA analysis_limit=1000;".to_owned()),
     ] {
         if let Err(e) =
             db.execute_raw(Statement::from_string(DatabaseBackend::Sqlite, statement)).await
         {
             tracing::warn!("Could not set the SQLite {label}: {e}. Continuing with the default.");
         }
+    }
+
+    Ok(())
+}
+
+/// Runs SQLite query planner statistics optimization (`PRAGMA optimize;`) to ensure the query
+/// planner has optimal index selection statistics for query execution.
+pub async fn run_sqlite_optimize(db: &DatabaseConnection) -> Result<(), DbErr> {
+    if db.get_database_backend() != DatabaseBackend::Sqlite {
+        return Ok(());
+    }
+
+    tracing::info!("Running SQLite query planner optimization (PRAGMA optimize)...");
+    if let Err(e) = db
+        .execute_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "PRAGMA optimize;".to_owned(),
+        ))
+        .await
+    {
+        tracing::warn!("Could not run PRAGMA optimize: {e}");
     }
 
     Ok(())
@@ -194,6 +223,9 @@ mod tests {
         }
         assert_eq!(pragma::<String>(&db, "PRAGMA journal_mode;", "journal_mode").await, "wal");
         assert_eq!(pragma::<i32>(&db, "PRAGMA foreign_keys;", "foreign_keys").await, 1);
+        assert_eq!(pragma::<i32>(&db, "PRAGMA temp_store;", "temp_store").await, 2);
+        assert_eq!(pragma::<i32>(&db, "PRAGMA cache_size;", "cache_size").await, -64000);
+        assert_eq!(pragma::<i32>(&db, "PRAGMA analysis_limit;", "analysis_limit").await, 1000);
     }
 
     #[tokio::test]
