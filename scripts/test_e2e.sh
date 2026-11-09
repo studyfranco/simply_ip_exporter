@@ -44,7 +44,7 @@
 #  15. Cleanup: terminate both processes and remove every temporary file.
 #
 # Usage: ./scripts/test_e2e.sh
-# Requires: curl, jq, cargo, openssl. Needs example/simply_ip_vault present (a reference checkout;
+# Requires: curl, jq, cargo, openssl, cargo-audit. Needs example/simply_ip_vault present (a reference checkout;
 # see AGENT.MD) and two free ports (defaults below; override with VAULT_PORT/EXPORTER_PORT).
 # Exit code: 0 if every check passed, 1 otherwise.
 
@@ -57,6 +57,8 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 VAULT_DIR="$PROJECT_ROOT/example/simply_ip_vault"
+# Ensure local cargo-installed binaries (e.g. cargo-audit in ~/.cargo/bin) are on PATH
+export PATH="$HOME/.cargo/bin:$PATH"
 
 VAULT_PORT="${VAULT_PORT:-13000}"
 EXPORTER_PORT="${EXPORTER_PORT:-13002}"
@@ -341,6 +343,15 @@ for bin in curl jq cargo openssl; do
     log "Found $bin: $(command -v "$bin")"
 done
 
+if ! command -v cargo-audit >/dev/null 2>&1 && ! cargo audit --version >/dev/null 2>&1; then
+    log "cargo-audit not found on PATH; attempting to install via 'cargo install cargo-audit'..."
+    if ! cargo install cargo-audit; then
+        err "cargo-audit is required for dependency security audits but is missing and could not be installed."
+        exit 1
+    fi
+fi
+log "Found cargo-audit: $(command -v cargo-audit 2>/dev/null || echo "cargo audit subcommand")"
+
 if [ ! -d "$VAULT_DIR" ]; then
     err "$VAULT_DIR not found. This suite needs the reference simply_ip_vault checkout under example/ (see AGENT.MD)."
     exit 1
@@ -352,6 +363,29 @@ for port in "$VAULT_PORT" "$EXPORTER_PORT"; do
         exit 1
     fi
 done
+
+# ── Dependencies & Security Audit ────────────────────────────────────────────
+
+log_section "Dependencies & Security Audit"
+
+log "Running cargo update in $PROJECT_ROOT ..."
+if ! (cd "$PROJECT_ROOT" && cargo update >"$WORK_DIR/exporter_update.log" 2>&1); then
+    err "cargo update failed:"
+    cat "$WORK_DIR/exporter_update.log" >&2
+    exit 1
+fi
+log "cargo update succeeded."
+
+log "Running cargo audit in $PROJECT_ROOT ..."
+# RUSTSEC-2026-0459: upstream unpatched SQLite CVE in libsqlite3-sys 0.37.0 transitively pinned by
+# sqlx-sqlite 0.9.0 (which restricts libsqlite3-sys <0.38.0). Ignored until sqlx publishes a patch release.
+AUDIT_ARGS=(${CARGO_AUDIT_ARGS:---ignore RUSTSEC-2026-0459})
+if ! (cd "$PROJECT_ROOT" && cargo audit "${AUDIT_ARGS[@]}" >"$WORK_DIR/exporter_audit.log" 2>&1); then
+    err "cargo audit detected vulnerabilities or failed:"
+    cat "$WORK_DIR/exporter_audit.log" >&2
+    exit 1
+fi
+log "cargo audit passed cleanly."
 
 # ── Build ────────────────────────────────────────────────────────────────────
 
