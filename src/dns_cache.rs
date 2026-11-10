@@ -167,10 +167,7 @@ pub(crate) async fn lookup_hostname(hostname: &str) -> Vec<IpNet> {
 
 /// Normalizes an IPv4-mapped IPv6 address (`::ffff:192.168.1.1`) down to its plain IPv4 form.
 pub fn normalize_ip(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
-        v4 => v4,
-    }
+    ip.to_canonical()
 }
 
 /// Why an entry is not a valid spelling of anything, and why.
