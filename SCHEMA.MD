@@ -189,15 +189,21 @@ exist" and deleting every grant.
 
 ## ⚡ Database Indexing Summary
 
-1. `api_keys.prefix`: Fast lookup during `X-API-Key` middleware matching.
-2. `api_keys.key_hash`: Fast exact matching for authentication hashes.
-3. `api_keys.master_marker`: Unique marker index enforcing single Master invariant.
-4. `endpoints.token_secret`: Unique index for public URL feed resolution.
-5. `endpoints.owner_key_id`: Fast filtering of endpoints by key owner.
-6. `audit_logs.action`: Fast filtering by operation type on `GET /api/audit-logs?action=...`.
-7. `audit_logs.timestamp`: Fast ordering/pagination of the audit trail (most recent first).
-8. `audit_logs.api_key_id`: Fast lookup of a given key's audit history.
-9. `vault_group_permissions.(api_key_id, vault_group_id)`: Unique index — one grant per (key, group) pair, and the lookup `validate_group_access` and the cleanup worker both use.
+1. `api_keys.prefix`: Fast lookup during `X-API-Key` middleware matching (`idx_api_keys_prefix`).
+2. `api_keys.key_hash`: Fast exact matching for authentication hashes (`idx_api_keys_key_hash`).
+3. `api_keys.master_marker`: Unique marker index enforcing single Master invariant (`idx_api_keys_master_marker`).
+4. `api_keys.is_master`: Fast lookup of Master key at boot and during auth (`idx_api_keys_is_master`).
+5. `api_keys.created_at`: Newest-first ordering for key listings (`idx_api_keys_created_at_desc`).
+6. `endpoints.token_secret`: Unique index for public URL feed resolution (`idx_endpoints_token_secret`).
+7. `endpoints.owner_key_id`: Fast filtering of endpoints by key owner (`idx_endpoints_owner_key_id`).
+8. `endpoints.(owner_key_id, created_at DESC)`: Fast newest-first endpoint listing by owner (`idx_endpoints_owner_created`).
+9. `endpoints.created_at`: Newest-first ordering for global endpoint listings (`idx_endpoints_created_at_desc`).
+10. `audit_logs.action`: Fast filtering by operation type on `GET /api/audit-logs?action=...` (`idx_audit_logs_action`).
+11. `audit_logs.timestamp`: Fast ordering/pagination of the audit trail (`idx_audit_logs_timestamp`, `idx_audit_logs_timestamp_desc`).
+12. `audit_logs.api_key_id`: Fast lookup of a given key's audit history (`idx_audit_logs_api_key_id`, `idx_audit_logs_api_key_id_timestamp`).
+13. `audit_logs.(action, timestamp DESC)`: Compound index for filtered audit searches (`idx_audit_logs_action_timestamp_desc`).
+14. `vault_group_permissions.(api_key_id, vault_group_id)`: Unique index — one grant per (key, group) pair (`idx_vault_group_permissions_key_group`).
+15. `vault_group_permissions.vault_group_id`: Fast filtering and cleanup by Vault group ID (`idx_vault_group_permissions_vault_group_id`).
 
 ---
 

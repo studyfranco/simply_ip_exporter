@@ -5,7 +5,7 @@
 use axum::{Extension, Json, extract::State, response::IntoResponse};
 use chrono::Utc;
 use rand::RngExt;
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
+use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -200,10 +200,14 @@ pub async fn list_endpoints(
     Extension(caller): Extension<api_key::Model>,
 ) -> Result<impl IntoResponse, AppError> {
     let rows = if caller.is_master {
-        Endpoint::find().all(&state.db).await?
+        Endpoint::find()
+            .order_by_desc(endpoint::Column::CreatedAt)
+            .all(&state.db)
+            .await?
     } else {
         Endpoint::find()
             .filter(endpoint::Column::OwnerKeyId.eq(caller.id))
+            .order_by_desc(endpoint::Column::CreatedAt)
             .all(&state.db)
             .await?
     };

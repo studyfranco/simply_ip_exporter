@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+jobs:
+  test:
+    name: Test & Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@main
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: which cargo-audit || cargo install cargo-audit
+
+      - name: Cargo update check
+        run: cargo update
+
+      - name: Cargo audit
+        run: cargo audit --ignore RUSTSEC-2026-0459
+
+      - name: Run tests
+        run: cargo test --workspace --verbose

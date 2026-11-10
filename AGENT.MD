@@ -363,3 +363,12 @@ schema was designed to avoid ever needing one. This is deliberate and must not r
 3. **ETag & 304 Responses:** Assert `If-None-Match` returns `304 Not Modified` when content is unchanged.
 4. **Public Anti-DoS:** Verify source IPs querying within the 2-minute window are throttled with `429 Too Many Requests` while LRU tracking memory stays capped.
 5. **HMAC Canonical Signing:** Test inbound and outbound signed requests against invalid signatures, tampered query parameters, and replay attempts.
+
+---
+
+## 📦 Dependency Management & Security Audits
+
+All external libraries and Cargo dependencies must always be kept at their latest compatible versions:
+- **Up-to-date dependencies**: All Cargo dependencies must be actively maintained and kept at their latest compatible semver release via `cargo update`.
+- **Security audits**: Zero unaddressed vulnerabilities. `cargo audit` must be run continuously to identify security advisories. (Known upstream CVEs with pending patches, e.g. `--ignore RUSTSEC-2026-0459`, must be explicitly documented and scoped).
+- **Mandatory test and CI enforcement**: Both `scripts/test_e2e.sh` and GitHub CI workflows (`.github/workflows/ci.yml`, `.github/workflows/docker-publish.yml`) must enforce `cargo update` and `cargo audit` checks before executing test suites and before container builds.

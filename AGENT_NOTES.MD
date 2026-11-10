@@ -2625,3 +2625,24 @@ Following `simply_ip_vault` commit `eda0f41`, `VaultClient::fetch_ips_for_scope`
   exact-multiple lookahead termination, delta-sync filter propagation, and repeated-cursor stall
   detection) and extended `scripts/test_e2e.sh` §2 to assert `next_cursor` and `format=minimal`
   against live Vault.
+
+## Session (2026-11-10): DB Query Optimization, CI & E2E Validation, AGENT.MD Directives
+
+### Changes
+- **DB Query Optimization (`src/migration/m20261110_220000_add_lookup_indexes.rs`)**:
+  - Added indexes:
+    - `idx_vault_group_permissions_vault_group_id` on `vault_group_permissions(vault_group_id)` to eliminate sequential scans when querying or filtering by Vault group ID (`group_id`).
+    - `idx_api_keys_is_master` on `api_keys(is_master)` for fast lookup of Master key at boot and during authentication.
+    - `idx_endpoints_created_at_desc` on `endpoints(created_at DESC)` for efficient newest-first sorting on global endpoint listings.
+    - `idx_api_keys_created_at_desc` on `api_keys(created_at DESC)` for newest-first ordering on key listings.
+  - Updated `list_endpoints` in `src/api/endpoints.rs` and `list_api_keys` in `src/api/keys.rs` to order by `created_at DESC`, utilizing the compound and single-column indexes.
+  - Registered migration in `src/migration/mod.rs` and updated `SCHEMA.MD` index summary.
+- **GitHub CI/CD Workflows (`.github/workflows/`)**:
+  - Added `test` job in `.github/workflows/docker-publish.yml` and made `build` job depend on it (`needs: test`).
+  - Added `.github/workflows/ci.yml` running on `push` and `pull_request` to `master`, enforcing `cargo update`, `cargo audit`, and `cargo test --workspace --verbose`.
+- **E2E Testing (`scripts/test_e2e.sh`)**:
+  - Verified `scripts/test_e2e.sh` includes `cargo update` and `cargo audit --ignore RUSTSEC-2026-0459` with error logging.
+  - Ran `scripts/test_e2e.sh`: 235/235 checks passed (100%).
+- **AGENT.MD**:
+  - Added explicit section `📦 Dependency Management & Security Audits` requiring dependencies to be kept at latest compatible semver, `cargo audit` to be run, and enforcement in `scripts/test_e2e.sh` and CI.
+

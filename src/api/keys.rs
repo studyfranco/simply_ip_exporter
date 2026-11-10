@@ -3,7 +3,10 @@
 
 use axum::{Extension, Json, extract::State, response::IntoResponse};
 use chrono::Utc;
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, TransactionTrait};
+use sea_orm::{
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QueryOrder,
+    TransactionTrait,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
@@ -141,7 +144,10 @@ pub async fn list_api_keys(
     Extension(caller): Extension<api_key::Model>,
 ) -> Result<impl IntoResponse, AppError> {
     require_master(&caller)?;
-    let keys = ApiKey::find().all(&state.db).await?;
+    let keys = ApiKey::find()
+        .order_by_desc(api_key::Column::CreatedAt)
+        .all(&state.db)
+        .await?;
     Ok(Json(keys.into_iter().map(KeyResponse::from).collect::<Vec<_>>()))
 }
 
