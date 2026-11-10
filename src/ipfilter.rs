@@ -245,4 +245,36 @@ mod tests {
         let out = filter_and_aggregate(&networks, false, true, false);
         assert!(out.is_empty(), "any overlap with a bogon range drops the whole candidate");
     }
+
+    #[test]
+    fn aggregates_contiguous_sibling_subnets_into_supernet() {
+        // Two contiguous /25 networks aggregate into one /24
+        let networks = vec![net("198.51.100.0/25"), net("198.51.100.128/25")];
+        let out = filter_and_aggregate(&networks, false, false, false);
+        assert_eq!(out, vec![net("198.51.100.0/24")]);
+
+        // Two contiguous IPv6 /65 networks aggregate into one /64
+        let v6_networks = vec![net("2001:db8::/65"), net("2001:db8:0:0:8000::/65")];
+        let out_v6 = filter_and_aggregate(&v6_networks, false, false, false);
+        assert_eq!(out_v6, vec![net("2001:db8::/64")]);
+    }
+
+    #[test]
+    fn filter_and_aggregate_handles_empty_input() {
+        let empty: Vec<IpNet> = Vec::new();
+        let out = filter_and_aggregate(&empty, true, true, true);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn filter_and_aggregate_with_all_filters_drops_bogons_rfc1918_and_loopback() {
+        let networks = vec![
+            net("10.0.0.1/32"),   // RFC1918
+            net("127.0.0.1/32"),  // Loopback
+            net("169.254.1.1/32"), // Bogon
+            net("8.8.8.8/32"),    // Public
+        ];
+        let out = filter_and_aggregate(&networks, true, true, true);
+        assert_eq!(out, vec![net("8.8.8.8/32")]);
+    }
 }
