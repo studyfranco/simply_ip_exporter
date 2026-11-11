@@ -210,26 +210,25 @@
       </div>
       <p class="subtitle">Issue a new Daughter API key with specific network bindings and scopes.</p>
       <form id="key-form" class="admin-form">
-        <div class="form-grid">
+        <div class="form-grid mt-2">
           <div class="form-group">
-            <label for="key-name">Name <span class="required-marker">*</span></label>
-            <input type="text" id="key-name" class="input-field" required />
+            <label for="key-name">Key Name</label>
+            <input type="text" id="key-name" class="input-field" placeholder="e.g. Ingestion Worker" required />
           </div>
           <div class="form-group">
-            <label for="key-bound-ips">Bound IPs (comma-separated CIDR, IP, or hostname, optional)</label>
-            <input type="text" id="key-bound-ips" class="input-field" placeholder="203.0.113.0/24, vpn.internal" />
+            <label for="key-bound-ips">Bound IPs (CIDR, comma-separated)</label>
+            <input type="text" id="key-bound-ips" class="input-field font-mono" placeholder="0.0.0.0/0,::/0" />
           </div>
         </div>
         <div class="permissions-grid mt-2 mb-4">
           <label class="checkbox-container">
             <input type="checkbox" id="key-can-manage-keys">
-            <span class="checkmark"></span>
-            Can manage keys
+            <span>can_manage_keys</span>
           </label>
         </div>
         <div class="form-actions mt-4">
           <button type="submit" class="btn btn-primary">Create Key</button>
-          <button type="button" id="btn-cancel-create-key" class="btn btn-cancel">Cancel</button>
+          <button type="button" id="btn-cancel-create-key" class="btn btn-secondary">Cancel</button>
         </div>
         <div id="key-error" class="message error hidden"></div>
       </form>
