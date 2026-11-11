@@ -119,6 +119,11 @@ body {
        literal would silently stop matching the moment the viewport crossed a breakpoint. */
     margin: calc(-1 * var(--container-padding-y)) calc(-1 * var(--container-padding-x)) 0;
     padding: var(--container-padding-y) var(--container-padding-x) 0;
+    transition: transform var(--transition-base), box-shadow var(--transition-base);
+}
+
+.top-bar.stuck {
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
 }
 
 .tab-nav {

@@ -113,43 +113,6 @@
           <button type="button" id="btn-open-create-key" class="btn btn-primary">+ New Key</button>
         </div>
 
-        <form id="key-form" class="admin-form hidden">
-          <div class="form-grid">
-            <div class="form-group">
-              <label for="key-name">Name <span class="required-marker">*</span></label>
-              <input type="text" id="key-name" class="input-field" required />
-            </div>
-            <div class="form-group">
-              <label for="key-bound-ips">Bound IPs (comma-separated CIDR, IP, or hostname, optional)</label>
-              <input type="text" id="key-bound-ips" class="input-field" placeholder="203.0.113.0/24, vpn.internal" />
-            </div>
-          </div>
-          <div class="permissions-grid mt-2 mb-4">
-            <label class="checkbox-container">
-              <input type="checkbox" id="key-can-manage-keys">
-              <span class="checkmark"></span>
-              Can manage keys
-            </label>
-          </div>
-          <div class="form-actions">
-            <button type="submit" class="btn btn-primary">Create key</button>
-            <button type="button" id="btn-cancel-create-key" class="btn btn-cancel">Cancel</button>
-          </div>
-          <div id="key-error" class="message error hidden"></div>
-        </form>
-
-        <div id="minted-key-box" class="key-reveal hidden">
-          <div id="minted-api-key-row">
-            <p class="key-reveal-label">API Key (copy now):</p>
-            <code id="minted-api-key" class="key-reveal-value"></code>
-          </div>
-          <p class="key-reveal-label">Signing Secret (copy now — required to sign requests):</p>
-          <code id="minted-signing-secret" class="key-reveal-value"></code>
-          <div class="row mt-2">
-            <button id="minted-key-dismiss" type="button" class="btn btn-secondary btn-sm">I've saved these</button>
-          </div>
-        </div>
-
         <div class="batch-actions batch-actions-keys hidden">
           <button type="button" id="delete-selected-keys" class="btn-batch-delete" disabled>Delete Selected</button>
         </div>
@@ -236,6 +199,66 @@
         <div id="audit-error" class="message error hidden"></div>
       </section>
     </main>
+  </div>
+
+  <!-- Create API Key Modal -->
+  <div id="create-key-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="create-key-modal-title">
+    <div class="modal-card modal-card-form card">
+      <div class="modal-header">
+        <h3 id="create-key-modal-title">Create API Key</h3>
+        <button type="button" id="create-key-close-x" class="btn-modal-close" aria-label="Close">&times;</button>
+      </div>
+      <p class="subtitle">Issue a new Daughter API key with specific network bindings and scopes.</p>
+      <form id="key-form" class="admin-form">
+        <div class="form-grid">
+          <div class="form-group">
+            <label for="key-name">Name <span class="required-marker">*</span></label>
+            <input type="text" id="key-name" class="input-field" required />
+          </div>
+          <div class="form-group">
+            <label for="key-bound-ips">Bound IPs (comma-separated CIDR, IP, or hostname, optional)</label>
+            <input type="text" id="key-bound-ips" class="input-field" placeholder="203.0.113.0/24, vpn.internal" />
+          </div>
+        </div>
+        <div class="permissions-grid mt-2 mb-4">
+          <label class="checkbox-container">
+            <input type="checkbox" id="key-can-manage-keys">
+            <span class="checkmark"></span>
+            Can manage keys
+          </label>
+        </div>
+        <div class="form-actions mt-4">
+          <button type="submit" class="btn btn-primary">Create Key</button>
+          <button type="button" id="btn-cancel-create-key" class="btn btn-cancel">Cancel</button>
+        </div>
+        <div id="key-error" class="message error hidden"></div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Secret Reveal Modal (used after key creation or rotation) -->
+  <div id="secret-reveal-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="secret-reveal-title">
+    <div class="modal-card card">
+      <h3 id="secret-reveal-title">API Key Created</h3>
+      <p class="subtitle">Copy both values now — the signing secret cannot be retrieved or displayed again.</p>
+      <div id="minted-key-box" class="key-reveal">
+        <div id="minted-api-key-row">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <p class="key-reveal-label">API Key (copy now):</p>
+            <button type="button" class="btn btn-secondary btn-sm" id="btn-copy-minted-key" style="padding:0.2rem 0.5rem;font-size:0.75rem;">Copy</button>
+          </div>
+          <code id="minted-api-key" class="key-reveal-value"></code>
+        </div>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-top:0.5rem;">
+          <p class="key-reveal-label">Signing Secret (copy now — required to sign requests):</p>
+          <button type="button" class="btn btn-secondary btn-sm" id="btn-copy-minted-secret" style="padding:0.2rem 0.5rem;font-size:0.75rem;">Copy</button>
+        </div>
+        <code id="minted-signing-secret" class="key-reveal-value"></code>
+        <div class="form-actions mt-4">
+          <button id="minted-key-dismiss" type="button" class="btn btn-primary">Done</button>
+        </div>
+      </div>
+    </div>
   </div>
 
   <!-- Edit API Key Modal — name/bound_ips/can_manage_keys via PUT /api/keys/{id}, matching

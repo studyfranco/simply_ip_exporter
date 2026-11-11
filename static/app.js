@@ -776,6 +776,7 @@ function showMintedKey(minted) {
   }
   el('minted-signing-secret').textContent = minted.signing_secret;
   el('minted-key-box').classList.remove('hidden');
+  el('secret-reveal-modal')?.classList.remove('hidden');
 }
 
 async function createKey(event) {
@@ -789,6 +790,7 @@ async function createKey(event) {
     });
     event.target.reset();
     el('key-form').classList.add('hidden');
+    el('create-key-modal')?.classList.add('hidden');
     showMintedKey(minted);
     await loadKeys();
   } catch (e) {
@@ -1091,13 +1093,50 @@ document.addEventListener('DOMContentLoaded', () => {
   el('key-form').addEventListener('submit', createKey);
 
   el('btn-open-create-key')?.addEventListener('click', () => {
-    el('key-form').classList.remove('hidden');
+    el('create-key-modal')?.classList.remove('hidden');
     el('key-name').focus();
   });
   el('btn-cancel-create-key')?.addEventListener('click', () => {
-    el('key-form').classList.add('hidden');
+    el('create-key-modal')?.classList.add('hidden');
     el('key-form').reset();
+    hideError('key-error');
   });
+  el('create-key-close-x')?.addEventListener('click', () => {
+    el('create-key-modal')?.classList.add('hidden');
+    el('key-form').reset();
+    hideError('key-error');
+  });
+  el('create-key-modal')?.addEventListener('click', (event) => {
+    if (event.target.id === 'create-key-modal') {
+      el('create-key-modal')?.classList.add('hidden');
+      el('key-form').reset();
+      hideError('key-error');
+    }
+  });
+  el('secret-reveal-modal')?.addEventListener('click', (event) => {
+    if (event.target.id === 'secret-reveal-modal') {
+      el('secret-reveal-modal')?.classList.add('hidden');
+    }
+  });
+  el('btn-copy-minted-key')?.addEventListener('click', () => {
+    const text = el('minted-api-key')?.textContent;
+    if (text) {
+      navigator.clipboard?.writeText(text);
+      el('btn-copy-minted-key').textContent = 'Copied!';
+      setTimeout(() => { if (el('btn-copy-minted-key')) el('btn-copy-minted-key').textContent = 'Copy'; }, 1500);
+    }
+  });
+  el('btn-copy-minted-secret')?.addEventListener('click', () => {
+    const text = el('minted-signing-secret')?.textContent;
+    if (text) {
+      navigator.clipboard?.writeText(text);
+      el('btn-copy-minted-secret').textContent = 'Copied!';
+      setTimeout(() => { if (el('btn-copy-minted-secret')) el('btn-copy-minted-secret').textContent = 'Copy'; }, 1500);
+    }
+  });
+  window.addEventListener('scroll', () => {
+    el('top-bar')?.classList.toggle('stuck', window.scrollY > 4);
+  }, { passive: true });
 
   // Create Endpoint modal: open from the toolbar button, close on the × button, Cancel, a
   // backdrop click, or Escape — same conventions as the reassignment modal below.
@@ -1107,7 +1146,10 @@ document.addEventListener('DOMContentLoaded', () => {
   el('create-endpoint-modal').addEventListener('click', (event) => {
     if (event.target.id === 'create-endpoint-modal') closeCreateEndpointModal();
   });
-  el('minted-key-dismiss').addEventListener('click', () => el('minted-key-box').classList.add('hidden'));
+  el('minted-key-dismiss').addEventListener('click', () => {
+    el('minted-key-box').classList.add('hidden');
+    el('secret-reveal-modal')?.classList.add('hidden');
+  });
 
   // Edit Endpoint modal: same four close conventions as every other modal here.
   el('edit-endpoint-form').addEventListener('submit', submitEditEndpoint);
