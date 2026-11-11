@@ -10,7 +10,7 @@ use sea_orm::{
 use sea_orm_migration::MigratorTrait;
 
 /// How long SQLite waits on a locked database before returning `SQLITE_BUSY`, in milliseconds.
-pub const SQLITE_BUSY_TIMEOUT_MS: u32 = 5_000;
+pub const SQLITE_BUSY_TIMEOUT_MS: u32 = 10_000;
 
 /// Connections in the SQLite pool. Fixed at one, per `SCHEMA.MD`.
 pub const SQLITE_MAX_CONNECTIONS: u32 = 1;

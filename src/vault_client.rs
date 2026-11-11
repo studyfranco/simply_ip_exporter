@@ -22,11 +22,10 @@ use crate::crypto::{canonical_v1_payload, compute_signature};
 /// other endpoint's sync ticks behind it rather than surfacing as the fast, logged failure the
 /// "keep serving the cache" resilience contract expects.
 ///
-/// 60s rather than the original 15s (2026-11-08): with multi-million-row groups, a legitimately
-/// deep `offset` page costs Vault a few seconds of index walking, and 15s left too little headroom
-/// under the [`MAX_CONCURRENT_PAGES`] parallel load. 60s still turns a black-holed Vault into a
-/// bounded, logged failure.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// 120s rather than the original 60s/15s: with large multi-row groups, a legitimately
+/// deep page costs Vault a few seconds of index walking, and 120s leaves comfortable headroom
+/// under parallel load without timing out healthy queries.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// One record as returned by Vault's `GET /api/ips` contract.
 ///
