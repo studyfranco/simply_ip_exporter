@@ -190,11 +190,17 @@ pub async fn auth_middleware(
         return Err(AppError::Forbidden("Client IP not allowed".to_owned()));
     }
 
+    let key_id = key_record.id;
     let mut req = Request::from_parts(parts, Body::from(bytes));
     req.extensions_mut().insert(ClientIp(client_ip));
     req.extensions_mut().insert(key_record);
 
-    Ok(next.run(req).await)
+    let res = next.run(req).await;
+    if res.status().is_server_error() {
+        state.replay_guard.unrecord(key_id, &digest);
+    }
+
+    Ok(res)
 }
 
 #[cfg(test)]

@@ -1077,6 +1077,16 @@ function formatMaxAge(seconds) {
 
 // ── Wiring ───────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
+  if (window.location.protocol === 'file:') {
+    showError(
+      'login-error',
+      "This dashboard must be opened through the daemon's own web server (http:// or https://), " +
+      "not as a local file — opening index.html directly blocks every request this page makes."
+    );
+    el('login-form')?.querySelectorAll('input, button')?.forEach((elem) => { elem.disabled = true; });
+    return;
+  }
+
   // Prefill from storage so a proxied deployment doesn't ask for the override again on every
   // logout — only the credentials themselves are cleared by Session.clear().
   el('login-api-base').value = Session.apiBaseOverride;

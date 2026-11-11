@@ -80,6 +80,19 @@ impl ReplayGuard {
         }
     }
 
+    /// Removes a recorded signature digest so that a transiently failed request (e.g. 503 Service
+    /// Unavailable due to temporary database locking or connection pool exhaustion) can be retried by
+    /// the caller with the same signature without being falsely rejected as a replay.
+    pub fn unrecord(&self, key_id: Uuid, digest: &[u8]) {
+        if let Ok(mut seen) = self.seen.lock() {
+            let id = SignatureId {
+                key_id,
+                digest: digest.to_vec(),
+            };
+            seen.remove(&id);
+        }
+    }
+
     #[cfg(test)]
     fn tracked(&self) -> usize {
         self.seen.lock().map(|seen| seen.len()).unwrap_or(0)
