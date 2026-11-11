@@ -447,16 +447,43 @@ impl RuntimeConfig {
                 defaults.signature_max_age_seconds,
             )
             .max(1),
-            vault_base_url: std::env::var("VAULT_BASE_URL")
-                .ok()
+            vault_base_url: get_secret_or_env("VAULT_BASE_URL")
                 .map(|s| s.trim_end_matches('/').to_owned())
                 .filter(|s| !s.is_empty()),
-            vault_api_key: std::env::var("VAULT_API_KEY").ok().filter(|s| !s.is_empty()),
-            vault_signing_secret: std::env::var("VAULT_SIGNING_SECRET")
-                .ok()
+            vault_api_key: get_secret_or_env("VAULT_API_KEY").filter(|s| !s.is_empty()),
+            vault_signing_secret: get_secret_or_env("VAULT_SIGNING_SECRET")
                 .filter(|s| !s.is_empty()),
         })
     }
+}
+
+/// Reads a secret from `<VAR>_FILE`, `/run/secrets/<var_lowercase>`, or `<VAR>`.
+#[must_use]
+pub fn get_secret_or_env(var_name: &str) -> Option<String> {
+    if let Ok(file_path) = std::env::var(format!("{var_name}_FILE")) {
+        let trimmed = file_path.trim();
+        if !trimmed.is_empty() {
+            if let Ok(content) = std::fs::read_to_string(trimmed) {
+                let trimmed_content = content.trim().to_owned();
+                if !trimmed_content.is_empty() {
+                    return Some(trimmed_content);
+                }
+            }
+        }
+    }
+
+    let default_path = format!("/run/secrets/{}", var_name.to_ascii_lowercase());
+    if let Ok(content) = std::fs::read_to_string(&default_path) {
+        let trimmed_content = content.trim().to_owned();
+        if !trimmed_content.is_empty() {
+            return Some(trimmed_content);
+        }
+    }
+
+    std::env::var(var_name)
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
 }
 
 /// Resolves the socket address the HTTP server binds to, from `BIND_HOST`/`HOST` and `PORT`.

@@ -141,7 +141,7 @@ impl SecretCipher {
     /// Builds the cipher from `EXPORTER_ENCRYPTION_KEY`. A malformed key aborts startup rather
     /// than silently falling back to plaintext.
     pub fn from_env() -> Result<Self, CryptoError> {
-        let configured = std::env::var(KEY_ENV_VAR).ok().filter(|raw| !raw.trim().is_empty());
+        let configured = crate::config::get_secret_or_env(KEY_ENV_VAR);
         match configured {
             Some(raw) => Self::from_hex_key(raw.trim()),
             None => Ok(Self::Plaintext),

@@ -69,8 +69,8 @@ async fn bootstrap_master_key(
 
     // As with INITIAL_MASTER_KEY above: deterministic test/CI bootstrap only, so a script never
     // has to scrape the signing secret back out of stdout.
-    let signing_secret = match std::env::var("INITIAL_MASTER_SIGNING_SECRET") {
-        Ok(fixed) if !fixed.is_empty() => {
+    let signing_secret = match config::get_secret_or_env("INITIAL_MASTER_SIGNING_SECRET") {
+        Some(fixed) if !fixed.is_empty() => {
             tracing::warn!(
                 "INITIAL_MASTER_SIGNING_SECRET is set: using the provided value instead of \
                  generating one. Intended for deterministic test/CI bootstrap only."
@@ -96,17 +96,23 @@ async fn bootstrap_master_key(
     };
     model.insert(db).await?;
 
+    const W: usize = 82;
+    let border = "═".repeat(W);
+    let body: String = [
+        format!("X-API-Key      : {plaintext_key}"),
+        format!("Signing secret : {signing_secret}"),
+        format!("Bound IPs      : {bound_ip}"),
+        String::new(),
+        "Both values are needed to sign requests (X-Timestamp + X-Signature-256).".to_owned(),
+        "They will NOT be shown again — store them securely!".to_owned(),
+    ]
+    .iter()
+    .map(|row| format!("║ {row:<W$} ║\n"))
+    .collect();
+
     tracing::info!(
-        "\n╔══════════════════════════════════════════════════════════════╗\n\
-         ║  BOOTSTRAP: Master API Key Generated                            \n\
-         ║  X-API-Key:        {}  \n\
-         ║  Signing Secret:   {}  \n\
-         ║  Bound IPs:        {}  \n\
-         ║  Shown once. Store the key and signing secret securely!         \n\
-         ╚══════════════════════════════════════════════════════════════╝",
-        plaintext_key,
-        signing_secret,
-        bound_ip
+        "\n╔{border}╗\n║ {:<W$} ║\n╠{border}╣\n{body}╚{border}╝",
+        "BOOTSTRAP: Master API Key Generated"
     );
 
     use std::io::Write;
@@ -184,8 +190,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     };
+    let initial_key_raw = config::get_secret_or_env("INITIAL_MASTER_KEY");
     let initial_master_key =
-        match config::validate_initial_master_key(std::env::var("INITIAL_MASTER_KEY").ok().as_deref()) {
+        match config::validate_initial_master_key(initial_key_raw.as_deref()) {
             Ok(key) => key,
             Err(e) => {
                 tracing::error!("{e}");
@@ -194,7 +201,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
     let db_url =
-        std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://simply_ip_exporter.db?mode=rwc".to_owned());
+        config::get_secret_or_env("DATABASE_URL").unwrap_or_else(|| "sqlite://simply_ip_exporter.db?mode=rwc".to_owned());
 
     tracing::info!("Connecting to database...");
     let db: DatabaseConnection = db::connect(&db_url).await?;
