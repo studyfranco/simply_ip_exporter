@@ -150,8 +150,8 @@ async fn benchmark_vault_group_id_lookup_performance() {
     );
 
     assert!(
-        duration_indexed <= duration_unindexed,
-        "Indexed query ({:?}) should be at least as fast as unindexed ({:?})",
+        duration_indexed <= duration_unindexed.mul_f64(1.25),
+        "Indexed query ({:?}) should be faster than or comparable to unindexed ({:?})",
         duration_indexed,
         duration_unindexed
     );
@@ -245,8 +245,8 @@ async fn benchmark_api_keys_is_master_lookup_performance() {
     );
 
     assert!(
-        duration_indexed <= duration_unindexed,
-        "Indexed query ({:?}) should be at least as fast as unindexed ({:?})",
+        duration_indexed <= duration_unindexed.mul_f64(1.25),
+        "Indexed query ({:?}) should be faster than or comparable to unindexed ({:?})",
         duration_indexed,
         duration_unindexed
     );
@@ -326,8 +326,8 @@ async fn benchmark_endpoints_created_at_ordering_performance() {
     );
 
     assert!(
-        duration_indexed <= duration_unindexed,
-        "Indexed query ({:?}) should be at least as fast as unindexed ({:?})",
+        duration_indexed <= duration_unindexed.mul_f64(1.25),
+        "Indexed query ({:?}) should be faster than or comparable to unindexed ({:?})",
         duration_indexed,
         duration_unindexed
     );

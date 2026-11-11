@@ -160,9 +160,20 @@ const Session = {
   isSet() { return !!this.apiKey && !!this.signingSecret; },
 };
 
-async function apiCall(method, path, bodyObj) {
+let _lastSigSec = 0;
+let _lastSigKey = '';
+
+async function apiCall(method, path, bodyObj, isRetry = false) {
   const body = bodyObj !== undefined ? JSON.stringify(bodyObj) : '';
-  const timestamp = Math.floor(Date.now() / 1000).toString();
+  let nowSec = Math.floor(Date.now() / 1000);
+  const sigKey = `${method}\n${Session.apiBaseOverride}${path}\n${body}`;
+  if (sigKey === _lastSigKey && nowSec <= _lastSigSec) {
+    nowSec = _lastSigSec + 1;
+  }
+  _lastSigKey = sigKey;
+  _lastSigSec = nowSec;
+
+  const timestamp = nowSec.toString();
   const signTarget = `${Session.apiBaseOverride}${path}`;
   const signature = await hmacSign(Session.signingSecret, method, signTarget, timestamp, body);
   const requestUrl = `${REQUEST_BASE}${path}`.replace(/\/{2,}/g, '/');
@@ -182,11 +193,12 @@ async function apiCall(method, path, bodyObj) {
   const text = await response.text();
   const json = text ? JSON.parse(text) : null;
   if (!response.ok) {
-    const err = new Error((json && json.error) || `HTTP ${response.status}`);
-    // Most callers only ever read `.message` (unchanged behavior). A caller that needs to react to
-    // *which* error this was — e.g. the key-deletion flow distinguishing a 409's structured
-    // `owned_endpoints` inventory from every other failure — reads `.status`/`.body` instead of
-    // parsing the message string back apart.
+    const errMsg = (json && json.error) || `HTTP ${response.status}`;
+    if (response.status === 401 && !isRetry && (errMsg.includes('already been used') || errMsg.includes('already used') || errMsg.includes('timestamp'))) {
+      await new Promise(r => setTimeout(r, 1100));
+      return apiCall(method, path, bodyObj, true);
+    }
+    const err = new Error(errMsg);
     err.status = response.status;
     err.body = json;
     throw err;
