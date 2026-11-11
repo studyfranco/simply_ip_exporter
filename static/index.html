@@ -32,9 +32,12 @@
         <div class="form-group">
           <label for="login-api-base">API Base Path Override</label>
           <input type="text" id="login-api-base" class="input-field" placeholder="/api" autocomplete="off" />
-          <small class="field-hint">Leave blank unless this dashboard sits behind a reverse proxy
-            that forwards its subpath prefix through to this service instead of stripping it —
-            see AGENT.MD.</small>
+          <small class="field-hint">
+            Leave blank unless a reverse proxy rewrites the path. Signatures must cover the path the
+            <em>server</em> sees: if the proxy strips a prefix (<code>/ip_exporter/api/endpoints</code> →
+            <code>/api/endpoints</code>), keep <code>/api</code>; if it forwards the prefix untouched, set
+            <code>/ip_exporter/api</code>. Requests themselves are always sent relative to this page.
+          </small>
         </div>
         <button type="submit" class="btn btn-primary">Unlock Dashboard</button>
       </form>
