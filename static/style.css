@@ -1107,6 +1107,15 @@ input[type='checkbox']:checked::after {
     font-size: 0.7rem;
 }
 
+.badge-scope-master {
+    background-color: rgba(231, 76, 60, 0.16);
+    color: #ff7b6b;
+    border: 1px solid rgba(231, 76, 60, 0.45);
+    text-transform: none;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+}
+
 /* System settings key-value grid */
 .kv-grid {
     display: grid;
@@ -1226,7 +1235,7 @@ input[type='checkbox']:checked::after {
 
 .modal-card {
     width: 100%;
-    max-width: clamp(360px, 45vw, 560px);
+    max-width: clamp(520px, 46vw, 860px);
     background-color: var(--bg-card);
     color: var(--text-main);
     border: 1px solid var(--border);
@@ -1237,13 +1246,14 @@ input[type='checkbox']:checked::after {
 }
 
 #secret-reveal-modal .modal-card {
-    max-width: 560px;
+    max-width: clamp(580px, 48vw, 860px);
 }
 
 #create-key-modal .modal-card-form,
+#edit-key-modal .modal-card-form,
 #create-endpoint-modal .modal-card-form,
 #edit-endpoint-modal .modal-card-form {
-    max-width: 780px;
+    max-width: clamp(620px, 56vw, 960px);
 }
 
 .modal-card h3 {
@@ -1284,7 +1294,7 @@ input[type='checkbox']:checked::after {
 /* A modal that holds a form (the reassignment dialog) scrolls inside the card on a short window
    rather than overflowing the viewport. */
 .modal-card-form {
-    max-width: clamp(420px, 60vw, 840px);
+    max-width: clamp(600px, 56vw, 960px);
     max-height: calc(100vh - 3rem);
     overflow-y: auto;
 }

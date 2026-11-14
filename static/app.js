@@ -623,7 +623,7 @@ async function loadKeys() {
       k.can_manage_keys && "can_manage_keys",
     ]
       .filter(Boolean)
-      .map((s) => `<span class="badge badge-scope">${escapeHtml(s)}</span>`)
+      .map((s) => `<span class="badge badge-scope${s === "Master" ? " badge-scope-master" : ""}">${escapeHtml(s)}</span>`)
       .join("");
 
     const groupBadgesRaw = k.is_master
