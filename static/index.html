@@ -77,9 +77,10 @@
     <main id="tab-endpoints" class="tab-panel active">
       <section class="card">
         <div class="list-header">
-          <h2>Endpoints</h2>
-        </div>
-        <div class="table-toolbar">
+          <div>
+            <h2>Endpoints</h2>
+            <p class="subtitle">Configure and manage live IP export feeds sourced from Simply IP Vault groups.</p>
+          </div>
           <button type="button" id="open-create-endpoint" class="btn btn-primary">+ Add Endpoint</button>
         </div>
         <div class="table-container">
@@ -123,7 +124,7 @@
             <thead>
               <tr>
                 <th><input type="checkbox" id="select-all-keys" title="Select all" /></th>
-                <th>Name</th><th>Prefix</th><th>Tier</th><th>Global rights</th><th>Vault groups</th><th>Parent</th><th></th>
+                <th>Name</th><th>Prefix</th><th>Tier</th><th>Global rights</th><th>Vault groups</th><th>Bound IPs</th><th></th>
               </tr>
             </thead>
             <tbody id="keys-body"></tbody>
@@ -289,13 +290,15 @@
         <button type="button" id="create-endpoint-close" class="btn-modal-close" aria-label="Close">&times;</button>
       </div>
       <form id="endpoint-form" class="admin-form">
-        <div class="form-group">
-          <label for="ep-name">Name <span class="required-marker">*</span></label>
-          <input type="text" id="ep-name" class="input-field" required />
-        </div>
-        <div class="form-group">
-          <label for="ep-description">Description</label>
-          <input type="text" id="ep-description" class="input-field" />
+        <div class="form-grid">
+          <div class="form-group">
+            <label for="ep-name">Name <span class="required-marker">*</span></label>
+            <input type="text" id="ep-name" class="input-field" required />
+          </div>
+          <div class="form-group">
+            <label for="ep-description">Description</label>
+            <input type="text" id="ep-description" class="input-field" />
+          </div>
         </div>
         <div class="form-group">
           <label for="ep-groups-list">Vault groups <span class="required-marker">*</span></label>
@@ -303,14 +306,16 @@
           <small class="field-hint" id="ep-groups-hint"></small>
           <div id="ep-groups-error" class="message error hidden"></div>
         </div>
-        <div class="form-group">
-          <label for="ep-ttl">TTL seconds</label>
-          <input type="number" id="ep-ttl" class="input-field" value="3600" min="1" />
-        </div>
-        <div class="form-group">
-          <label for="ep-max-age">Max IP Age / Time Window (seconds)</label>
-          <input type="number" id="ep-max-age" class="input-field" value="0" min="0" />
-          <small class="field-hint">Maximum age in seconds since an IP was last updated to be included in the feed. Set to 0 for unlimited (default).</small>
+        <div class="form-grid">
+          <div class="form-group">
+            <label for="ep-ttl">TTL seconds</label>
+            <input type="number" id="ep-ttl" class="input-field" value="3600" min="1" />
+          </div>
+          <div class="form-group">
+            <label for="ep-max-age">Max IP Age / Time Window (seconds)</label>
+            <input type="number" id="ep-max-age" class="input-field" value="0" min="0" />
+            <small class="field-hint">Set to 0 for unlimited (default).</small>
+          </div>
         </div>
         <div class="form-group">
           <label for="ep-bound-ips">Bound IPs (comma-separated CIDR, IP, or hostname, optional)</label>
@@ -326,9 +331,9 @@
             <label class="checkbox-container"><input type="checkbox" id="ep-filter-loopback" /><span class="checkmark"></span>Filter loopback</label>
           </div>
         </div>
-        <div class="modal-actions mt-4">
+        <div class="form-actions mt-4">
+          <button type="submit" class="btn btn-primary">Create Endpoint</button>
           <button type="button" id="create-endpoint-cancel" class="btn btn-cancel">Cancel</button>
-          <button type="submit" class="btn btn-primary">Create endpoint</button>
         </div>
         <div id="endpoint-error" class="message error hidden"></div>
       </form>
@@ -343,15 +348,17 @@
         <h3 id="edit-endpoint-modal-title">Edit Endpoint</h3>
         <button type="button" id="edit-endpoint-close" class="btn-modal-close" aria-label="Close">&times;</button>
       </div>
-      <form id="edit-endpoint-form">
+      <form id="edit-endpoint-form" class="admin-form">
         <input type="hidden" id="edit-ep-id" />
-        <div class="form-group">
-          <label for="edit-ep-name">Name <span class="required-marker">*</span></label>
-          <input type="text" id="edit-ep-name" class="input-field" required />
-        </div>
-        <div class="form-group">
-          <label for="edit-ep-description">Description</label>
-          <input type="text" id="edit-ep-description" class="input-field" />
+        <div class="form-grid">
+          <div class="form-group">
+            <label for="edit-ep-name">Name <span class="required-marker">*</span></label>
+            <input type="text" id="edit-ep-name" class="input-field" required />
+          </div>
+          <div class="form-group">
+            <label for="edit-ep-description">Description</label>
+            <input type="text" id="edit-ep-description" class="input-field" />
+          </div>
         </div>
         <div class="form-group">
           <label for="edit-ep-groups-list">Vault groups <span class="required-marker">*</span></label>
@@ -359,14 +366,16 @@
           <small class="field-hint" id="edit-ep-groups-hint"></small>
           <div id="edit-ep-groups-error" class="message error hidden"></div>
         </div>
-        <div class="form-group">
-          <label for="edit-ep-ttl">TTL seconds</label>
-          <input type="number" id="edit-ep-ttl" class="input-field" min="1" />
-        </div>
-        <div class="form-group">
-          <label for="edit-ep-max-age">Max IP Age / Time Window (seconds)</label>
-          <input type="number" id="edit-ep-max-age" class="input-field" min="0" />
-          <small class="field-hint">Maximum age in seconds since an IP was last updated to be included in the feed. Set to 0 for unlimited (default).</small>
+        <div class="form-grid">
+          <div class="form-group">
+            <label for="edit-ep-ttl">TTL seconds</label>
+            <input type="number" id="edit-ep-ttl" class="input-field" min="1" />
+          </div>
+          <div class="form-group">
+            <label for="edit-ep-max-age">Max IP Age / Time Window (seconds)</label>
+            <input type="number" id="edit-ep-max-age" class="input-field" min="0" />
+            <small class="field-hint">Set to 0 for unlimited (default).</small>
+          </div>
         </div>
         <div class="form-group">
           <label for="edit-ep-bound-ips">Bound IPs (comma-separated CIDR, IP, or hostname, optional)</label>
@@ -382,9 +391,9 @@
             <label class="checkbox-container"><input type="checkbox" id="edit-ep-filter-loopback" /><span class="checkmark"></span>Filter loopback</label>
           </div>
         </div>
-        <div class="modal-actions mt-4">
-          <button type="button" id="edit-endpoint-cancel" class="btn btn-cancel">Cancel</button>
+        <div class="form-actions mt-4">
           <button type="submit" class="btn btn-primary">Save Changes</button>
+          <button type="button" id="edit-endpoint-cancel" class="btn btn-cancel">Cancel</button>
         </div>
         <div id="edit-endpoint-error" class="message error hidden"></div>
       </form>

@@ -619,17 +619,21 @@ async function loadKeys() {
     const tier = rbacTier(k);
     const tierModifier = k.is_master ? " badge-master" : k.can_manage_keys ? " badge-parent" : "";
     const scopes = [
+      k.is_master && "Master",
       k.can_manage_keys && "can_manage_keys",
     ]
       .filter(Boolean)
       .map((s) => `<span class="badge badge-scope">${escapeHtml(s)}</span>`)
-      .join(" ");
+      .join("");
 
-    const groupBadges = k.is_master
-      ? '<span class="text-muted text-sm">all groups</span>'
+    const groupBadgesRaw = k.is_master
+      ? '<span class="badge badge-scope">all groups</span>'
       : (grantsByKeyId.get(k.id) || [])
           .map((g) => `<span class="badge badge-scope">${escapeHtml(g.vault_group_name)}</span>`)
-          .join(" ") || '<span class="text-muted text-sm">none</span>';
+          .join("");
+    const groupBadges = groupBadgesRaw
+      ? `<div class="scope-badges">${groupBadgesRaw}</div>`
+      : '<span class="text-muted text-sm">none</span>';
 
     const actions = k.is_master
       ? me.is_master
@@ -645,10 +649,10 @@ async function loadKeys() {
       <td>${escapeHtml(k.name)}</td>
       <td class="font-mono">${escapeHtml(k.prefix)}</td>
       <td><span class="badge badge-tier${tierModifier}">${escapeHtml(tier)}</span></td>
-      <td>${scopes || '<span class="text-muted text-sm">none</span>'}</td>
+      <td>${scopes ? `<div class="scope-badges">${scopes}</div>` : '<span class="text-muted text-sm">none</span>'}</td>
       <td>${groupBadges}</td>
-      <td class="font-mono text-sm">${escapeHtml(k.parent_key_id || "")}</td>
-      <td class="row-actions">${actions}</td>`;
+      <td class="font-mono text-sm">${escapeHtml(k.bound_ips || "any")}</td>
+      <td class="row-actions">${actions ? `<div class="row-actions-group">${actions}</div>` : ""}</td>`;
     tbody.appendChild(tr);
   }
   tbody.querySelectorAll('[data-delete-key]').forEach((btn) => {

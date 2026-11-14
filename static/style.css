@@ -41,8 +41,8 @@
        (as this crate did before) silently drifts apart the moment either one changes. Horizontal
        padding is fluid (`clamp()`), vertical stays fixed — same split `example/simply_hook_executor`
        uses for its own wide, responsive container. */
-    --container-padding-x: clamp(1rem, 3vw, 4rem);
-    --container-padding-y: 2rem;
+    --container-padding-x: clamp(1rem, 2.5vw, 3rem);
+    --container-padding-y: 1.75rem;
 }
 
 /* ─── Reset & Base ──────────────────────────────────────── */
@@ -86,7 +86,7 @@ body {
        giving the table room to breathe. `width: 100%` alongside `max-width` is what makes the cap
        an upper bound rather than a fixed size — the container still shrinks to fit a narrower
        viewport instead of forcing horizontal scroll on the whole page. */
-    max-width: 1800px;
+    max-width: min(2400px, 96vw);
     width: 100%;
     margin: 0 auto;
     padding: var(--container-padding-y) var(--container-padding-x);
@@ -372,16 +372,14 @@ body {
    .btn-secondary, so the safe escape hatch reads as its own affordance next to the red confirm
    button instead of blending into the card background. */
 .btn-cancel {
-    background-color: #1e293b;
-    color: #60a5fa;
-    border-color: #60a5fa;
-    font-weight: 600;
+    background-color: var(--bg-surface);
+    color: var(--text-muted);
+    border-color: var(--border);
 }
 
 .btn-cancel:hover:not(:disabled) {
-    background-color: #2563eb;
-    color: #ffffff;
-    border-color: #2563eb;
+    background-color: var(--border);
+    color: var(--text-main);
 }
 
 .btn-logout {
@@ -747,7 +745,9 @@ input[type='checkbox']:checked::after {
     font-family: var(--font-mono);
     font-size: 0.85rem;
     color: var(--text-main);
-    word-break: break-all;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
     padding: 0.5rem 0.7rem;
     background-color: var(--bg-input);
     border-radius: var(--radius);
@@ -1029,9 +1029,22 @@ input[type='checkbox']:checked::after {
 }
 
 .row-actions {
-    display: flex;
+    white-space: nowrap;
+    vertical-align: middle;
+}
+
+.row-actions-group {
+    display: inline-flex;
     gap: 0.35rem;
+    flex-wrap: nowrap;
+    align-items: center;
+}
+
+.scope-badges {
+    display: flex;
     flex-wrap: wrap;
+    gap: 0.4rem;
+    align-items: center;
 }
 
 .empty-state {
@@ -1213,7 +1226,7 @@ input[type='checkbox']:checked::after {
 
 .modal-card {
     width: 100%;
-    max-width: clamp(360px, 45vw, 760px);
+    max-width: clamp(360px, 45vw, 560px);
     background-color: var(--bg-card);
     color: var(--text-main);
     border: 1px solid var(--border);
@@ -1221,6 +1234,16 @@ input[type='checkbox']:checked::after {
     padding: 1.5rem;
     box-shadow: var(--shadow-lg);
     animation: fadeIn var(--transition-slow);
+}
+
+#secret-reveal-modal .modal-card {
+    max-width: 560px;
+}
+
+#create-key-modal .modal-card-form,
+#create-endpoint-modal .modal-card-form,
+#edit-endpoint-modal .modal-card-form {
+    max-width: 780px;
 }
 
 .modal-card h3 {
