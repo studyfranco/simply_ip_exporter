@@ -1057,7 +1057,7 @@ async function loadAuditLogs() {
         <td class="text-muted text-sm" title="${escapeHtml(entry.timestamp)}">${escapeHtml(formatTimestamp(entry.timestamp))}</td>
         <td class="text-sm" title="${escapeHtml(actor)}">${escapeHtml(entry.api_key_name)} <span class="text-muted text-sm">(${escapeHtml(entry.api_key_prefix)}...)</span></td>
         <td class="font-mono text-sm">${escapeHtml(entry.client_ip)}</td>
-        <td><span class="badge badge-scope">${escapeHtml(entry.action)}</span></td>
+        <td><span class="badge ${getActionBadgeClass(entry.action)}">${escapeHtml(entry.action)}</span></td>
         <td class="font-mono text-sm" title="${escapeHtml(target)}">${escapeHtml(target)}</td>
         <td class="text-sm" title="${escapeHtml(details)}">${escapeHtml(details)}</td>`;
       tbody.appendChild(tr);
@@ -1065,6 +1065,17 @@ async function loadAuditLogs() {
   } catch (e) {
     showError('audit-error', e.message);
   }
+}
+
+function getActionBadgeClass(action) {
+  if (!action) return 'badge-scope';
+  const act = String(action).toUpperCase();
+  if (/CREATE|ADD|INSERT|REGISTER/.test(act)) return 'badge-action-create badge-success';
+  if (/DELETE|DESTROY|REVOKE|REMOVE|PURGE/.test(act)) return 'badge-action-delete badge-danger';
+  if (/UPDATE|EDIT|MODIFY|SET|ROTATE|RESTORE|LOCK|UNLOCK|GRANT/.test(act)) return 'badge-action-update badge-warning';
+  if (/EXECUTE|TRIGGER|DEPLOY|GENERATE|RELOAD|REFETCH|RUN|TEST|DISPATCH/.test(act)) return 'badge-action-execute badge-info badge-highlight';
+  if (/AUTH|LOGIN|SIGNIN|SIGNOUT|TOKEN/.test(act)) return 'badge-action-auth';
+  return 'badge-scope';
 }
 
 function escapeHtml(str) {

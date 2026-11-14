@@ -314,7 +314,7 @@ body {
 .btn {
     padding: 0.6rem 1.2rem;
     border-radius: var(--radius);
-    border: 1px solid transparent;
+    border: 1px solid var(--border);
     cursor: pointer;
     font-weight: 600;
     font-size: 0.9rem;
@@ -348,10 +348,12 @@ body {
 .btn-primary {
     background-color: var(--accent);
     color: #1a1d20;
+    border-color: var(--accent);
 }
 
 .btn-primary:hover:not(:disabled) {
     background-color: var(--accent-hover);
+    border-color: var(--accent-hover);
     box-shadow: var(--shadow);
 }
 
@@ -639,13 +641,23 @@ input[type='checkbox']:checked::after {
     cursor: pointer;
 }
 
+.permissions-grid .checkbox-container:hover {
+    color: var(--text-muted);
+}
+
 .permissions-grid .checkbox-container input[type="checkbox"] {
+    appearance: auto;
+    -webkit-appearance: auto;
     position: static;
     opacity: 1;
     width: 1rem;
     height: 1rem;
     accent-color: var(--accent);
     cursor: pointer;
+}
+
+.permissions-grid .checkbox-container .checkmark {
+    display: none;
 }
 
 /* Custom checkbox with a label baked into one clickable element — used for permission toggles
@@ -739,9 +751,12 @@ input[type='checkbox']:checked::after {
     padding: 0.5rem 0.7rem;
     background-color: var(--bg-input);
     border-radius: var(--radius);
-    margin-bottom: 0.75rem;
     user-select: all;
     cursor: text;
+}
+
+.modal-card .key-reveal-value {
+    margin-top: 0.5rem;
 }
 
 .message {
@@ -1198,7 +1213,7 @@ input[type='checkbox']:checked::after {
 
 .modal-card {
     width: 100%;
-    max-width: min(90vw, 480px);
+    max-width: clamp(360px, 45vw, 760px);
     background-color: var(--bg-card);
     color: var(--text-main);
     border: 1px solid var(--border);
