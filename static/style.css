@@ -327,6 +327,12 @@ body {
     gap: 0.5rem;
     line-height: 1.4;
     white-space: nowrap;
+    background-color: var(--bg-surface);
+    color: var(--text-main);
+}
+
+.btn:hover:not(:disabled) {
+    border-color: var(--accent);
 }
 
 .btn:active {
@@ -1007,6 +1013,19 @@ input[type='checkbox']:checked::after {
     min-width: 2.25rem;
 }
 
+.row-actions {
+    display: flex;
+    gap: 0.35rem;
+    flex-wrap: wrap;
+}
+
+.empty-state {
+    color: var(--text-muted);
+    font-size: 0.88rem;
+    text-align: center;
+    padding: 1.5rem 0;
+}
+
 /* ─── Badges ────────────────────────────────────────────── */
 
 .badge {
@@ -1021,36 +1040,43 @@ input[type='checkbox']:checked::after {
     line-height: 1.4;
 }
 
-/* RBAC tier badges — Master / Daughter, per AGENT.MD's two-tier model. Coloured by authority
-   rather than by mood: Daughter (the common case) is deliberately the quietest, matching
-   example/simply_ip_vault's identical `.badge-tier*` rationale for its own three-tier model. */
+/* RBAC tier badges — Master / Parent / Daughter. Coloured by authority
+   rather than by mood, identical to simply_ip_sync. */
 .badge-tier {
     background-color: rgba(189, 195, 199, 0.1);
     color: var(--text-muted);
     border: 1px solid var(--border);
 }
 
-.badge-tier-master {
+.badge-tier-master,
+.badge-tier.badge-master {
     background-color: rgba(28, 220, 154, 0.15);
     color: var(--accent);
     border: 1px solid rgba(28, 220, 154, 0.4);
 }
 
-.badge-tier-daughter {
+.badge-tier-parent,
+.badge-tier.badge-parent {
+    background-color: rgba(61, 174, 233, 0.14);
+    color: var(--highlight);
+    border: 1px solid rgba(61, 174, 233, 0.4);
+}
+
+.badge-tier-daughter,
+.badge-tier.badge-daughter {
     background-color: rgba(189, 195, 199, 0.1);
     color: var(--text-muted);
     border: 1px solid var(--border);
 }
 
-/* Audit-log action badge — matches example/simply_ip_vault's `.badge-scope` treatment of its own
-   audit table's ACTION column. */
+/* Granted rights badge — matches simply_ip_sync. */
 .badge-scope {
-    background-color: rgba(61, 174, 233, 0.12);
-    color: var(--highlight);
-    border: 1px solid rgba(61, 174, 233, 0.3);
-    font-family: var(--font-mono);
+    background-color: rgba(28, 220, 154, 0.1);
+    color: var(--accent);
+    border: 1px solid rgba(28, 220, 154, 0.25);
     text-transform: none;
-    letter-spacing: normal;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
 }
 
 /* System settings key-value grid */
