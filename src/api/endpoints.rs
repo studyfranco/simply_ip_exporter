@@ -5,7 +5,9 @@
 use axum::{Extension, Json, extract::State, response::IntoResponse};
 use chrono::Utc;
 use rand::RngExt;
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
+use sea_orm::{
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QueryOrder,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -92,7 +94,9 @@ pub struct CreateEndpointPayload {
 
 fn validate_groups(raw: &str) -> Result<(), AppError> {
     if raw.split(',').map(str::trim).all(str::is_empty) {
-        return Err(AppError::InvalidInput("vault_groups must name at least one group".to_owned()));
+        return Err(AppError::InvalidInput(
+            "vault_groups must name at least one group".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -138,6 +142,9 @@ async fn validate_group_access(
 }
 
 /// `POST /api/endpoints` — creates a new public feed endpoint, owned by the caller.
+///
+/// # Errors
+/// Returns [`AppError`] if input validation, permission checks, or database insertion fail.
 pub async fn create_endpoint(
     State(state): State<AppState>,
     Extension(caller): Extension<api_key::Model>,
@@ -155,7 +162,9 @@ pub async fn create_endpoint(
     }
     let ttl_seconds = payload.ttl_seconds.unwrap_or(3600);
     if ttl_seconds <= 0 {
-        return Err(AppError::InvalidInput("ttl_seconds must be positive".to_owned()));
+        return Err(AppError::InvalidInput(
+            "ttl_seconds must be positive".to_owned(),
+        ));
     }
     let max_age_seconds = payload.max_age_seconds.unwrap_or(0);
     validate_max_age(max_age_seconds)?;
@@ -195,6 +204,9 @@ pub async fn create_endpoint(
 
 /// `GET /api/endpoints` — lists endpoints. Master sees every endpoint; a Daughter key sees only
 /// the ones it owns.
+///
+/// # Errors
+/// Returns [`AppError`] if querying the database fails.
 pub async fn list_endpoints(
     State(state): State<AppState>,
     Extension(caller): Extension<api_key::Model>,
@@ -211,7 +223,11 @@ pub async fn list_endpoints(
             .all(&state.db)
             .await?
     };
-    Ok(Json(rows.into_iter().map(EndpointResponse::from).collect::<Vec<_>>()))
+    Ok(Json(
+        rows.into_iter()
+            .map(EndpointResponse::from)
+            .collect::<Vec<_>>(),
+    ))
 }
 
 /// Payload for updating an endpoint. Ownership (`owner_key_id`) is reassignable by Master only,
@@ -232,6 +248,9 @@ pub struct UpdateEndpointPayload {
 }
 
 /// `PUT /api/endpoints/{id}` — updates an endpoint's configuration.
+///
+/// # Errors
+/// Returns [`AppError`] if the endpoint is missing, forbidden, invalid, or persistence fails.
 pub async fn update_endpoint(
     State(state): State<AppState>,
     Extension(caller): Extension<api_key::Model>,
@@ -239,7 +258,10 @@ pub async fn update_endpoint(
     StrictPath(id): StrictPath,
     StrictJson(payload): StrictJson<UpdateEndpointPayload>,
 ) -> Result<impl IntoResponse, AppError> {
-    let existing = Endpoint::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let existing = Endpoint::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
     if !may_manage(&caller, &existing) {
         return Err(AppError::Forbidden(
             "You do not have management rights over this endpoint".to_owned(),
@@ -257,7 +279,11 @@ pub async fn update_endpoint(
         changed.push("name");
     }
     if let Some(description) = payload.description {
-        active.description = Set(if description.trim().is_empty() { None } else { Some(description) });
+        active.description = Set(if description.trim().is_empty() {
+            None
+        } else {
+            Some(description)
+        });
         changed.push("description");
     }
     if let Some(vault_groups) = payload.vault_groups {
@@ -268,7 +294,9 @@ pub async fn update_endpoint(
     }
     if let Some(ttl_seconds) = payload.ttl_seconds {
         if ttl_seconds <= 0 {
-            return Err(AppError::InvalidInput("ttl_seconds must be positive".to_owned()));
+            return Err(AppError::InvalidInput(
+                "ttl_seconds must be positive".to_owned(),
+            ));
         }
         active.ttl_seconds = Set(ttl_seconds);
         changed.push("ttl_seconds");
@@ -283,7 +311,11 @@ pub async fn update_endpoint(
         if !trimmed.is_empty() {
             validate_bound_ips(trimmed).map_err(AppError::InvalidInput)?;
         }
-        active.bound_ips = Set(if trimmed.is_empty() { None } else { Some(trimmed.to_owned()) });
+        active.bound_ips = Set(if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        });
         changed.push("bound_ips");
     }
     if let Some(v) = payload.filter_rfc1918 {
@@ -308,7 +340,14 @@ pub async fn update_endpoint(
         client_ip.0,
         "ENDPOINT_UPDATE",
         Some(describe_resource("endpoint", updated.id, &updated.name)),
-        Some(format!("changed: {}", if changed.is_empty() { "(none)".to_owned() } else { changed.join(", ") })),
+        Some(format!(
+            "changed: {}",
+            if changed.is_empty() {
+                "(none)".to_owned()
+            } else {
+                changed.join(", ")
+            }
+        )),
     )
     .await?;
 
@@ -316,13 +355,19 @@ pub async fn update_endpoint(
 }
 
 /// `DELETE /api/endpoints/{id}` — removes an endpoint and evicts its in-memory cache.
+///
+/// # Errors
+/// Returns [`AppError`] if the endpoint is missing, forbidden, or deletion fails.
 pub async fn delete_endpoint(
     State(state): State<AppState>,
     Extension(caller): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
     StrictPath(id): StrictPath,
 ) -> Result<impl IntoResponse, AppError> {
-    let existing = Endpoint::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let existing = Endpoint::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
     if !may_manage(&caller, &existing) {
         return Err(AppError::Forbidden(
             "You do not have management rights over this endpoint".to_owned(),
@@ -345,13 +390,23 @@ pub async fn delete_endpoint(
     }
     state.ip_cache.evict(id).await;
 
-    create_audit_log(&state.db, &caller, client_ip.0, "ENDPOINT_DELETE", Some(target_resource), None)
-        .await?;
+    create_audit_log(
+        &state.db,
+        &caller,
+        client_ip.0,
+        "ENDPOINT_DELETE",
+        Some(target_resource),
+        None,
+    )
+    .await?;
 
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 /// `PUT /api/endpoints/{id}/owner` — reassigns ownership. Master only.
+///
+/// # Errors
+/// Returns [`AppError`] if the caller is not Master, owner or endpoint is missing, or update fails.
 pub async fn reassign_endpoint_owner(
     State(state): State<AppState>,
     Extension(caller): Extension<api_key::Model>,
@@ -360,20 +415,30 @@ pub async fn reassign_endpoint_owner(
     StrictJson(payload): StrictJson<ReassignOwnerPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     if !caller.is_master {
-        return Err(AppError::Forbidden("Only the Master key can reassign endpoint ownership".to_owned()));
+        return Err(AppError::Forbidden(
+            "Only the Master key can reassign endpoint ownership".to_owned(),
+        ));
     }
-    let existing = Endpoint::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let existing = Endpoint::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
 
-    if let Some(new_owner) = payload.owner_key_id {
-        crate::entities::prelude::ApiKey::find_by_id(new_owner)
-            .one(&state.db)
-            .await?
-            .ok_or(AppError::InvalidInput("owner_key_id does not name an existing key".to_owned()))?;
-    }
+    let Some(new_owner_id) = payload.owner_key_id else {
+        return Err(AppError::InvalidInput(
+            "owner_key_id must name an existing key; an ownerless endpoint is never served"
+                .to_owned(),
+        ));
+    };
+    crate::entities::prelude::ApiKey::find_by_id(new_owner_id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::InvalidInput(
+            "owner_key_id does not name an existing key".to_owned(),
+        ))?;
 
-    let new_owner_id = payload.owner_key_id;
     let mut active: endpoint::ActiveModel = existing.into();
-    active.owner_key_id = Set(new_owner_id);
+    active.owner_key_id = Set(Some(new_owner_id));
     active.updated_at = Set(Utc::now().naive_utc());
     let updated = active.update(&state.db).await?;
 
@@ -383,7 +448,7 @@ pub async fn reassign_endpoint_owner(
         client_ip.0,
         "ENDPOINT_OWNER_REASSIGN",
         Some(describe_resource("endpoint", updated.id, &updated.name)),
-        Some(format!("owner_key_id -> {}", new_owner_id.map_or_else(|| "(none)".to_owned(), |id| id.to_string()))),
+        Some(format!("owner_key_id -> {new_owner_id}")),
     )
     .await?;
 

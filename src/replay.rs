@@ -45,14 +45,19 @@ pub struct ReplayGuard {
 
 impl ReplayGuard {
     /// Builds a guard remembering signatures for `window_seconds`, clamped into a sane range.
+    #[must_use]
     pub fn new(window_seconds: i64) -> Self {
-        let window = Duration::from_secs(window_seconds.clamp(1, 3600) as u64);
+        let clamped = u64::try_from(window_seconds.clamp(1, 3600)).unwrap_or(600);
+        let window = Duration::from_secs(clamped);
         let prune_interval = window / PRUNE_INTERVAL_DIVISOR;
         let capacity_backoff = window / CAPACITY_BACKOFF_DIVISOR;
         let now = Instant::now();
         Self {
             seen: Mutex::new(HashMap::new()),
-            schedule: Mutex::new(PruneSchedule { next: now + prune_interval, next_capacity: now }),
+            schedule: Mutex::new(PruneSchedule {
+                next: now + prune_interval,
+                next_capacity: now,
+            }),
             window,
             prune_interval,
             capacity_backoff,
@@ -70,7 +75,10 @@ impl ReplayGuard {
             return false;
         };
 
-        let id = SignatureId { key_id, digest: digest.to_vec() };
+        let id = SignatureId {
+            key_id,
+            digest: digest.to_vec(),
+        };
         match seen.get(&id) {
             Some(expires_at) if *expires_at > now => false,
             _ => {
@@ -95,14 +103,19 @@ impl ReplayGuard {
 
     #[cfg(test)]
     fn tracked(&self) -> usize {
-        self.seen.lock().map(|seen| seen.len()).unwrap_or(0)
+        self.seen.lock().map_or(0, |seen| seen.len())
     }
 
     fn prune_if_due(&self, now: Instant) {
-        let over_capacity = self.seen.lock().is_ok_and(|seen| seen.len() >= MAX_TRACKED_SIGNATURES);
+        let over_capacity = self
+            .seen
+            .lock()
+            .is_ok_and(|seen| seen.len() >= MAX_TRACKED_SIGNATURES);
 
         {
-            let Ok(mut schedule) = self.schedule.lock() else { return };
+            let Ok(mut schedule) = self.schedule.lock() else {
+                return;
+            };
             let routine_due = now >= schedule.next;
             let capacity_due = over_capacity && now >= schedule.next_capacity;
             if !routine_due && !capacity_due {
@@ -114,7 +127,9 @@ impl ReplayGuard {
             }
         }
 
-        let Ok(mut seen) = self.seen.lock() else { return };
+        let Ok(mut seen) = self.seen.lock() else {
+            return;
+        };
         seen.retain(|_, expires_at| *expires_at > now);
 
         if seen.len() >= MAX_TRACKED_SIGNATURES {

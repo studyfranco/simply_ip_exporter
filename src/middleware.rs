@@ -28,10 +28,9 @@ pub struct ClientIp(pub std::net::IpAddr);
 
 /// Rejects a timestamp outside the anti-replay window, symmetrically in both directions.
 fn validate_timestamp(raw: &str, max_age_seconds: i64) -> Result<(), AppError> {
-    let presented: i64 = raw
-        .trim()
-        .parse()
-        .map_err(|_| AppError::Unauthorized(format!("{TIMESTAMP_HEADER} must be a Unix timestamp")))?;
+    let presented: i64 = raw.trim().parse().map_err(|_| {
+        AppError::Unauthorized(format!("{TIMESTAMP_HEADER} must be a Unix timestamp"))
+    })?;
 
     let skew = (chrono::Utc::now().timestamp() - presented).abs();
     if skew > max_age_seconds {
@@ -50,7 +49,9 @@ fn reject_signature(rejection: SignatureRejection, key_prefix: &str) -> AppError
         SignatureRejection::MalformedHex => {
             AppError::Unauthorized("Signature is not valid hexadecimal".to_owned())
         }
-        SignatureRejection::Mismatch => AppError::Unauthorized("Invalid request signature".to_owned()),
+        SignatureRejection::Mismatch => {
+            AppError::Unauthorized("Invalid request signature".to_owned())
+        }
         SignatureRejection::KeyUnusable => {
             tracing::error!(key = %key_prefix, "Stored signing secret is unusable as HMAC key material");
             AppError::Internal
@@ -63,12 +64,41 @@ fn recover_signing_secret(
     key_record: &crate::entities::api_key::Model,
 ) -> Result<String, AppError> {
     let stored = key_record.signing_secret.as_deref().ok_or_else(|| {
-        AppError::Unauthorized("This API key has no signing secret; rotate it to obtain one".to_owned())
+        AppError::Unauthorized(
+            "This API key has no signing secret; rotate it to obtain one".to_owned(),
+        )
     })?;
     state.cipher.open(stored).map_err(|e| {
         tracing::error!(key = %key_record.prefix, "Failed to decrypt a stored signing secret: {e}");
         AppError::Internal
     })
+}
+
+async fn read_bounded_body(
+    parts: &axum::http::request::Parts,
+    body: Body,
+) -> Result<axum::body::Bytes, AppError> {
+    if let Some(declared) = parts
+        .headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok())
+        && declared > MAX_SIGNED_BODY_BYTES
+    {
+        return Err(AppError::BodyRejected(
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            "Request body exceeds the maximum allowed size".to_owned(),
+        ));
+    }
+
+    axum::body::to_bytes(body, MAX_SIGNED_BODY_BYTES)
+        .await
+        .map_err(|_| {
+            AppError::BodyRejected(
+                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                "Request body exceeds the maximum allowed size".to_owned(),
+            )
+        })
 }
 
 /// Enforces API key authentication, `CANONICAL_V1` signing, single-use replay protection, and
@@ -78,6 +108,9 @@ fn recover_signing_secret(
 /// malformed one costs an unauthenticated caller nothing; `bound_ips` is checked only after the
 /// signature verifies, so a caller holding a leaked `X-API-Key` alone cannot use the 403-vs-401
 /// split to map a key's network binding.
+///
+/// # Errors
+/// Returns [`AppError`] if credentials, timestamp, body size, signature, replay check, or IP binding fail.
 pub async fn auth_middleware(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -96,20 +129,26 @@ pub async fn auth_middleware(
         .get(API_KEY_HEADER)
         .and_then(|h| h.to_str().ok())
         .ok_or_else(|| {
-            AppError::Unauthorized(format!("Missing credentials: provide an {API_KEY_HEADER} header"))
+            AppError::Unauthorized(format!(
+                "Missing credentials: provide an {API_KEY_HEADER} header"
+            ))
         })?;
 
     let timestamp_header = headers
         .get(TIMESTAMP_HEADER)
         .and_then(|h| h.to_str().ok())
-        .ok_or_else(|| AppError::Unauthorized(format!("A signed request must include {TIMESTAMP_HEADER}")))?
+        .ok_or_else(|| {
+            AppError::Unauthorized(format!("A signed request must include {TIMESTAMP_HEADER}"))
+        })?
         .to_owned();
     validate_timestamp(&timestamp_header, state.config.signature_max_age_seconds)?;
 
     let signature = headers
         .get(SIGNATURE_HEADER)
         .and_then(|h| h.to_str().ok())
-        .ok_or_else(|| AppError::Unauthorized(format!("A signed request must include {SIGNATURE_HEADER}")))?
+        .ok_or_else(|| {
+            AppError::Unauthorized(format!("A signed request must include {SIGNATURE_HEADER}"))
+        })?
         .to_owned();
 
     let mut hasher = Sha256::new();
@@ -123,46 +162,25 @@ pub async fn auth_middleware(
         .map_err(AppError::DbError)?
         .ok_or(AppError::Unauthorized("Invalid API Key".to_owned()))?;
 
-    state.master_pin.authenticate(&state.db, &mut key_record).await;
-
     let secret = recover_signing_secret(&state, &key_record)?;
 
     let (parts, body) = req.into_parts();
-
-    // A declared `Content-Length` over the limit is rejected as `413` before any of the body is
-    // read — the correct status for "this body is too large", which `to_bytes`'s own limit below
-    // cannot express (it has no way to distinguish "too large" from any other read failure, so it
-    // is mapped to a generic `400`). This only covers requests carrying the header; a chunked body
-    // with no `Content-Length` still falls through to that fallback.
-    if let Some(declared) = parts
-        .headers
-        .get(axum::http::header::CONTENT_LENGTH)
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.parse::<usize>().ok())
-        && declared > MAX_SIGNED_BODY_BYTES
-    {
-        return Err(AppError::BodyRejected(
-            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
-            "Request body exceeds the maximum allowed size".to_owned(),
-        ));
-    }
-
-    let bytes = axum::body::to_bytes(body, MAX_SIGNED_BODY_BYTES).await.map_err(|_| {
-        AppError::BodyRejected(
-            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
-            "Request body exceeds the maximum allowed size".to_owned(),
-        )
-    })?;
+    let bytes = read_bounded_body(&parts, body).await?;
 
     let original_uri = parts
         .extensions
         .get::<axum::extract::OriginalUri>()
-        .map(|o| &o.0)
-        .unwrap_or(&parts.uri);
-    let path_and_query =
-        original_uri.path_and_query().map(|pq| pq.as_str()).unwrap_or_else(|| original_uri.path());
-    let payload =
-        canonical_v1_payload(parts.method.as_str(), path_and_query, &timestamp_header, &bytes);
+        .map_or(&parts.uri, |o| &o.0);
+    let path_and_query = original_uri.path_and_query().map_or_else(
+        || original_uri.path(),
+        axum::http::uri::PathAndQuery::as_str,
+    );
+    let payload = canonical_v1_payload(
+        parts.method.as_str(),
+        path_and_query,
+        &timestamp_header,
+        &bytes,
+    );
 
     let digest = verify_signature(&secret, &payload, &signature)
         .map_err(|rejection| reject_signature(rejection, &key_record.prefix))?;
@@ -180,7 +198,8 @@ pub async fn auth_middleware(
         AppError::Internal
     })?;
 
-    let is_allowed = entries.is_empty() || bound_ips::is_allowed(&entries, client_ip, &state.dns_resolver).await;
+    let is_allowed =
+        entries.is_empty() || bound_ips::is_allowed(&entries, client_ip, &state.dns_resolver).await;
     if !is_allowed {
         tracing::warn!(
             key = %key_record.prefix,
@@ -189,6 +208,11 @@ pub async fn auth_middleware(
         );
         return Err(AppError::Forbidden("Client IP not allowed".to_owned()));
     }
+
+    state
+        .master_pin
+        .authenticate(&state.db, &mut key_record)
+        .await;
 
     let key_id = key_record.id;
     let mut req = Request::from_parts(parts, Body::from(bytes));

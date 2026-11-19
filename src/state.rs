@@ -42,8 +42,17 @@ pub struct AppState {
 
 impl AppState {
     /// Builds state around an existing database connection.
-    pub fn new(db: DatabaseConnection, config: Arc<RuntimeConfig>, cipher: Arc<SecretCipher>) -> Self {
-        let replay_guard = Arc::new(ReplayGuard::new(config.signature_max_age_seconds));
+    #[must_use]
+    pub fn new(
+        db: DatabaseConnection,
+        config: Arc<RuntimeConfig>,
+        cipher: Arc<SecretCipher>,
+    ) -> Self {
+        // Double the one-sided clock skew window (`±max_age`) so signatures dated in the future
+        // remain tracked across their full `[now - max_age, now + max_age]` validity span.
+        let replay_guard = Arc::new(ReplayGuard::new(
+            config.signature_max_age_seconds.saturating_mul(2),
+        ));
         let vault_client = VaultClient::from_config(&config).map(Arc::new);
         let dns_resolver = config.trusted_proxies.dns_resolver();
         Self {
@@ -60,6 +69,7 @@ impl AppState {
     }
 
     /// Builds state whose Master identity is fixed without a database lookup. Test-facing.
+    #[must_use]
     pub fn with_pinned_master(mut self, master_key_id: uuid::Uuid) -> Self {
         self.master_pin = Arc::new(MasterPin::pinned_to(master_key_id));
         self

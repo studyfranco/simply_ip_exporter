@@ -16,7 +16,9 @@ use uuid::Uuid;
 
 use crate::api::guards::require_master;
 use crate::api::support::{create_audit_log, describe_resource};
-use crate::entities::{api_key, prelude::ApiKey, prelude::VaultGroupPermission, vault_group_permission};
+use crate::entities::{
+    api_key, prelude::ApiKey, prelude::VaultGroupPermission, vault_group_permission,
+};
 use crate::error::AppError;
 use crate::extract::{StrictJson, StrictPath};
 use crate::middleware::ClientIp;
@@ -26,23 +28,36 @@ use crate::vault_client::VaultGroup as VaultClientGroup;
 /// `GET /api/vault-groups` — Master-only: lists every group Vault currently has (Vault-side
 /// restricted to what this crate's own configured Vault key can read), for the "grant a local key
 /// read access to a group" UI to pick from.
+///
+/// # Errors
+/// Returns [`AppError`] if the caller is not Master or Vault cannot be queried.
 pub async fn list_vault_groups(
     State(state): State<AppState>,
     Extension(caller): Extension<api_key::Model>,
 ) -> Result<impl IntoResponse, AppError> {
     require_master(&caller)?;
 
-    let client = state.vault_client.as_ref().ok_or(AppError::VaultNotConfigured)?;
+    let client = state
+        .vault_client
+        .as_ref()
+        .ok_or(AppError::VaultNotConfigured)?;
     let groups = match client.list_groups().await {
         Ok(groups) => groups,
-        Err(crate::vault_client::VaultError::Status(s)) if s == reqwest::StatusCode::FORBIDDEN => Vec::new(),
+        Err(crate::vault_client::VaultError::Status(s)) if s == reqwest::StatusCode::FORBIDDEN => {
+            Vec::new()
+        }
         Err(e) => {
             tracing::warn!("Could not list Vault groups: {e}");
             return Err(AppError::VaultUnreachable);
         }
     };
 
-    Ok(Json(groups.into_iter().map(VaultGroupResponse::from).collect::<Vec<_>>()))
+    Ok(Json(
+        groups
+            .into_iter()
+            .map(VaultGroupResponse::from)
+            .collect::<Vec<_>>(),
+    ))
 }
 
 #[derive(Serialize)]
@@ -53,7 +68,10 @@ struct VaultGroupResponse {
 
 impl From<VaultClientGroup> for VaultGroupResponse {
     fn from(g: VaultClientGroup) -> Self {
-        Self { id: g.id, name: g.name }
+        Self {
+            id: g.id,
+            name: g.name,
+        }
     }
 }
 
@@ -83,20 +101,30 @@ impl From<vault_group_permission::Model> for GroupGrantResponse {
 /// key; a Daughter may inspect only its own — the same self-or-Master shape `endpoints::may_manage`
 /// uses, needed here so a Daughter's own endpoint-creation form can show what it's allowed to use
 /// without requiring `can_manage_keys`.
+///
+/// # Errors
+/// Returns [`AppError`] if the caller may not inspect `id` or querying grants fails.
 pub async fn list_key_groups(
     State(state): State<AppState>,
     Extension(caller): Extension<api_key::Model>,
     StrictPath(id): StrictPath,
 ) -> Result<impl IntoResponse, AppError> {
     if !caller.is_master && caller.id != id {
-        return Err(AppError::Forbidden("You may only view your own group grants".to_owned()));
+        return Err(AppError::Forbidden(
+            "You may only view your own group grants".to_owned(),
+        ));
     }
 
     let grants = VaultGroupPermission::find()
         .filter(vault_group_permission::Column::ApiKeyId.eq(id))
         .all(&state.db)
         .await?;
-    Ok(Json(grants.into_iter().map(GroupGrantResponse::from).collect::<Vec<_>>()))
+    Ok(Json(
+        grants
+            .into_iter()
+            .map(GroupGrantResponse::from)
+            .collect::<Vec<_>>(),
+    ))
 }
 
 /// Payload for granting a key read access to a Vault group. Only the group's id is accepted —
@@ -112,6 +140,9 @@ pub struct GrantGroupPayload {
 /// `POST /api/keys/{id}/groups` — Master-only: grants the named local key read access to a Vault
 /// group. Idempotent: granting a group the key already has access to changes nothing and returns
 /// the existing grant, rather than a conflict — a repeat grant is not an error condition.
+///
+/// # Errors
+/// Returns [`AppError`] if the caller is not Master, target key/group is missing, or Vault/DB fails.
 pub async fn grant_key_group(
     State(state): State<AppState>,
     Extension(caller): Extension<api_key::Model>,
@@ -121,12 +152,20 @@ pub async fn grant_key_group(
 ) -> Result<impl IntoResponse, AppError> {
     require_master(&caller)?;
 
-    let target = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let target = ApiKey::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
 
-    let client = state.vault_client.as_ref().ok_or(AppError::VaultNotConfigured)?;
+    let client = state
+        .vault_client
+        .as_ref()
+        .ok_or(AppError::VaultNotConfigured)?;
     let groups = match client.list_groups().await {
         Ok(groups) => groups,
-        Err(crate::vault_client::VaultError::Status(s)) if s == reqwest::StatusCode::FORBIDDEN => Vec::new(),
+        Err(crate::vault_client::VaultError::Status(s)) if s == reqwest::StatusCode::FORBIDDEN => {
+            Vec::new()
+        }
         Err(e) => {
             tracing::warn!("Could not list Vault groups while granting access: {e}");
             return Err(AppError::VaultUnreachable);
@@ -162,7 +201,10 @@ pub async fn grant_key_group(
         client_ip.0,
         "KEY_GROUP_GRANT",
         Some(describe_resource("api_key", target.id, &target.name)),
-        Some(format!("granted read on Vault group {} ({})", group.name, group.id)),
+        Some(format!(
+            "granted read on Vault group {} ({})",
+            group.name, group.id
+        )),
     )
     .await?;
 
@@ -176,6 +218,9 @@ pub async fn grant_key_group(
 /// wraps a single-segment `Path<Uuid>`, and this is the one route in this crate with two path
 /// segments. The rejection is mapped to [`AppError::InvalidInput`] by hand here, the same
 /// normalization `StrictPath` itself does internally.
+///
+/// # Errors
+/// Returns [`AppError`] if the caller is not Master, path/grant is invalid, or deletion fails.
 pub async fn revoke_key_group(
     State(state): State<AppState>,
     Extension(caller): Extension<api_key::Model>,
@@ -187,15 +232,23 @@ pub async fn revoke_key_group(
 
     require_master(&caller)?;
 
-    let target = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
-    let grant = VaultGroupPermission::find_by_id(permission_id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let target = ApiKey::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let grant = VaultGroupPermission::find_by_id(permission_id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
     if grant.api_key_id != id {
         return Err(AppError::NotFound);
     }
 
     let group_name = grant.vault_group_name.clone();
     let group_id = grant.vault_group_id;
-    VaultGroupPermission::delete_by_id(permission_id).exec(&state.db).await?;
+    VaultGroupPermission::delete_by_id(permission_id)
+        .exec(&state.db)
+        .await?;
 
     create_audit_log(
         &state.db,
@@ -203,7 +256,9 @@ pub async fn revoke_key_group(
         client_ip.0,
         "KEY_GROUP_REVOKE",
         Some(describe_resource("api_key", target.id, &target.name)),
-        Some(format!("revoked read on Vault group {group_name} ({group_id})")),
+        Some(format!(
+            "revoked read on Vault group {group_name} ({group_id})"
+        )),
     )
     .await?;
 
@@ -214,6 +269,9 @@ pub async fn revoke_key_group(
 /// `endpoints::validate_group_access` checks a Daughter's `vault_groups` against. Matches by the
 /// grant's snapshotted name (see `entities::vault_group_permission`'s module doc comment for why
 /// grants aren't re-validated against a live Vault call on every use).
+///
+/// # Errors
+/// Returns [`AppError`] if querying `vault_group_permissions` fails.
 pub async fn granted_group_names(
     db: &sea_orm::DatabaseConnection,
     api_key_id: Uuid,

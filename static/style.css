@@ -11,6 +11,7 @@
     --bg-main: #232629;
     --bg-surface: #31363b;
     --bg-card: #31363b;
+    --bg-form: #383e45;
     --bg-input: #17191b;
     --text-main: #eff0f1;
     --text-muted: #bdc3c7;
@@ -53,6 +54,11 @@
     box-sizing: border-box;
     margin: 0;
     padding: 0;
+}
+
+html,
+body {
+    overflow-x: clip;
 }
 
 body {
@@ -176,11 +182,12 @@ body {
     width: 100vw;
     height: 100vh;
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     justify-content: center;
     background-color: var(--bg-main);
     z-index: 10000;
     padding: 1.5rem;
+    overflow-y: auto;
     transition: opacity var(--transition-slow), visibility var(--transition-slow);
 }
 
@@ -192,10 +199,11 @@ body {
 }
 
 .login-card {
-    background-color: var(--bg-card);
+    background-color: var(--bg-form);
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
     padding: 2.5rem 2rem;
+    margin: auto;
     width: 100%;
     max-width: 420px;
     box-shadow: var(--shadow-lg);
@@ -282,6 +290,7 @@ body {
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
     padding: 1.5rem;
+    min-width: 0;
     margin-bottom: 1.5rem;
     transition: border-color var(--transition-base);
 }
@@ -938,16 +947,16 @@ input[type='checkbox']:checked::after {
     gap: 0.5rem;
     flex: 1 1 auto;
     min-width: 0;
-    justify-content: flex-end;
-    padding: 0.6rem 0.75rem;
-    background-color: var(--bg-surface);
+    justify-content: flex-start;
+    padding: 0.75rem;
+    background-color: var(--bg-form);
     border: 1px solid var(--border);
     border-radius: var(--radius);
 }
 
 .filters .input-field {
     width: auto;
-    flex: 1 1 220px;
+    flex: 1 1 180px;
     min-width: 0;
 }
 
@@ -1163,10 +1172,7 @@ input[type='checkbox']:checked::after {
 
 .toast-container {
     position: fixed;
-    /* Cleared past .top-bar (2rem container padding + header + tab-nav), not the 1.5rem a page
-       with no fixed header could use — at 1.5rem a toast overlapped the identity badge and logout
-       button instead of appearing below them. */
-    top: 11rem;
+    top: 5.25rem;
     right: 1.5rem;
     z-index: 9999;
     display: flex;
@@ -1246,14 +1252,14 @@ input[type='checkbox']:checked::after {
 }
 
 #secret-reveal-modal .modal-card {
-    max-width: clamp(580px, 48vw, 860px);
+    max-width: clamp(720px, 54vw, 920px);
 }
 
 #create-key-modal .modal-card-form,
 #edit-key-modal .modal-card-form,
 #create-endpoint-modal .modal-card-form,
 #edit-endpoint-modal .modal-card-form {
-    max-width: clamp(620px, 56vw, 960px);
+    max-width: clamp(720px, 58vw, 960px);
 }
 
 .modal-card h3 {
@@ -1291,10 +1297,12 @@ input[type='checkbox']:checked::after {
     outline-offset: 2px;
 }
 
-/* A modal that holds a form (the reassignment dialog) scrolls inside the card on a short window
+/* A modal that holds a form (creation/edit/reassignment dialogs) uses #383e45 grey form
+   surface and widens to >= 720px on desktop, scrolling inside the card on a short window
    rather than overflowing the viewport. */
 .modal-card-form {
-    max-width: clamp(600px, 56vw, 960px);
+    background-color: var(--bg-form);
+    max-width: clamp(720px, 58vw, 960px);
     max-height: calc(100vh - 3rem);
     overflow-y: auto;
 }
@@ -1391,9 +1399,44 @@ input[type='checkbox']:checked::after {
         align-items: flex-start;
     }
 
+    .tab-nav {
+        flex-wrap: nowrap;
+        overflow-x: auto;
+        max-width: 100%;
+        scrollbar-width: none;
+    }
+
+    .tab-nav::-webkit-scrollbar {
+        display: none;
+    }
+
+    .tab-btn {
+        flex: 0 0 auto;
+        white-space: nowrap;
+        padding: 0.55rem 0.85rem;
+        font-size: 0.85rem;
+    }
+
     .card {
         padding: 1rem;
     }
+
+    .form-actions {
+        flex-direction: column;
+    }
+
+    .form-actions .btn {
+        width: 100%;
+    }
+}
+
+input[type="datetime-local"] {
+    color-scheme: dark;
+}
+
+input[type="datetime-local"]::-webkit-calendar-picker-indicator {
+    filter: invert(0.8);
+    cursor: pointer;
 }
 
 /* ─── Harmonized Audit Log Action Badges ─────────────────── */

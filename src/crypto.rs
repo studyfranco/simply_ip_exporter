@@ -15,6 +15,7 @@ use sha2::Sha256;
 pub const SIGNATURE_PREFIX: &str = "sha256=";
 
 /// Generates a fresh 32-byte HMAC signing secret, hex-encoded.
+#[must_use]
 pub fn generate_signing_secret() -> String {
     let bytes: [u8; 32] = rand::rng().random();
     hex::encode(bytes)
@@ -24,6 +25,7 @@ pub fn generate_signing_secret() -> String {
 ///
 /// `target` must include the query string when present, and `body` is used verbatim — never a
 /// re-serialized form — so the bytes verified are exactly the bytes sent.
+#[must_use]
 pub fn canonical_v1_payload(method: &str, target: &str, timestamp: &str, body: &[u8]) -> Vec<u8> {
     let mut message =
         Vec::with_capacity(method.len() + target.len() + timestamp.len() + body.len() + 3);
@@ -38,10 +40,14 @@ pub fn canonical_v1_payload(method: &str, target: &str, timestamp: &str, body: &
 }
 
 /// Computes the `X-Signature-256` header value (`sha256=<hex>`, prefix included) over a payload.
+#[must_use]
 pub fn compute_signature(secret: &str, payload: &[u8]) -> Option<String> {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).ok()?;
     mac.update(payload);
-    Some(format!("{SIGNATURE_PREFIX}{}", hex::encode(mac.finalize().into_bytes())))
+    Some(format!(
+        "{SIGNATURE_PREFIX}{}",
+        hex::encode(mac.finalize().into_bytes())
+    ))
 }
 
 /// Why a presented signature was refused.
@@ -61,6 +67,9 @@ pub enum SignatureRejection {
 ///
 /// Comparison goes through [`Mac::verify_slice`] (constant-time). Returns the raw decoded digest
 /// bytes on success, so [`crate::replay::ReplayGuard`] can key on canonical material.
+///
+/// # Errors
+/// Returns [`SignatureRejection`] if the prefix, hex encoding, HMAC key, or digest is invalid.
 pub fn verify_signature(
     secret: &str,
     payload: &[u8],
@@ -76,7 +85,8 @@ pub fn verify_signature(
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
         .map_err(|_| SignatureRejection::KeyUnusable)?;
     mac.update(payload);
-    mac.verify_slice(&provided_bytes).map_err(|_| SignatureRejection::Mismatch)?;
+    mac.verify_slice(&provided_bytes)
+        .map_err(|_| SignatureRejection::Mismatch)?;
 
     Ok(provided_bytes)
 }
@@ -140,6 +150,9 @@ impl std::fmt::Debug for SecretCipher {
 impl SecretCipher {
     /// Builds the cipher from `EXPORTER_ENCRYPTION_KEY`. A malformed key aborts startup rather
     /// than silently falling back to plaintext.
+    ///
+    /// # Errors
+    /// Returns [`CryptoError::InvalidKey`] if the configured key is not valid 64-hex material.
     pub fn from_env() -> Result<Self, CryptoError> {
         let configured = crate::config::get_secret_or_env(KEY_ENV_VAR);
         match configured {
@@ -149,6 +162,9 @@ impl SecretCipher {
     }
 
     /// Builds a cipher from a hex-encoded 32-byte key.
+    ///
+    /// # Errors
+    /// Returns [`CryptoError::InvalidKey`] if `hex_key` is not 32 decoded bytes.
     pub fn from_hex_key(hex_key: &str) -> Result<Self, CryptoError> {
         let bytes = hex::decode(hex_key).map_err(|_| CryptoError::InvalidKey)?;
         if bytes.len() != KEY_LEN {
@@ -159,11 +175,15 @@ impl SecretCipher {
     }
 
     /// Whether secrets are actually being encrypted.
+    #[must_use]
     pub fn is_encrypting(&self) -> bool {
         matches!(self, Self::Sealed(_))
     }
 
     /// Encodes a secret for storage.
+    ///
+    /// # Errors
+    /// Returns [`CryptoError::EncryptionFailed`] if AEAD encryption fails.
     pub fn seal(&self, plaintext: &str) -> Result<String, CryptoError> {
         match self {
             Self::Plaintext => Ok(format!("{PLAINTEXT_PREFIX}{}", hex::encode(plaintext))),
@@ -184,28 +204,35 @@ impl SecretCipher {
 
     /// Recovers a secret written by [`SecretCipher::seal`]. Plaintext rows remain readable
     /// regardless of the configured mode, so enabling encryption does not invalidate old rows.
+    ///
+    /// # Errors
+    /// Returns [`CryptoError`] if the envelope is malformed or authentication fails.
     pub fn open(&self, stored: &str) -> Result<String, CryptoError> {
         if let Some(encoded) = stored.strip_prefix(PLAINTEXT_PREFIX) {
             let bytes = hex::decode(encoded).map_err(|_| CryptoError::MalformedCiphertext)?;
             return String::from_utf8(bytes).map_err(|_| CryptoError::MalformedCiphertext);
         }
 
-        let body = stored.strip_prefix(SEALED_PREFIX).ok_or(CryptoError::MalformedCiphertext)?;
-        let (nonce_hex, ciphertext_hex) =
-            body.split_once('.').ok_or(CryptoError::MalformedCiphertext)?;
+        let body = stored
+            .strip_prefix(SEALED_PREFIX)
+            .ok_or(CryptoError::MalformedCiphertext)?;
+        let (nonce_hex, ciphertext_hex) = body
+            .split_once('.')
+            .ok_or(CryptoError::MalformedCiphertext)?;
 
         let nonce_bytes = hex::decode(nonce_hex).map_err(|_| CryptoError::MalformedCiphertext)?;
         if nonce_bytes.len() != NONCE_LEN {
             return Err(CryptoError::MalformedCiphertext);
         }
-        let ciphertext = hex::decode(ciphertext_hex).map_err(|_| CryptoError::MalformedCiphertext)?;
+        let ciphertext =
+            hex::decode(ciphertext_hex).map_err(|_| CryptoError::MalformedCiphertext)?;
 
         let Self::Sealed(cipher) = self else {
             return Err(CryptoError::DecryptionFailed);
         };
 
-        let nonce =
-            XNonce::try_from(nonce_bytes.as_slice()).map_err(|_| CryptoError::MalformedCiphertext)?;
+        let nonce = XNonce::try_from(nonce_bytes.as_slice())
+            .map_err(|_| CryptoError::MalformedCiphertext)?;
         let plaintext = cipher
             .decrypt(&nonce, ciphertext.as_ref())
             .map_err(|_| CryptoError::DecryptionFailed)?;
@@ -306,13 +333,19 @@ mod tests {
         )
         .expect("valid key");
         let sealed = writer.seal("s3cr3t").expect("seals");
-        assert!(matches!(other.open(&sealed), Err(CryptoError::DecryptionFailed)));
+        assert!(matches!(
+            other.open(&sealed),
+            Err(CryptoError::DecryptionFailed)
+        ));
     }
 
     #[test]
     fn a_malformed_key_aborts_rather_than_downgrading() {
         for bad in ["not-hex", "00ff", &"a".repeat(63)] {
-            assert!(matches!(SecretCipher::from_hex_key(bad), Err(CryptoError::InvalidKey)));
+            assert!(matches!(
+                SecretCipher::from_hex_key(bad),
+                Err(CryptoError::InvalidKey)
+            ));
         }
     }
 
@@ -320,7 +353,10 @@ mod tests {
     fn malformed_stored_values_are_rejected_as_malformed() {
         let cipher = SecretCipher::from_hex_key(TEST_KEY).expect("valid key");
         for malformed in ["", "garbage", "v1.xchacha20poly1305.nodot", "v1.plain.zz"] {
-            assert!(matches!(cipher.open(malformed), Err(CryptoError::MalformedCiphertext)));
+            assert!(matches!(
+                cipher.open(malformed),
+                Err(CryptoError::MalformedCiphertext)
+            ));
         }
     }
 }

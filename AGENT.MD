@@ -94,7 +94,7 @@ To protect the underlying storage hardware, **IP records are kept strictly in-me
 - **Backend:** Rust + Axum (0.8+) + Tokio (1.x).
 - **Default Port:** `3002` (`BIND_HOST` / `PORT`).
 - **Encryption Key:** `EXPORTER_ENCRYPTION_KEY` (XChaCha20-Poly1305, 64 hex characters).
-- **ORM (Configuration Only):** SeaORM (2.0+). Defaults to **SQLite** for configuration persistence. **Never write vendor-specific raw SQL queries.** Zero raw SQL for DML in `src/`.
+- **ORM (Configuration Only):** SeaORM (2.0+). Defaults to **SQLite** for configuration persistence. **100% SeaORM / zero raw SQL** in `src/` and `src/migration/` (no `execute_raw`, `execute_unprepared`, `Statement::from_*`, `query_*_raw`, `from_raw_sql`, or `Expr::cust`), with at most a single `"SELECT 1"` healthcheck exception in `src/db.rs` (currently zero raw SQL is needed at all). Variable-length, sealed-secret, `bound_ips`, and group-list columns use `.text()`, never `VARCHAR(255)`.
 - **IP Processing:** `ipnet` crate (`IpNet::aggregate`) for subnet merging and contiguous block consolidation.
 - **Frontend:** STRICTLY Vanilla JS, HTML5, and CSS3 embedded SPA. **NO external dependencies** (No React, Vue, Tailwind, Bootstrap, CDN links, or Axios).
 - **Quality & Safety:**
@@ -274,19 +274,24 @@ An endpoint's `owner_key_id` is a single, exclusive pointer, reassignable in two
 `SCHEMA.MD`/AGENT.MD historically describe this crate's configuration store as SQLite-exclusive in
 practice, but every query, migration, and transaction in `src/` is written to be portable regardless:
 
-- All mutations go through SeaORM's entity/query builders (`ActiveModel::update`,
-  `Entity::update_many().col_expr(...)`, `Entity::delete_by_id`) or `db.transaction`/explicit
-  `begin()`/`commit()` — never a hand-assembled, backend-specific SQL string. `tests/source_hygiene.rs`
-  enforces the "zero raw SQL outside `src/db.rs`/`src/migration/`" half of this mechanically.
-- The one place this crate previously used a non-portable check — `master.rs::pin_at_boot`'s
-  uniqueness-index lookup, via `sea_orm_migration::SchemaManager::has_index`, which answers
-  `BackendNotSupported` on PostgreSQL rather than correctly reporting the index — was replaced
-  2026-08-18 with `db::has_index`, a per-backend catalog query (`sqlite_master`/`pg_indexes`/
-  `information_schema.statistics`) ported from `simply_ip_vault`'s identical fix. See
-  `AGENT_NOTES.MD` (session 5) for the incident this addresses.
-- `src/migration/`'s DDL (`ColumnDef`/`Table`/`ForeignKey` builders, plus the one documented raw-SQL
-  exception for `api_keys.master_marker`'s `GENERATED ALWAYS AS` column, which has no SeaQuery
-  builder representation on any backend) uses no vendor-specific syntax either.
+- All queries, migrations, and transactions go through SeaORM's entity/query/schema builders (`ActiveModel::update`, `Entity::update_many().col_expr(...)`, `Entity::delete_by_id`, `SchemaManager::has_index`, `Table::alter().add_column(...)`) or `db.transaction`/`begin()`/`commit()` — never a hand-assembled, backend-specific SQL string. `tests/source_hygiene.rs` enforces zero raw SQL across `src/` and `src/migration/` (except at most a single `"SELECT 1"` healthcheck in `src/db.rs`, currently unused).
+- `src/db.rs::has_index` delegates directly to `sea_orm_migration::SchemaManager::has_index`, and SQLite session PRAGMAs plus close-time `PRAGMA optimize` are declared via `SqliteConnectOptions` (zero raw `PRAGMA` statements).
+- `src/migration/m20260811_115204_initial_schema.rs` adds `api_keys.master_marker` using `Table::alter().add_column(ColumnDef::new(...).integer().extra(...))` via `SchemaManager::alter_table` (zero `execute_raw`).
+
+---
+
+## 🎨 Dashboard UX & Frontend Standard
+
+All embedded SPA views in `static/{index.html,style.css,app.js}` adhere to the ecosystem-wide dark UI standard:
+
+1. **Header-Button-to-Modal Flow:** Every primary Add/Create action (`+ New Endpoint`, `+ Create API Key`) sits in the section header (`.list-header`) **above** its table/list and opens a widened modal popup (`>= 720px` on desktop) rather than rendering inline creation forms above tables.
+2. **Surface & Input Contrast:** Form and filter cards (`.modal-card-form`, `.filters`, `.login-card`) use the `#383e45` (`--bg-form`) grey surface paired with `#17191b` (`--bg-input`) black inputs and dark-themed controls (`color-scheme: dark`).
+3. **1-Line Ellipsis Secret Reveal:** Newly minted or rotated credentials render inside `#secret-reveal-modal` (widened `>= 720px` on desktop) using single-line truncated `.key-reveal-value` (`white-space: nowrap; overflow: hidden; text-overflow: ellipsis`) paired with explicit **Copy** buttons.
+4. **API Keys Table & Badges:**
+   - No `Parent` column in the Keys table (`Select | Name | Prefix | Tier | Global rights | Vault groups | Bound IPs | Actions`).
+   - Master's global-rights badge uses the red `.badge-scope-master` style (`rgba(231, 76, 60, 0.16)` / `#ff7b6b`).
+   - `Vault groups` carries clear tooltip/help text explaining it is a read-only Vault group scope controlling which Vault groups `/feed/v1/*` endpoints may pull from.
+5. **Audit Logs Uniform Layout:** Five filters (`action`, `client_ip`, `api_key`, `since`, `until`) plus Search/Clear inside the `#383e45` `.filters` bar above a fixed-layout 6-column table (`Timestamp | API Key | Client IP | Action | Target | Details`).
 
 ---
 

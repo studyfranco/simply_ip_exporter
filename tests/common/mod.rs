@@ -21,14 +21,22 @@ use uuid::Uuid;
 
 /// A migrated, isolated in-memory database.
 pub async fn setup_test_db() -> DatabaseConnection {
-    let db = Database::connect("sqlite::memory:").await.expect("in-memory sqlite is always available");
-    migration::Migrator::up(&db, None).await.expect("migrations apply to a fresh database");
+    let db = Database::connect("sqlite::memory:")
+        .await
+        .expect("in-memory sqlite is always available");
+    migration::Migrator::up(&db, None)
+        .await
+        .expect("migrations apply to a fresh database");
     db
 }
 
 /// Builds application state around a database handle, with plaintext secret storage.
 pub fn test_state(db: &DatabaseConnection) -> AppState {
-    AppState::new(db.clone(), Arc::new(RuntimeConfig::default()), Arc::new(SecretCipher::Plaintext))
+    AppState::new(
+        db.clone(),
+        Arc::new(RuntimeConfig::default()),
+        Arc::new(SecretCipher::Plaintext),
+    )
 }
 
 /// As [`test_state`], but with a `VaultClient` configured against `vault_base_url` — for tests
@@ -41,7 +49,11 @@ pub fn test_state_with_vault(db: &DatabaseConnection, vault_base_url: String) ->
         vault_signing_secret: Some("vault-signing-secret".to_owned()),
         ..RuntimeConfig::default()
     };
-    AppState::new(db.clone(), Arc::new(config), Arc::new(SecretCipher::Plaintext))
+    AppState::new(
+        db.clone(),
+        Arc::new(config),
+        Arc::new(SecretCipher::Plaintext),
+    )
 }
 
 /// A seeded key: its plaintext secret, signing secret, and database row.
@@ -52,7 +64,11 @@ pub struct SeededKey {
 }
 
 /// Inserts an API key directly (bypassing the API), returning its plaintext credentials.
-pub async fn insert_key(db: &DatabaseConnection, is_master: bool, can_manage_keys: bool) -> SeededKey {
+pub async fn insert_key(
+    db: &DatabaseConnection,
+    is_master: bool,
+    can_manage_keys: bool,
+) -> SeededKey {
     let plaintext_key = "k".repeat(32) + &Uuid::new_v4().simple().to_string();
     let signing_secret = "s".repeat(32) + &Uuid::new_v4().simple().to_string();
     let now = Utc::now().naive_utc();
@@ -72,7 +88,11 @@ pub async fn insert_key(db: &DatabaseConnection, is_master: bool, can_manage_key
         updated_at: Set(now),
     };
     let inserted = model.insert(db).await.expect("insert succeeds");
-    SeededKey { plaintext_key, signing_secret, model: inserted }
+    SeededKey {
+        plaintext_key,
+        signing_secret,
+        model: inserted,
+    }
 }
 
 /// Rebuilds a `SeededKey` around a different `X-API-Key`/signing-secret pair while keeping the
@@ -82,7 +102,11 @@ pub async fn insert_key(db: &DatabaseConnection, is_master: bool, can_manage_key
 /// off a `SeededKey`, never `model`, so cloning it here is safe even though the row's own
 /// `key_hash`/`signing_secret` columns have since changed.
 pub fn reseal_key(base: &SeededKey, plaintext_key: String, signing_secret: String) -> SeededKey {
-    SeededKey { plaintext_key, signing_secret, model: base.model.clone() }
+    SeededKey {
+        plaintext_key,
+        signing_secret,
+        model: base.model.clone(),
+    }
 }
 
 /// Directly inserts a `vault_group_permissions` row — the test-fixture equivalent of `insert_key`
@@ -118,7 +142,10 @@ fn sign(secret: &str, method: &str, target: &str, timestamp: &str, body: &[u8]) 
 
 /// Attaches a simulated TCP peer, required by the auth middleware's `ConnectInfo` extractor.
 pub fn with_connect_info(builder: axum::http::request::Builder) -> axum::http::request::Builder {
-    builder.extension(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 8080))))
+    builder.extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+        [127, 0, 0, 1],
+        8080,
+    ))))
 }
 
 /// Builds a `CANONICAL_V1`-signed request, stamped at the current time.
@@ -127,7 +154,13 @@ pub fn signed_request(method: &str, uri: &str, key: &SeededKey, body: &str) -> R
 }
 
 /// As [`signed_request`], with an explicit timestamp so replay/window behaviour is testable.
-pub fn signed_request_at(method: &str, uri: &str, key: &SeededKey, body: &str, timestamp: i64) -> Request<Body> {
+pub fn signed_request_at(
+    method: &str,
+    uri: &str,
+    key: &SeededKey,
+    body: &str,
+    timestamp: i64,
+) -> Request<Body> {
     let ts = timestamp.to_string();
     let signature = sign(&key.signing_secret, method, uri, &ts, body.as_bytes());
     with_connect_info(

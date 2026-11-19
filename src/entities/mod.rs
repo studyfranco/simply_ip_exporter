@@ -1,4 +1,4 @@
-//! SeaORM entity definitions mirroring the tables described in `SCHEMA.MD`.
+//! `SeaORM` entity definitions mirroring the tables described in `SCHEMA.MD`.
 //!
 //! Configuration only: `api_keys`, `endpoints`, and `audit_logs`. IP records never appear here —
 //! they are kept strictly in-memory, per `AGENT.MD`.

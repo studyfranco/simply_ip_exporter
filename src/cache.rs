@@ -60,6 +60,7 @@ pub struct IpCache {
 
 impl IpCache {
     /// Builds an empty cache.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -75,16 +76,33 @@ impl IpCache {
             if record.is_deleted {
                 continue;
             }
-            let Some(network) = parse_target_address(&record.target_address) else { continue };
+            let Some(network) = parse_target_address(&record.target_address) else {
+                continue;
+            };
             max_last_seen =
                 Some(max_last_seen.map_or(record.last_seen_at, |m| m.max(record.last_seen_at)));
             entry.records.insert(
                 record.target_address.clone(),
-                CachedRecord { network, last_seen_at: record.last_seen_at },
+                CachedRecord {
+                    network,
+                    last_seen_at: record.last_seen_at,
+                },
             );
         }
         entry.last_synced_at = max_last_seen;
         entry.last_full_sync_at = Some(tokio::time::Instant::now());
+    }
+
+    /// As [`apply_full`](Self::apply_full), for a sync that covered only a *subset* of the
+    /// endpoint's configured groups (some grants were revoked). The full-sync marker is cleared so
+    /// that, once the missing groups become authorized again, the very next cycle performs a full
+    /// resync instead of a differential one that would never fetch the restored groups' older
+    /// records.
+    pub async fn apply_full_partial(&self, endpoint_id: Uuid, records: &[VaultRecord]) {
+        self.apply_full(endpoint_id, records).await;
+        if let Some(entry) = self.inner.write().await.get_mut(&endpoint_id) {
+            entry.last_full_sync_at = None;
+        }
     }
 
     /// Merges a differential batch: upserts live records, removes soft-deleted ones.
@@ -99,10 +117,15 @@ impl IpCache {
                 entry.records.remove(&record.target_address);
                 continue;
             }
-            let Some(network) = parse_target_address(&record.target_address) else { continue };
+            let Some(network) = parse_target_address(&record.target_address) else {
+                continue;
+            };
             entry.records.insert(
                 record.target_address.clone(),
-                CachedRecord { network, last_seen_at: record.last_seen_at },
+                CachedRecord {
+                    network,
+                    last_seen_at: record.last_seen_at,
+                },
             );
         }
         entry.last_synced_at = max_last_seen;
@@ -110,7 +133,8 @@ impl IpCache {
 
     /// The networks currently cached for an endpoint, unaggregated and unfiltered.
     pub async fn snapshot(&self, endpoint_id: Uuid) -> Vec<IpNet> {
-        self.snapshot_within(endpoint_id, 0, chrono::Utc::now().naive_utc()).await
+        self.snapshot_within(endpoint_id, 0, chrono::Utc::now().naive_utc())
+            .await
     }
 
     /// As [`snapshot`](Self::snapshot), but dropping records older than an endpoint's
@@ -145,7 +169,9 @@ impl IpCache {
         now: NaiveDateTime,
     ) -> Vec<IpNet> {
         let guard = self.inner.read().await;
-        let Some(entry) = guard.get(&endpoint_id) else { return Vec::new() };
+        let Some(entry) = guard.get(&endpoint_id) else {
+            return Vec::new();
+        };
 
         if max_age_seconds <= 0 {
             return entry.records.values().map(|r| r.network).collect();
@@ -162,7 +188,11 @@ impl IpCache {
 
     /// The `since` cursor for the next differential sync.
     pub async fn last_synced_at(&self, endpoint_id: Uuid) -> Option<NaiveDateTime> {
-        self.inner.read().await.get(&endpoint_id).and_then(|e| e.last_synced_at)
+        self.inner
+            .read()
+            .await
+            .get(&endpoint_id)
+            .and_then(|e| e.last_synced_at)
     }
 
     /// Whether a full sync has never run, or ran more than `interval` ago.
@@ -210,7 +240,12 @@ mod tests {
     async fn diff_sync_upserts_and_removes_soft_deletes() {
         let cache = IpCache::new();
         let id = Uuid::new_v4();
-        cache.apply_diff(id, &[record("10.1.2.3/32", false), record("10.1.2.4/32", false)]).await;
+        cache
+            .apply_diff(
+                id,
+                &[record("10.1.2.3/32", false), record("10.1.2.4/32", false)],
+            )
+            .await;
         assert_eq!(cache.snapshot(id).await.len(), 2);
 
         cache.apply_diff(id, &[record("10.1.2.3/32", true)]).await;
@@ -228,12 +263,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_partial_full_sync_leaves_a_full_sync_due_for_when_grants_are_restored() {
+        let cache = IpCache::new();
+        let id = Uuid::new_v4();
+        cache.apply_full_partial(id, &[]).await;
+        assert!(
+            cache
+                .full_sync_due(id, std::time::Duration::from_hours(24))
+                .await
+        );
+    }
+
+    #[tokio::test]
     async fn full_sync_due_is_true_until_a_full_sync_has_run() {
         let cache = IpCache::new();
         let id = Uuid::new_v4();
-        assert!(cache.full_sync_due(id, std::time::Duration::from_secs(86_400)).await);
+        assert!(
+            cache
+                .full_sync_due(id, std::time::Duration::from_hours(24))
+                .await
+        );
         cache.apply_full(id, &[]).await;
-        assert!(!cache.full_sync_due(id, std::time::Duration::from_secs(86_400)).await);
+        assert!(
+            !cache
+                .full_sync_due(id, std::time::Duration::from_hours(24))
+                .await
+        );
     }
 
     // ── max_age_seconds retention window ──────────────────────────────────────
@@ -241,7 +296,11 @@ mod tests {
     /// A record with an explicit `last_seen_at`, so a test can place it precisely relative to a
     /// pinned "now" rather than depending on wall-clock timing.
     fn record_at(addr: &str, last_seen_at: NaiveDateTime) -> VaultRecord {
-        VaultRecord { target_address: addr.to_owned(), last_seen_at, is_deleted: false }
+        VaultRecord {
+            target_address: addr.to_owned(),
+            last_seen_at,
+            is_deleted: false,
+        }
     }
 
     fn at(s: &str) -> NaiveDateTime {
@@ -298,9 +357,15 @@ mod tests {
         let cache = IpCache::new();
         let id = Uuid::new_v4();
         let now = at("2026-08-26T12:00:00");
-        cache.apply_full(id, &[record_at("10.0.0.1/32", at("2026-08-26T11:59:00"))]).await;
+        cache
+            .apply_full(id, &[record_at("10.0.0.1/32", at("2026-08-26T11:59:00"))])
+            .await;
 
-        assert_eq!(cache.snapshot_within(id, 60, now).await.len(), 1, "exactly 60s old, window 60s");
+        assert_eq!(
+            cache.snapshot_within(id, 60, now).await.len(),
+            1,
+            "exactly 60s old, window 60s"
+        );
         assert!(
             cache.snapshot_within(id, 59, now).await.is_empty(),
             "one second past the window, it goes"
@@ -315,9 +380,14 @@ mod tests {
         let cache = IpCache::new();
         let id = Uuid::new_v4();
         let now = at("2026-08-26T12:00:00");
-        cache.apply_full(id, &[record_at("10.0.0.9/32", at("2026-08-26T11:00:00"))]).await;
+        cache
+            .apply_full(id, &[record_at("10.0.0.9/32", at("2026-08-26T11:00:00"))])
+            .await;
 
-        assert!(cache.snapshot_within(id, 60, now).await.is_empty(), "an hour old, 60s window");
+        assert!(
+            cache.snapshot_within(id, 60, now).await.is_empty(),
+            "an hour old, 60s window"
+        );
         assert_eq!(
             cache.snapshot_within(id, 7_200, now).await.len(),
             1,
@@ -332,7 +402,9 @@ mod tests {
         let cache = IpCache::new();
         let id = Uuid::new_v4();
         let now = at("2026-08-26T12:00:00");
-        cache.apply_full(id, &[record_at("10.0.0.1/32", at("2020-01-01T00:00:00"))]).await;
+        cache
+            .apply_full(id, &[record_at("10.0.0.1/32", at("2020-01-01T00:00:00"))])
+            .await;
 
         assert_eq!(cache.snapshot_within(id, -1, now).await.len(), 1);
     }
@@ -345,10 +417,17 @@ mod tests {
         let cache = IpCache::new();
         let id = Uuid::new_v4();
         let now = at("2026-08-26T12:00:00");
-        cache.apply_full(id, &[record_at("10.0.0.1/32", at("2026-08-26T10:00:00"))]).await;
-        assert!(cache.snapshot_within(id, 60, now).await.is_empty(), "2h old, outside a 60s window");
+        cache
+            .apply_full(id, &[record_at("10.0.0.1/32", at("2026-08-26T10:00:00"))])
+            .await;
+        assert!(
+            cache.snapshot_within(id, 60, now).await.is_empty(),
+            "2h old, outside a 60s window"
+        );
 
-        cache.apply_diff(id, &[record_at("10.0.0.1/32", at("2026-08-26T11:59:45"))]).await;
+        cache
+            .apply_diff(id, &[record_at("10.0.0.1/32", at("2026-08-26T11:59:45"))])
+            .await;
         assert_eq!(
             cache.snapshot_within(id, 60, now).await.len(),
             1,
@@ -358,8 +437,14 @@ mod tests {
 
     #[test]
     fn parses_bare_addresses_and_cidrs() {
-        assert_eq!(parse_target_address("192.168.1.1").unwrap().to_string(), "192.168.1.1/32");
-        assert_eq!(parse_target_address("192.168.1.0/24").unwrap().to_string(), "192.168.1.0/24");
+        assert_eq!(
+            parse_target_address("192.168.1.1").unwrap().to_string(),
+            "192.168.1.1/32"
+        );
+        assert_eq!(
+            parse_target_address("192.168.1.0/24").unwrap().to_string(),
+            "192.168.1.0/24"
+        );
         assert!(parse_target_address("not-an-ip").is_none());
     }
 
@@ -379,7 +464,7 @@ mod tests {
             target_address: addr.to_owned(),
             last_seen_at: NaiveDateTime::parse_from_str("2026-08-11T10:00:00", "%Y-%m-%dT%H:%M:%S")
                 .unwrap()
-                + chrono::Duration::minutes(minute as i64),
+                + chrono::Duration::minutes(i64::from(minute)),
             is_deleted: false,
         }
     }
@@ -404,9 +489,15 @@ mod tests {
                     match i % 10 {
                         0 => cache.evict(id).await,
                         n if n % 2 == 0 => {
-                            cache.apply_full(id, &[record_with_last_seen_at("10.0.0.1/32", i)]).await
+                            cache
+                                .apply_full(id, &[record_with_last_seen_at("10.0.0.1/32", i)])
+                                .await;
                         }
-                        _ => cache.apply_diff(id, &[record_with_last_seen_at("10.0.0.2/32", i)]).await,
+                        _ => {
+                            cache
+                                .apply_diff(id, &[record_with_last_seen_at("10.0.0.2/32", i)])
+                                .await;
+                        }
                     }
                 }
             });
@@ -419,7 +510,9 @@ mod tests {
                 for i in 0..200u32 {
                     let id = ids[((r * 200 + i) as usize) % ids.len()];
                     let _ = cache.snapshot(id).await;
-                    let _ = cache.full_sync_due(id, std::time::Duration::from_secs(1)).await;
+                    let _ = cache
+                        .full_sync_due(id, std::time::Duration::from_secs(1))
+                        .await;
                     let _ = cache.last_synced_at(id).await;
                 }
             });
@@ -431,13 +524,19 @@ mod tests {
             }
         })
         .await;
-        assert!(outcome.is_ok(), "concurrent cache access deadlocked: did not finish within 30s");
+        assert!(
+            outcome.is_ok(),
+            "concurrent cache access deadlocked: did not finish within 30s"
+        );
 
         // The cache must still be fully usable afterward — a poisoned or corrupted lock would
         // hang or panic here too.
         for id in &endpoint_ids {
             let snap = cache.snapshot(*id).await;
-            assert!(snap.len() <= 2, "each endpoint only ever received two distinct addresses");
+            assert!(
+                snap.len() <= 2,
+                "each endpoint only ever received two distinct addresses"
+            );
         }
     }
 
@@ -456,11 +555,16 @@ mod tests {
             let addr = format!("10.{}.{}.1/32", i / 256, i % 256);
             tasks.spawn(async move {
                 for _ in 0..50 {
-                    cache.apply_full(id, &[VaultRecord {
-                        target_address: addr.clone(),
-                        last_seen_at: chrono::Utc::now().naive_utc(),
-                        is_deleted: false,
-                    }]).await;
+                    cache
+                        .apply_full(
+                            id,
+                            &[VaultRecord {
+                                target_address: addr.clone(),
+                                last_seen_at: chrono::Utc::now().naive_utc(),
+                                is_deleted: false,
+                            }],
+                        )
+                        .await;
                 }
                 (id, addr)
             });
@@ -479,8 +583,16 @@ mod tests {
 
         for (id, addr) in outcome {
             let snap = cache.snapshot(id).await;
-            assert_eq!(snap.len(), 1, "endpoint {id} must hold exactly its own one address");
-            assert_eq!(snap[0].to_string(), addr, "endpoint {id} must not see another endpoint's write");
+            assert_eq!(
+                snap.len(),
+                1,
+                "endpoint {id} must hold exactly its own one address"
+            );
+            assert_eq!(
+                snap[0].to_string(),
+                addr,
+                "endpoint {id} must not see another endpoint's write"
+            );
         }
     }
 }

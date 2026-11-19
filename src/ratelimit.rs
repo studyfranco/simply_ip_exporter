@@ -47,9 +47,13 @@ impl Default for RateLimiter {
 
 impl RateLimiter {
     /// Builds an empty limiter.
+    #[must_use]
     pub fn new() -> Self {
         Self {
-            state: Mutex::new(Inner { next_allowed: HashMap::new(), order: Default::default() }),
+            state: Mutex::new(Inner {
+                next_allowed: HashMap::new(),
+                order: std::collections::VecDeque::default(),
+            }),
         }
     }
 
@@ -58,6 +62,9 @@ impl RateLimiter {
     /// Returns `Ok(())` when the request may proceed, or `Err(remaining)` with the time left in
     /// the throttle window otherwise. A poisoned lock fails open toward rejecting the request
     /// rather than bypassing the limiter.
+    ///
+    /// # Errors
+    /// Returns `Err(remaining)` when `ip` is still within its cooldown window or the internal lock is poisoned.
     pub fn check_and_record(&self, ip: IpAddr) -> Result<(), Duration> {
         let now = Instant::now();
         let Ok(mut inner) = self.state.lock() else {
@@ -74,7 +81,9 @@ impl RateLimiter {
             // Evict the oldest tracked entry to make room, rather than refusing to track (and
             // thereby exempting) the new caller.
             while inner.next_allowed.len() >= MAX_TRACKED_IPS {
-                let Some(oldest) = inner.order.pop_front() else { break };
+                let Some(oldest) = inner.order.pop_front() else {
+                    break;
+                };
                 inner.next_allowed.remove(&oldest);
             }
         }
@@ -90,12 +99,12 @@ impl RateLimiter {
 
     #[cfg(test)]
     fn tracked(&self) -> usize {
-        self.state.lock().map(|i| i.next_allowed.len()).unwrap_or(0)
+        self.state.lock().map_or(0, |i| i.next_allowed.len())
     }
 
     #[cfg(test)]
     fn order_len(&self) -> usize {
-        self.state.lock().map(|i| i.order.len()).unwrap_or(0)
+        self.state.lock().map_or(0, |i| i.order.len())
     }
 }
 
@@ -133,7 +142,7 @@ mod tests {
     fn tracked_ips_are_capped() {
         let limiter = RateLimiter::new();
         for n in 0..MAX_TRACKED_IPS + 50 {
-            let addr = IpAddr::V4(std::net::Ipv4Addr::from(n as u32 + 1));
+            let addr = IpAddr::V4(std::net::Ipv4Addr::from(u32::try_from(n).unwrap_or(0) + 1));
             let _ = limiter.check_and_record(addr);
         }
         assert!(limiter.tracked() <= MAX_TRACKED_IPS);
@@ -148,10 +157,21 @@ mod tests {
         let limiter = RateLimiter::new();
         for n in 0..50_000u32 {
             let addr = IpAddr::V4(std::net::Ipv4Addr::from(n));
-            assert!(limiter.check_and_record(addr).is_ok(), "a first-ever request from any IP is always allowed");
+            assert!(
+                limiter.check_and_record(addr).is_ok(),
+                "a first-ever request from any IP is always allowed"
+            );
         }
-        assert_eq!(limiter.tracked(), MAX_TRACKED_IPS, "the map must sit exactly at the ceiling");
-        assert_eq!(limiter.order_len(), MAX_TRACKED_IPS, "the eviction queue must not outgrow the map");
+        assert_eq!(
+            limiter.tracked(),
+            MAX_TRACKED_IPS,
+            "the map must sit exactly at the ceiling"
+        );
+        assert_eq!(
+            limiter.order_len(),
+            MAX_TRACKED_IPS,
+            "the eviction queue must not outgrow the map"
+        );
     }
 
     /// Eviction actually removes the *earliest-seen* addresses, not an arbitrary or empty set —
@@ -160,7 +180,8 @@ mod tests {
     #[test]
     fn eviction_forgets_the_oldest_ips_first_and_keeps_the_newest() {
         let limiter = RateLimiter::new();
-        for n in 0..MAX_TRACKED_IPS as u32 + 10 {
+        let max_u32 = u32::try_from(MAX_TRACKED_IPS).unwrap_or(10_000);
+        for n in 0..max_u32 + 10 {
             let addr = IpAddr::V4(std::net::Ipv4Addr::from(n));
             assert!(limiter.check_and_record(addr).is_ok());
         }
@@ -169,12 +190,18 @@ mod tests {
         // longer throttled — a fresh request from one succeeds exactly as if it were unseen.
         for n in 0..10u32 {
             let addr = IpAddr::V4(std::net::Ipv4Addr::from(n));
-            assert!(limiter.check_and_record(addr).is_ok(), "IP {n} should have been evicted");
+            assert!(
+                limiter.check_and_record(addr).is_ok(),
+                "IP {n} should have been evicted"
+            );
         }
 
         // The most recently inserted IP is still within its window and stays throttled.
-        let newest = IpAddr::V4(std::net::Ipv4Addr::from(MAX_TRACKED_IPS as u32 + 9));
-        assert!(limiter.check_and_record(newest).is_err(), "the newest IP must not have been evicted");
+        let newest = IpAddr::V4(std::net::Ipv4Addr::from(max_u32 + 9));
+        assert!(
+            limiter.check_and_record(newest).is_err(),
+            "the newest IP must not have been evicted"
+        );
     }
 
     /// The companion leak this rate limiter is *actually* exposed to in production is not a wide

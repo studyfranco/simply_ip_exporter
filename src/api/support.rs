@@ -11,12 +11,14 @@ use crate::error::AppError;
 
 /// Generates a fresh 32-byte random API key, hex-encoded (`sie_<64 hex>` when displayed with its
 /// prefix, but the returned value is the bare secret).
+#[must_use]
 pub fn generate_random_key() -> String {
     let bytes: [u8; 32] = rand::rng().random();
     hex::encode(bytes)
 }
 
 /// Hashes a plaintext API key with SHA-256 for storage/lookup.
+#[must_use]
 pub fn hash_key(key: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(key.as_bytes());
@@ -24,6 +26,7 @@ pub fn hash_key(key: &str) -> String {
 }
 
 /// Renders a stable `kind:id (name)` reference for an audit log's `target_resource`.
+#[must_use]
 pub fn describe_resource(kind: &str, id: Uuid, name: &str) -> String {
     format!("{kind}:{id} ({name})")
 }
@@ -44,6 +47,9 @@ pub fn describe_resource(kind: &str, id: Uuid, name: &str) -> String {
 /// reassignment) can pass the transaction handle directly — the audit entry then commits or rolls
 /// back atomically with the mutation it describes, rather than being a separate write that could
 /// succeed even if the transaction it was meant to describe did not.
+///
+/// # Errors
+/// Returns [`AppError`] if inserting the audit record fails.
 pub async fn create_audit_log<C: ConnectionTrait>(
     db: &C,
     key: &api_key::Model,
@@ -90,6 +96,9 @@ mod tests {
     #[test]
     fn describe_resource_renders_kind_id_and_name() {
         let id = Uuid::nil();
-        assert_eq!(describe_resource("api_key", id, "Daughter Key"), format!("api_key:{id} (Daughter Key)"));
+        assert_eq!(
+            describe_resource("api_key", id, "Daughter Key"),
+            format!("api_key:{id} (Daughter Key)")
+        );
     }
 }

@@ -52,11 +52,14 @@ static BOGONS: LazyLock<Vec<IpNet>> = LazyLock::new(|| nets(BOGON_LITERALS));
 
 /// Whether `candidate` falls (fully or partially) inside any of `excluded`.
 fn overlaps_any(candidate: &IpNet, excluded: &[IpNet]) -> bool {
-    excluded.iter().any(|ex| ex.contains(&candidate.network()) || candidate.contains(&ex.network()))
+    excluded
+        .iter()
+        .any(|ex| ex.contains(&candidate.network()) || candidate.contains(&ex.network()))
 }
 
 /// Applies the configured filters, then aggregates the survivors into the smallest equivalent set
 /// of CIDR blocks.
+#[must_use]
 pub fn filter_and_aggregate(
     networks: &[IpNet],
     filter_rfc1918: bool,
@@ -89,9 +92,21 @@ mod tests {
         // `nets()` parses leniently so a malformed literal can never panic at startup; this is what
         // actually catches a typo — a bad entry would otherwise just be silently absent from the
         // list, quietly weakening the filter it was meant to strengthen.
-        assert_eq!(RFC1918.len(), RFC1918_LITERALS.len(), "an RFC1918 literal failed to parse");
-        assert_eq!(LOOPBACK.len(), LOOPBACK_LITERALS.len(), "a loopback literal failed to parse");
-        assert_eq!(BOGONS.len(), BOGON_LITERALS.len(), "a bogon literal failed to parse");
+        assert_eq!(
+            RFC1918.len(),
+            RFC1918_LITERALS.len(),
+            "an RFC1918 literal failed to parse"
+        );
+        assert_eq!(
+            LOOPBACK.len(),
+            LOOPBACK_LITERALS.len(),
+            "a loopback literal failed to parse"
+        );
+        assert_eq!(
+            BOGONS.len(),
+            BOGON_LITERALS.len(),
+            "a bogon literal failed to parse"
+        );
     }
 
     #[test]
@@ -137,11 +152,18 @@ mod tests {
     #[test]
     fn filters_cgn_at_its_exact_boundaries() {
         let inside = vec![net("100.64.0.0/32"), net("100.127.255.255/32")];
-        assert_eq!(filter_and_aggregate(&inside, false, true, false), Vec::<IpNet>::new());
+        assert_eq!(
+            filter_and_aggregate(&inside, false, true, false),
+            Vec::<IpNet>::new()
+        );
 
         let outside = vec![net("100.63.255.255/32"), net("100.128.0.0/32")];
         let out = filter_and_aggregate(&outside, false, true, false);
-        assert_eq!(out.len(), 2, "addresses one step outside /10 on either edge must survive");
+        assert_eq!(
+            out.len(),
+            2,
+            "addresses one step outside /10 on either edge must survive"
+        );
     }
 
     /// Multicast (`224.0.0.0/4`): the well-known all-hosts address, the top of the range, and the
@@ -149,7 +171,10 @@ mod tests {
     #[test]
     fn filters_multicast_at_its_exact_boundaries() {
         let inside = vec![net("224.0.0.1/32"), net("239.255.255.255/32")];
-        assert_eq!(filter_and_aggregate(&inside, false, true, false), Vec::<IpNet>::new());
+        assert_eq!(
+            filter_and_aggregate(&inside, false, true, false),
+            Vec::<IpNet>::new()
+        );
 
         let outside = vec![net("223.255.255.255/32")];
         assert_eq!(filter_and_aggregate(&outside, false, true, false), outside);
@@ -159,19 +184,29 @@ mod tests {
     #[test]
     fn filters_apipa_at_its_exact_boundaries() {
         let inside = vec![net("169.254.0.0/32"), net("169.254.255.255/32")];
-        assert_eq!(filter_and_aggregate(&inside, false, true, false), Vec::<IpNet>::new());
+        assert_eq!(
+            filter_and_aggregate(&inside, false, true, false),
+            Vec::<IpNet>::new()
+        );
 
         let outside = vec![net("169.253.255.255/32"), net("169.255.0.0/32")];
         let out = filter_and_aggregate(&outside, false, true, false);
-        assert_eq!(out.len(), 2, "addresses one step outside /16 on either edge must survive");
+        assert_eq!(
+            out.len(),
+            2,
+            "addresses one step outside /16 on either edge must survive"
+        );
     }
 
     /// With every filter off, CGN/multicast/APIPA addresses pass straight through unfiltered —
     /// confirms the boundary tests above are exercising `filter_bogons`, not some other rejection.
     #[test]
     fn cgn_multicast_and_apipa_survive_when_no_filters_are_enabled() {
-        let networks =
-            vec![net("100.64.0.1/32"), net("224.0.0.1/32"), net("169.254.1.1/32")];
+        let networks = vec![
+            net("100.64.0.1/32"),
+            net("224.0.0.1/32"),
+            net("169.254.1.1/32"),
+        ];
         let out = filter_and_aggregate(&networks, false, false, false);
         assert_eq!(out.len(), 3);
     }
@@ -181,10 +216,10 @@ mod tests {
     #[test]
     fn filters_ipv6_link_local_ula_and_multicast_as_bogons() {
         let networks = vec![
-            net("fe80::1/128"),   // link-local
-            net("fc00::1/128"),   // unique local
-            net("ff02::1/128"),   // multicast
-            net("2001:db8::1/128"), // documentation range
+            net("fe80::1/128"),              // link-local
+            net("fc00::1/128"),              // unique local
+            net("ff02::1/128"),              // multicast
+            net("2001:db8::1/128"),          // documentation range
             net("2001:4860:4860::8888/128"), // a real public IPv6 address (Google DNS)
         ];
         let out = filter_and_aggregate(&networks, false, true, false);
@@ -193,7 +228,11 @@ mod tests {
 
     #[test]
     fn filters_ipv6_loopback_independently_of_ipv4_loopback() {
-        let networks = vec![net("::1/128"), net("127.0.0.1/32"), net("2001:4860:4860::8888/128")];
+        let networks = vec![
+            net("::1/128"),
+            net("127.0.0.1/32"),
+            net("2001:4860:4860::8888/128"),
+        ];
         let out = filter_and_aggregate(&networks, false, false, true);
         assert_eq!(out, vec![net("2001:4860:4860::8888/128")]);
     }
@@ -206,17 +245,17 @@ mod tests {
     #[test]
     fn mixed_ipv4_and_ipv6_feed_is_filtered_and_aggregated_independently() {
         let networks = vec![
-            net("10.0.0.0/24"),           // RFC1918 v4 — filtered
-            net("192.168.1.1/32"),        // RFC1918 v4 — filtered
-            net("2001:db8::1/128"),       // documentation v6 (bogon) — filtered
-            net("8.8.8.0/24"),            // public v4 — survives
-            net("8.8.8.1/32"),            // public v4, contained in the above — aggregates away
+            net("10.0.0.0/24"),              // RFC1918 v4 — filtered
+            net("192.168.1.1/32"),           // RFC1918 v4 — filtered
+            net("2001:db8::1/128"),          // documentation v6 (bogon) — filtered
+            net("8.8.8.0/24"),               // public v4 — survives
+            net("8.8.8.1/32"),               // public v4, contained in the above — aggregates away
             net("2001:4860:4860::8888/128"), // public v6 — survives
         ];
         let mut out = filter_and_aggregate(&networks, true, true, false);
-        out.sort_by_key(|n| n.to_string());
+        out.sort_by_key(ToString::to_string);
         let mut expected = vec![net("8.8.8.0/24"), net("2001:4860:4860::8888/128")];
-        expected.sort_by_key(|n| n.to_string());
+        expected.sort_by_key(ToString::to_string);
         assert_eq!(out, expected);
     }
 
@@ -225,9 +264,17 @@ mod tests {
     /// with a numerically similar textual representation, nor the reverse.
     #[test]
     fn mixed_family_aggregation_never_merges_across_families() {
-        let networks = vec![net("10.0.0.0/24"), net("2001:db8:1::/48"), net("2001:db8:2::/48")];
+        let networks = vec![
+            net("10.0.0.0/24"),
+            net("2001:db8:1::/48"),
+            net("2001:db8:2::/48"),
+        ];
         let out = filter_and_aggregate(&networks, false, false, false);
-        assert_eq!(out.len(), 3, "a v4 network and two non-contiguous v6 networks stay distinct");
+        assert_eq!(
+            out.len(),
+            3,
+            "a v4 network and two non-contiguous v6 networks stay distinct"
+        );
         assert!(out.contains(&net("10.0.0.0/24")));
     }
 
@@ -243,7 +290,10 @@ mod tests {
         // plenty of address space that is not CGN at all.
         let networks = vec![net("100.0.0.0/8")];
         let out = filter_and_aggregate(&networks, false, true, false);
-        assert!(out.is_empty(), "any overlap with a bogon range drops the whole candidate");
+        assert!(
+            out.is_empty(),
+            "any overlap with a bogon range drops the whole candidate"
+        );
     }
 
     #[test]
@@ -269,10 +319,10 @@ mod tests {
     #[test]
     fn filter_and_aggregate_with_all_filters_drops_bogons_rfc1918_and_loopback() {
         let networks = vec![
-            net("10.0.0.1/32"),   // RFC1918
-            net("127.0.0.1/32"),  // Loopback
+            net("10.0.0.1/32"),    // RFC1918
+            net("127.0.0.1/32"),   // Loopback
             net("169.254.1.1/32"), // Bogon
-            net("8.8.8.8/32"),    // Public
+            net("8.8.8.8/32"),     // Public
         ];
         let out = filter_and_aggregate(&networks, true, true, true);
         assert_eq!(out, vec![net("8.8.8.8/32")]);

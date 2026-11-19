@@ -19,7 +19,9 @@ pub(crate) fn require_master(caller: &api_key::Model) -> Result<(), AppError> {
     if caller.is_master {
         Ok(())
     } else {
-        Err(AppError::Forbidden("Only the Master key can manage API keys".to_owned()))
+        Err(AppError::Forbidden(
+            "Only the Master key can manage API keys".to_owned(),
+        ))
     }
 }
 
@@ -35,7 +37,9 @@ pub(crate) fn guard_master_delete_or_rotate(
     operation: &str,
 ) -> Result<(), AppError> {
     if target.is_master {
-        return Err(AppError::Forbidden(format!("The Master key cannot be {operation} through the API")));
+        return Err(AppError::Forbidden(format!(
+            "The Master key cannot be {operation} through the API"
+        )));
     }
     Ok(())
 }
@@ -99,12 +103,21 @@ mod tests {
 
     #[test]
     fn guard_master_update_allows_bound_ips_only_but_refuses_name_and_can_manage_keys() {
-        assert!(guard_master_update(&key(true), false, false).is_ok(), "no restricted field present must pass");
-        assert!(guard_master_update(&key(true), true, false).is_err(), "a present name must be refused");
+        assert!(
+            guard_master_update(&key(true), false, false).is_ok(),
+            "no restricted field present must pass"
+        );
+        assert!(
+            guard_master_update(&key(true), true, false).is_err(),
+            "a present name must be refused"
+        );
         assert!(
             guard_master_update(&key(true), false, true).is_err(),
             "a present can_manage_keys must be refused"
         );
-        assert!(guard_master_update(&key(false), true, true).is_ok(), "a Daughter key has no such restriction");
+        assert!(
+            guard_master_update(&key(false), true, true).is_ok(),
+            "a Daughter key has no such restriction"
+        );
     }
 }

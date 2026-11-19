@@ -3,6 +3,13 @@ name = "simply_ip_exporter"
 version = "0.1.0"
 edition = "2024"
 
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -2 }
+pedantic = { level = "warn", priority = -1 }
+
 [dependencies]
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }

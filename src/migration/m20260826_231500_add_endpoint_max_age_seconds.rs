@@ -6,7 +6,7 @@
 //! is `NOT NULL DEFAULT 0` rather than nullable: "unlimited" is a real, expressible value here, not
 //! an absence, and a `NULL` would force every read site to re-decide what missing means.
 //!
-//! Written with SeaORM's vendor-agnostic builder (`ColumnDef::big_integer`), not raw SQL, so the
+//! Written with `SeaORM`'s vendor-agnostic builder (`ColumnDef::big_integer`), not raw SQL, so the
 //! same migration applies on SQLite, PostgreSQL and MariaDB alike — `AGENT.MD`'s multi-database
 //! rule. `big_integer` (i64) rather than `integer` so a window can exceed the ~68-year i32 second
 //! ceiling without overflow arithmetic, and so it lines up with `chrono::Duration::seconds`, which
@@ -44,7 +44,10 @@ impl MigrationTrait for Migration {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
             .alter_table(
-                Table::alter().table(Endpoints::Table).drop_column(Endpoints::MaxAgeSeconds).to_owned(),
+                Table::alter()
+                    .table(Endpoints::Table)
+                    .drop_column(Endpoints::MaxAgeSeconds)
+                    .to_owned(),
             )
             .await
     }

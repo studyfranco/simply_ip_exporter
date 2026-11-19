@@ -81,6 +81,9 @@ pub struct CreateKeyPayload {
 }
 
 /// `POST /api/keys` — mints a new Daughter key, owned and parented by the caller.
+///
+/// # Errors
+/// Returns [`AppError`] if the caller is not Master, inputs fail validation, or persistence fails.
 pub async fn create_api_key(
     State(state): State<AppState>,
     Extension(caller): Extension<api_key::Model>,
@@ -139,6 +142,9 @@ pub async fn create_api_key(
 }
 
 /// `GET /api/keys` — lists every local API key.
+///
+/// # Errors
+/// Returns [`AppError`] if the caller is not Master or querying the database fails.
 pub async fn list_api_keys(
     State(state): State<AppState>,
     Extension(caller): Extension<api_key::Model>,
@@ -148,7 +154,9 @@ pub async fn list_api_keys(
         .order_by_desc(api_key::Column::CreatedAt)
         .all(&state.db)
         .await?;
-    Ok(Json(keys.into_iter().map(KeyResponse::from).collect::<Vec<_>>()))
+    Ok(Json(
+        keys.into_iter().map(KeyResponse::from).collect::<Vec<_>>(),
+    ))
 }
 
 /// Payload for updating a key. `is_master` cannot appear here by construction, and an unknown
@@ -162,6 +170,9 @@ pub struct UpdateKeyPayload {
 }
 
 /// `PUT /api/keys/{id}` — updates a key's name, `bound_ips`, or `can_manage_keys`.
+///
+/// # Errors
+/// Returns [`AppError`] if the caller is not Master, target key is missing/immutable, or validation fails.
 pub async fn update_api_key(
     State(state): State<AppState>,
     Extension(caller): Extension<api_key::Model>,
@@ -171,8 +182,15 @@ pub async fn update_api_key(
 ) -> Result<impl IntoResponse, AppError> {
     require_master(&caller)?;
 
-    let existing = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
-    guard_master_update(&existing, payload.name.is_some(), payload.can_manage_keys.is_some())?;
+    let existing = ApiKey::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    guard_master_update(
+        &existing,
+        payload.name.is_some(),
+        payload.can_manage_keys.is_some(),
+    )?;
 
     let mut active: api_key::ActiveModel = existing.into();
     let mut changed: Vec<&str> = Vec::new();
@@ -189,7 +207,11 @@ pub async fn update_api_key(
         if !trimmed.is_empty() {
             validate_bound_ips(trimmed).map_err(AppError::InvalidInput)?;
         }
-        active.bound_ips = Set(if trimmed.is_empty() { None } else { Some(trimmed.to_owned()) });
+        active.bound_ips = Set(if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        });
         changed.push("bound_ips");
     }
     if let Some(can_manage_keys) = payload.can_manage_keys {
@@ -206,7 +228,14 @@ pub async fn update_api_key(
         client_ip.0,
         "KEY_UPDATE",
         Some(describe_resource("api_key", updated.id, &updated.name)),
-        Some(format!("changed: {}", if changed.is_empty() { "(none)".to_owned() } else { changed.join(", ") })),
+        Some(format!(
+            "changed: {}",
+            if changed.is_empty() {
+                "(none)".to_owned()
+            } else {
+                changed.join(", ")
+            }
+        )),
     )
     .await?;
 
@@ -229,8 +258,11 @@ pub struct DeleteKeyQuery {
 /// Conflict` and a structured inventory of what it owns, so the caller knows what's blocking the
 /// delete without a second round-trip to discover it. With `reassign_to`, the reassignment and the
 /// delete happen inside one database transaction, isolated from concurrent readers/writers and
-/// expressed entirely through SeaORM's query builder (`Entity::update_many().col_expr(...)`) —
+/// expressed entirely through `SeaORM`'s query builder (`Entity::update_many().col_expr(...)`) —
 /// portable across SQLite, PostgreSQL, and MariaDB with no vendor-specific SQL.
+///
+/// # Errors
+/// Returns [`AppError`] if the caller is not Master, key is protected/missing, owned endpoints exist without `reassign_to`, or persistence fails.
 pub async fn delete_api_key(
     State(state): State<AppState>,
     Extension(caller): Extension<api_key::Model>,
@@ -240,11 +272,16 @@ pub async fn delete_api_key(
 ) -> Result<impl IntoResponse, AppError> {
     require_master(&caller)?;
 
-    let existing = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let existing = ApiKey::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
     guard_master_delete_or_rotate(&existing, "deleted")?;
 
     if query.reassign_to == Some(id) {
-        return Err(AppError::InvalidInput("reassign_to cannot name the key being deleted".to_owned()));
+        return Err(AppError::InvalidInput(
+            "reassign_to cannot name the key being deleted".to_owned(),
+        ));
     }
 
     // Captured before the row is gone, since the audit entry must describe what was deleted.
@@ -258,37 +295,48 @@ pub async fn delete_api_key(
     // when it was never committed, the same guarantee sqlx's own `Transaction` gives.
     let txn = state.db.begin().await?;
 
-    let owned_endpoints = Endpoint::find().filter(endpoint::Column::OwnerKeyId.eq(id)).all(&txn).await?;
+    let owned_endpoints = Endpoint::find()
+        .filter(endpoint::Column::OwnerKeyId.eq(id))
+        .all(&txn)
+        .await?;
 
-    let reassign_target = match query.reassign_to {
-        Some(target_id) => Some(
+    let reassign_target = if let Some(target_id) = query.reassign_to {
+        Some(
             ApiKey::find_by_id(target_id)
                 .one(&txn)
                 .await?
-                .ok_or_else(|| AppError::InvalidInput("reassign_to does not name an existing key".to_owned()))?,
-        ),
-        None => {
-            if !owned_endpoints.is_empty() {
-                let inventory: Vec<_> =
-                    owned_endpoints.iter().map(|e| json!({ "id": e.id, "name": e.name })).collect();
-                return Err(AppError::ConflictWithDetails {
-                    message: format!(
-                        "this key still owns {} endpoint(s); reassign or delete them first, or retry with \
-                         ?reassign_to=<key id>",
-                        owned_endpoints.len()
-                    ),
-                    details: json!({ "owned_endpoints": inventory }),
-                });
-            }
-            None
-        }
+                .ok_or_else(|| {
+                    AppError::InvalidInput("reassign_to does not name an existing key".to_owned())
+                })?,
+        )
+    } else if !owned_endpoints.is_empty() {
+        let inventory: Vec<_> = owned_endpoints
+            .iter()
+            .map(|e| json!({ "id": e.id, "name": e.name }))
+            .collect();
+        return Err(AppError::ConflictWithDetails {
+            message: format!(
+                "this key still owns {} endpoint(s); reassign or delete them first, or retry with \
+                 ?reassign_to=<key id>",
+                owned_endpoints.len()
+            ),
+            details: json!({ "owned_endpoints": inventory }),
+        });
+    } else {
+        None
     };
 
     if let Some(target) = &reassign_target {
         Endpoint::update_many()
             .filter(endpoint::Column::OwnerKeyId.eq(id))
-            .col_expr(endpoint::Column::OwnerKeyId, sea_orm::sea_query::Expr::value(target.id))
-            .col_expr(endpoint::Column::UpdatedAt, sea_orm::sea_query::Expr::value(now))
+            .col_expr(
+                endpoint::Column::OwnerKeyId,
+                sea_orm::sea_query::Expr::value(target.id),
+            )
+            .col_expr(
+                endpoint::Column::UpdatedAt,
+                sea_orm::sea_query::Expr::value(now),
+            )
             .exec(&txn)
             .await?;
     }
@@ -312,7 +360,15 @@ pub async fn delete_api_key(
             target.id
         )
     });
-    create_audit_log(&txn, &caller, client_ip.0, "KEY_DELETE", Some(target_resource), details).await?;
+    create_audit_log(
+        &txn,
+        &caller,
+        client_ip.0,
+        "KEY_DELETE",
+        Some(target_resource),
+        details,
+    )
+    .await?;
 
     txn.commit().await?;
 
@@ -320,6 +376,9 @@ pub async fn delete_api_key(
 }
 
 /// `POST /api/keys/{id}/rotate` — mints a fresh secret and signing secret for a key.
+///
+/// # Errors
+/// Returns [`AppError`] if the caller is not Master, target key is protected/missing, or update fails.
 pub async fn rotate_api_key(
     State(state): State<AppState>,
     Extension(caller): Extension<api_key::Model>,
@@ -328,7 +387,10 @@ pub async fn rotate_api_key(
 ) -> Result<impl IntoResponse, AppError> {
     require_master(&caller)?;
 
-    let existing = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let existing = ApiKey::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
     guard_master_delete_or_rotate(&existing, "rotated")?;
 
     let plaintext_key = generate_random_key();
@@ -354,7 +416,11 @@ pub async fn rotate_api_key(
     )
     .await?;
 
-    Ok(Json(MintedKeyResponse { key: updated.into(), api_key: plaintext_key, signing_secret }))
+    Ok(Json(MintedKeyResponse {
+        key: updated.into(),
+        api_key: plaintext_key,
+        signing_secret,
+    }))
 }
 
 /// Response after rotating only an API key's HMAC signing secret. Deliberately narrower than
@@ -384,6 +450,9 @@ pub struct RotateSigningSecretResponse {
 ///
 /// The previous signing secret stops working the instant this returns — the column is
 /// overwritten, not versioned — so callers must be updated in lockstep.
+///
+/// # Errors
+/// Returns [`AppError`] if the caller is not Master, target key is protected/missing, or update fails.
 pub async fn rotate_signing_secret(
     State(state): State<AppState>,
     Extension(caller): Extension<api_key::Model>,
@@ -392,7 +461,10 @@ pub async fn rotate_signing_secret(
 ) -> Result<impl IntoResponse, AppError> {
     require_master(&caller)?;
 
-    let existing = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let existing = ApiKey::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
     guard_master_delete_or_rotate(&existing, "rotated")?;
 
     let signing_secret = generate_signing_secret();
@@ -418,5 +490,9 @@ pub async fn rotate_signing_secret(
     )
     .await?;
 
-    Ok(Json(RotateSigningSecretResponse { id: updated.id, name, signing_secret }))
+    Ok(Json(RotateSigningSecretResponse {
+        id: updated.id,
+        name,
+        signing_secret,
+    }))
 }

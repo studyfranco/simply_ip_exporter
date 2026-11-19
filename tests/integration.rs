@@ -6,8 +6,8 @@ mod common;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use common::{
-    insert_key, setup_test_db, signed_request, signed_request_at, test_state, test_state_with_vault,
-    with_connect_info,
+    insert_key, setup_test_db, signed_request, signed_request_at, test_state,
+    test_state_with_vault, with_connect_info,
 };
 use simply_ip_exporter::create_app;
 use tower::ServiceExt;
@@ -15,7 +15,9 @@ use tower::ServiceExt;
 /// Boots a throwaway HTTP server on an OS-assigned loopback port that answers `GET /api/groups`
 /// with a fixed, unsigned JSON body — enough for `VaultClient::list_groups()` to parse, since this
 /// suite never verifies Vault's own auth (that's `simply_ip_vault`'s concern, not this crate's).
-async fn spawn_mock_vault_groups(groups: serde_json::Value) -> (String, tokio::task::JoinHandle<()>) {
+async fn spawn_mock_vault_groups(
+    groups: serde_json::Value,
+) -> (String, tokio::task::JoinHandle<()>) {
     use axum::{Router, routing::get};
 
     let app = Router::new().route(
@@ -25,20 +27,30 @@ async fn spawn_mock_vault_groups(groups: serde_json::Value) -> (String, tokio::t
             async move { axum::Json(groups) }
         }),
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback bind always succeeds");
-    let addr = listener.local_addr().expect("a bound listener has a local address");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("loopback bind always succeeds");
+    let addr = listener
+        .local_addr()
+        .expect("a bound listener has a local address");
     let handle = tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
     (format!("http://{addr}"), handle)
 }
 
-async fn spawn_mock_vault_status(status: axum::http::StatusCode) -> (String, tokio::task::JoinHandle<()>) {
+async fn spawn_mock_vault_status(
+    status: axum::http::StatusCode,
+) -> (String, tokio::task::JoinHandle<()>) {
     use axum::{Router, routing::get};
 
     let app = Router::new().route("/api/groups", get(move || async move { status }));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback bind always succeeds");
-    let addr = listener.local_addr().expect("a bound listener has a local address");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("loopback bind always succeeds");
+    let addr = listener
+        .local_addr()
+        .expect("a bound listener has a local address");
     let handle = tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
@@ -46,7 +58,9 @@ async fn spawn_mock_vault_status(status: axum::http::StatusCode) -> (String, tok
 }
 
 async fn body_json(response: axum::response::Response) -> serde_json::Value {
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("body reads");
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body reads");
     serde_json::from_slice(&bytes).expect("valid JSON")
 }
 
@@ -57,7 +71,11 @@ async fn health_check_is_200_without_a_database() {
     let app = create_app(state);
 
     let response = app
-        .oneshot(with_connect_info(Request::builder().uri("/health")).body(Body::empty()).unwrap())
+        .oneshot(
+            with_connect_info(Request::builder().uri("/health"))
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -74,17 +92,39 @@ async fn readiness_is_503_until_master_is_pinned_then_200() {
 
     let response = app
         .clone()
-        .oneshot(with_connect_info(Request::builder().uri("/ready")).body(Body::empty()).unwrap())
+        .oneshot(
+            with_connect_info(Request::builder().uri("/ready"))
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let not_ready_body = body_json(response).await;
+    assert_eq!(not_ready_body["status"], "not_ready");
+    assert!(
+        not_ready_body.get("master_pinned").is_none(),
+        "/ready must stay opaque"
+    );
+    assert!(
+        not_ready_body.get("database").is_none(),
+        "/ready must stay opaque"
+    );
 
     let key = insert_key(&db, true, true).await;
-    state.master_pin.pin_at_boot(&db).await.expect("pins the sole master");
+    state
+        .master_pin
+        .pin_at_boot(&db)
+        .await
+        .expect("pins the sole master");
     let _ = &key;
 
     let response = app
-        .oneshot(with_connect_info(Request::builder().uri("/ready")).body(Body::empty()).unwrap())
+        .oneshot(
+            with_connect_info(Request::builder().uri("/ready"))
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -98,14 +138,20 @@ async fn readiness_is_503_until_master_is_pinned_then_200() {
 /// `with_pinned_master` so a passing master check can't be mistaken for the reason this still 503s.
 #[tokio::test]
 async fn readiness_is_503_when_the_database_itself_is_broken_even_with_master_pinned() {
-    let db = sea_orm::Database::connect("sqlite::memory:").await.expect("in-memory sqlite is always available");
+    let db = sea_orm::Database::connect("sqlite::memory:")
+        .await
+        .expect("in-memory sqlite is always available");
     // Deliberately no `migration::Migrator::up(&db, ...)`: every table-touching query on this
     // connection fails, which is exactly the dependency this test needs severed.
     let state = test_state(&db).with_pinned_master(uuid::Uuid::new_v4());
     let app = create_app(state);
 
     let response = app
-        .oneshot(with_connect_info(Request::builder().uri("/ready")).body(Body::empty()).unwrap())
+        .oneshot(
+            with_connect_info(Request::builder().uri("/ready"))
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -122,7 +168,11 @@ async fn an_unsigned_request_to_the_admin_api_is_rejected() {
     let app = create_app(state);
 
     let response = app
-        .oneshot(with_connect_info(Request::builder().uri("/api/auth/me")).body(Body::empty()).unwrap())
+        .oneshot(
+            with_connect_info(Request::builder().uri("/api/auth/me"))
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -135,8 +185,10 @@ async fn a_correctly_signed_request_authenticates_and_reports_identity() {
     let state = test_state(&db).with_pinned_master(key.model.id);
     let app = create_app(state);
 
-    let response =
-        app.oneshot(signed_request("GET", "/api/auth/me", &key, "")).await.unwrap();
+    let response = app
+        .oneshot(signed_request("GET", "/api/auth/me", &key, ""))
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let json = body_json(response).await;
     assert_eq!(json["is_master"], true);
@@ -153,8 +205,14 @@ async fn a_replayed_signature_is_rejected_on_second_use() {
     let first = signed_request_at("GET", "/api/auth/me", &key, "", timestamp);
     let second = signed_request_at("GET", "/api/auth/me", &key, "", timestamp);
 
-    assert_eq!(app.clone().oneshot(first).await.unwrap().status(), StatusCode::OK);
-    assert_eq!(app.oneshot(second).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        app.clone().oneshot(first).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        app.oneshot(second).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
 }
 
 #[tokio::test]
@@ -164,8 +222,17 @@ async fn a_stale_timestamp_is_rejected() {
     let state = test_state(&db).with_pinned_master(key.model.id);
     let app = create_app(state);
 
-    let stale = chrono::Utc::now().timestamp() - 3600;
-    let response = app.oneshot(signed_request_at("GET", "/api/auth/me", &key, "", stale)).await.unwrap();
+    let expired_ts = chrono::Utc::now().timestamp() - 3600;
+    let response = app
+        .oneshot(signed_request_at(
+            "GET",
+            "/api/auth/me",
+            &key,
+            "",
+            expired_ts,
+        ))
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -283,13 +350,28 @@ async fn feed_aggregates_filters_etags_and_rate_limits() {
 
     let first = app
         .clone()
-        .oneshot(with_connect_info(Request::builder().uri(uri.as_str())).body(Body::empty()).unwrap())
+        .oneshot(
+            with_connect_info(Request::builder().uri(uri.as_str()))
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(first.status(), StatusCode::OK);
-    assert_eq!(first.headers().get("content-type").unwrap(), "text/plain; charset=utf-8");
-    let etag = first.headers().get("etag").unwrap().to_str().unwrap().to_owned();
-    let bytes = axum::body::to_bytes(first.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        first.headers().get("content-type").unwrap(),
+        "text/plain; charset=utf-8"
+    );
+    let etag = first
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let bytes = axum::body::to_bytes(first.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let text = String::from_utf8(bytes.to_vec()).unwrap();
     // The RFC 1918 address is filtered out; only the public one survives.
     assert_eq!(text.trim(), "203.0.113.5/32");
@@ -297,23 +379,32 @@ async fn feed_aggregates_filters_etags_and_rate_limits() {
     // Second request from the same IP, with no conditional header, is rate-limited.
     let throttled = app
         .clone()
-        .oneshot(with_connect_info(Request::builder().uri(uri.as_str())).body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
-
-    // A matching If-None-Match from that SAME throttled IP still gets 304, not 429: a conditional
-    // revalidation the caller already has an up-to-date copy for is free and bypasses the limiter.
-    let revalidate = app
-        .clone()
         .oneshot(
-            with_connect_info(Request::builder().uri(uri.as_str()).header("If-None-Match", &etag))
+            with_connect_info(Request::builder().uri(uri.as_str()))
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(revalidate.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // A conditional request from that SAME already-throttled IP is ALSO rejected with 429
+    // because the per-IP rate limiter runs before SQLite lookup / ETag calculation to prevent
+    // unauthenticated token brute-force and DB/DNS floods.
+    let revalidate = app
+        .clone()
+        .oneshot(
+            with_connect_info(
+                Request::builder()
+                    .uri(uri.as_str())
+                    .header("If-None-Match", &etag),
+            )
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(revalidate.status(), StatusCode::TOO_MANY_REQUESTS);
 
     // A fresh source IP is unaffected by the other IP's throttle, and honours If-None-Match.
     let conditional = app
@@ -321,7 +412,10 @@ async fn feed_aggregates_filters_etags_and_rate_limits() {
             Request::builder()
                 .uri(uri.as_str())
                 .header("If-None-Match", etag)
-                .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from(([10, 0, 0, 9], 9000))))
+                .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                    [10, 0, 0, 9],
+                    9000,
+                ))))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -353,7 +447,10 @@ async fn feed_enforces_bound_ips() {
         .oneshot(
             Request::builder()
                 .uri(format!("/feed/v1/{token}/list.txt"))
-                .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from(([1, 2, 3, 4], 9000))))
+                .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                    [1, 2, 3, 4],
+                    9000,
+                ))))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -388,7 +485,10 @@ async fn feed_enforces_a_hostname_bound_ips_entry() {
         .oneshot(
             Request::builder()
                 .uri(format!("/feed/v1/{token}/list.txt"))
-                .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from(([9, 9, 9, 9], 9000))))
+                .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                    [9, 9, 9, 9],
+                    9000,
+                ))))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -401,7 +501,10 @@ async fn feed_enforces_a_hostname_bound_ips_entry() {
         .oneshot(
             Request::builder()
                 .uri(format!("/feed/v1/{token}/list.txt"))
-                .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 9000))))
+                .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                    [127, 0, 0, 1],
+                    9000,
+                ))))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -482,7 +585,10 @@ async fn an_unknown_feed_token_is_404() {
 
 /// Fetches the full, unfiltered audit log as Master and returns it as a JSON array.
 async fn fetch_audit_logs(app: axum::Router, master: &common::SeededKey) -> Vec<serde_json::Value> {
-    let response = app.oneshot(signed_request("GET", "/api/audit-logs", master, "")).await.unwrap();
+    let response = app
+        .oneshot(signed_request("GET", "/api/audit-logs", master, ""))
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     body_json(response).await.as_array().unwrap().clone()
 }
@@ -496,7 +602,12 @@ async fn creating_an_api_key_writes_an_audit_log_entry() {
 
     let create = app
         .clone()
-        .oneshot(signed_request("POST", "/api/keys", &master, r#"{"name":"Audited Key"}"#))
+        .oneshot(signed_request(
+            "POST",
+            "/api/keys",
+            &master,
+            r#"{"name":"Audited Key"}"#,
+        ))
         .await
         .unwrap();
     assert_eq!(create.status(), StatusCode::OK);
@@ -504,9 +615,17 @@ async fn creating_an_api_key_writes_an_audit_log_entry() {
     let key_id = created["id"].as_str().unwrap();
 
     let logs = fetch_audit_logs(app, &master).await;
-    let entry = logs.iter().find(|l| l["action"] == "KEY_CREATE").expect("a KEY_CREATE entry exists");
+    let entry = logs
+        .iter()
+        .find(|l| l["action"] == "KEY_CREATE")
+        .expect("a KEY_CREATE entry exists");
     assert!(entry["target_resource"].as_str().unwrap().contains(key_id));
-    assert!(entry["target_resource"].as_str().unwrap().contains("Audited Key"));
+    assert!(
+        entry["target_resource"]
+            .as_str()
+            .unwrap()
+            .contains("Audited Key")
+    );
     assert_eq!(entry["api_key_name"], master.model.name);
     assert_eq!(entry["api_key_prefix"], master.model.prefix);
     assert!(!entry["client_ip"].as_str().unwrap().is_empty());
@@ -521,7 +640,12 @@ async fn key_update_rotate_and_delete_each_write_their_own_audit_entry() {
 
     let create = app
         .clone()
-        .oneshot(signed_request("POST", "/api/keys", &master, r#"{"name":"Lifecycle Key"}"#))
+        .oneshot(signed_request(
+            "POST",
+            "/api/keys",
+            &master,
+            r#"{"name":"Lifecycle Key"}"#,
+        ))
         .await
         .unwrap();
     let key_id = body_json(create).await["id"].as_str().unwrap().to_owned();
@@ -540,14 +664,24 @@ async fn key_update_rotate_and_delete_each_write_their_own_audit_entry() {
 
     let rotate = app
         .clone()
-        .oneshot(signed_request("POST", &format!("/api/keys/{key_id}/rotate"), &master, ""))
+        .oneshot(signed_request(
+            "POST",
+            &format!("/api/keys/{key_id}/rotate"),
+            &master,
+            "",
+        ))
         .await
         .unwrap();
     assert_eq!(rotate.status(), StatusCode::OK);
 
     let delete = app
         .clone()
-        .oneshot(signed_request("DELETE", &format!("/api/keys/{key_id}"), &master, ""))
+        .oneshot(signed_request(
+            "DELETE",
+            &format!("/api/keys/{key_id}"),
+            &master,
+            "",
+        ))
         .await
         .unwrap();
     assert_eq!(delete.status(), StatusCode::NO_CONTENT);
@@ -556,7 +690,9 @@ async fn key_update_rotate_and_delete_each_write_their_own_audit_entry() {
     for expected_action in ["KEY_CREATE", "KEY_UPDATE", "KEY_ROTATE", "KEY_DELETE"] {
         assert!(
             logs.iter().any(|l| l["action"] == expected_action
-                && l["target_resource"].as_str().is_some_and(|t| t.contains(&key_id))),
+                && l["target_resource"]
+                    .as_str()
+                    .is_some_and(|t| t.contains(&key_id))),
             "expected an audit entry for {expected_action} against key {key_id}, got: {logs:#?}"
         );
     }
@@ -594,39 +730,74 @@ async fn rotating_the_signing_secret_alone_leaves_the_api_key_and_scopes_unchang
     let old_seeded = common::reseal_key(&master, api_key.clone(), old_secret.clone());
 
     // The pre-rotation credentials work right after minting.
-    let pre = app.clone().oneshot(signed_request("GET", "/api/auth/me", &old_seeded, "")).await.unwrap();
+    let pre = app
+        .clone()
+        .oneshot(signed_request("GET", "/api/auth/me", &old_seeded, ""))
+        .await
+        .unwrap();
     assert_eq!(pre.status(), StatusCode::OK);
 
     let rotate = app
         .clone()
-        .oneshot(signed_request("POST", &format!("/api/keys/{key_id}/rotate-secret"), &master, ""))
+        .oneshot(signed_request(
+            "POST",
+            &format!("/api/keys/{key_id}/rotate-secret"),
+            &master,
+            "",
+        ))
         .await
         .unwrap();
     assert_eq!(rotate.status(), StatusCode::OK);
     let rotated = body_json(rotate).await;
     assert_eq!(rotated["id"], key_id, "the id must be unchanged");
-    assert_eq!(rotated["name"], "Rotatable Key", "the name must be unchanged");
-    assert!(rotated.get("api_key").is_none(), "the response must not carry an api_key field — it never changes");
+    assert_eq!(
+        rotated["name"], "Rotatable Key",
+        "the name must be unchanged"
+    );
+    assert!(
+        rotated.get("api_key").is_none(),
+        "the response must not carry an api_key field — it never changes"
+    );
     let new_secret = rotated["signing_secret"].as_str().unwrap().to_owned();
-    assert_ne!(new_secret, old_secret, "a real rotation must actually produce a different secret");
+    assert_ne!(
+        new_secret, old_secret,
+        "a real rotation must actually produce a different secret"
+    );
 
     // The OLD signing secret no longer authenticates...
-    let stale = app.clone().oneshot(signed_request("GET", "/api/auth/me", &old_seeded, "")).await.unwrap();
-    assert_eq!(stale.status(), StatusCode::UNAUTHORIZED, "the pre-rotation signing secret must stop working");
+    let revoked_resp = app
+        .clone()
+        .oneshot(signed_request("GET", "/api/auth/me", &old_seeded, ""))
+        .await
+        .unwrap();
+    assert_eq!(
+        revoked_resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "the pre-rotation signing secret must stop working"
+    );
 
     // ...but the SAME X-API-Key, now paired with the NEW secret, does — proving the key itself
     // was never touched, only the signing half of the credential.
     let new_seeded = common::reseal_key(&master, api_key, new_secret);
-    let fresh = app.clone().oneshot(signed_request("GET", "/api/auth/me", &new_seeded, "")).await.unwrap();
+    let fresh = app
+        .clone()
+        .oneshot(signed_request("GET", "/api/auth/me", &new_seeded, ""))
+        .await
+        .unwrap();
     assert_eq!(fresh.status(), StatusCode::OK);
     let identity = body_json(fresh).await;
     assert_eq!(identity["name"], "Rotatable Key");
-    assert_eq!(identity["can_manage_keys"], true, "can_manage_keys must survive a secret-only rotation");
+    assert_eq!(
+        identity["can_manage_keys"], true,
+        "can_manage_keys must survive a secret-only rotation"
+    );
 
     let logs = fetch_audit_logs(app, &master).await;
     assert!(
         logs.iter().any(|l| l["action"] == "KEY_SECRET_ROTATE"
-            && l["target_resource"].as_str().is_some_and(|t| t.contains(&key_id))),
+            && l["target_resource"]
+                .as_str()
+                .is_some_and(|t| t.contains(&key_id))),
         "expected a KEY_SECRET_ROTATE audit entry for key {key_id}, got: {logs:#?}"
     );
 }
@@ -675,7 +846,9 @@ async fn a_daughter_cannot_name_an_ungranted_group_in_a_new_endpoint() {
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     let body = body_json(response).await;
     assert!(
-        body["error"].as_str().is_some_and(|s| s.contains("fail2ban")),
+        body["error"]
+            .as_str()
+            .is_some_and(|s| s.contains("fail2ban")),
         "the error should name the ungranted group: {body:?}"
     );
 }
@@ -699,7 +872,11 @@ async fn a_daughter_can_use_a_group_once_granted_but_not_others() {
         ))
         .await
         .unwrap();
-    assert_eq!(granted.status(), StatusCode::OK, "the granted group must be accepted");
+    assert_eq!(
+        granted.status(),
+        StatusCode::OK,
+        "the granted group must be accepted"
+    );
 
     // Naming a second, ungranted group alongside the granted one is refused in full — a partial
     // grant is not a partial pass.
@@ -714,9 +891,14 @@ async fn a_daughter_can_use_a_group_once_granted_but_not_others() {
         .unwrap();
     assert_eq!(mixed.status(), StatusCode::FORBIDDEN);
     let body = body_json(mixed).await;
-    assert!(body["error"].as_str().is_some_and(|s| s.contains("sshd")), "the error should name sshd: {body:?}");
     assert!(
-        !body["error"].as_str().is_some_and(|s| s.contains("fail2ban")),
+        body["error"].as_str().is_some_and(|s| s.contains("sshd")),
+        "the error should name sshd: {body:?}"
+    );
+    assert!(
+        !body["error"]
+            .as_str()
+            .is_some_and(|s| s.contains("fail2ban")),
         "fail2ban is granted and must not be listed as missing: {body:?}"
     );
 }
@@ -754,10 +936,21 @@ async fn updating_an_endpoint_to_an_ungranted_group_is_refused_and_changes_nothi
         .unwrap();
     assert_eq!(update.status(), StatusCode::FORBIDDEN);
 
-    let list = app.oneshot(signed_request("GET", "/api/endpoints", &daughter, "")).await.unwrap();
+    let list = app
+        .oneshot(signed_request("GET", "/api/endpoints", &daughter, ""))
+        .await
+        .unwrap();
     let endpoints = body_json(list).await;
-    let ep = endpoints.as_array().unwrap().iter().find(|e| e["id"] == id).expect("the endpoint still exists");
-    assert_eq!(ep["vault_groups"], "fail2ban", "the refused update must not have changed vault_groups");
+    let ep = endpoints
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"] == id)
+        .expect("the endpoint still exists");
+    assert_eq!(
+        ep["vault_groups"], "fail2ban",
+        "the refused update must not have changed vault_groups"
+    );
 }
 
 /// "Master can see all groups" (the user's own framing) — the enforcement in
@@ -794,7 +987,12 @@ async fn a_daughter_may_view_only_its_own_group_grants() {
 
     let own = app
         .clone()
-        .oneshot(signed_request("GET", &format!("/api/keys/{}/groups", daughter.model.id), &daughter, ""))
+        .oneshot(signed_request(
+            "GET",
+            &format!("/api/keys/{}/groups", daughter.model.id),
+            &daughter,
+            "",
+        ))
         .await
         .unwrap();
     assert_eq!(own.status(), StatusCode::OK);
@@ -804,14 +1002,24 @@ async fn a_daughter_may_view_only_its_own_group_grants() {
 
     let someone_elses = app
         .clone()
-        .oneshot(signed_request("GET", &format!("/api/keys/{}/groups", daughter.model.id), &other, ""))
+        .oneshot(signed_request(
+            "GET",
+            &format!("/api/keys/{}/groups", daughter.model.id),
+            &other,
+            "",
+        ))
         .await
         .unwrap();
     assert_eq!(someone_elses.status(), StatusCode::FORBIDDEN);
 
     // Master may view any key's grants.
     let as_master = app
-        .oneshot(signed_request("GET", &format!("/api/keys/{}/groups", daughter.model.id), &master, ""))
+        .oneshot(signed_request(
+            "GET",
+            &format!("/api/keys/{}/groups", daughter.model.id),
+            &master,
+            "",
+        ))
         .await
         .unwrap();
     assert_eq!(as_master.status(), StatusCode::OK);
@@ -825,12 +1033,19 @@ async fn listing_vault_groups_requires_master_and_a_configured_vault() {
     let state = test_state(&db).with_pinned_master(master.model.id);
     let app = create_app(state);
 
-    let as_daughter = app.clone().oneshot(signed_request("GET", "/api/vault-groups", &daughter, "")).await.unwrap();
+    let as_daughter = app
+        .clone()
+        .oneshot(signed_request("GET", "/api/vault-groups", &daughter, ""))
+        .await
+        .unwrap();
     assert_eq!(as_daughter.status(), StatusCode::FORBIDDEN);
 
     // test_state() configures no Vault at all — Master still gets a clean, typed error, not a
     // panic or an opaque 500.
-    let as_master = app.oneshot(signed_request("GET", "/api/vault-groups", &master, "")).await.unwrap();
+    let as_master = app
+        .oneshot(signed_request("GET", "/api/vault-groups", &master, ""))
+        .await
+        .unwrap();
     assert_eq!(as_master.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
@@ -843,7 +1058,10 @@ async fn listing_vault_groups_returns_empty_array_when_vault_returns_403_forbidd
     let state = test_state_with_vault(&db, vault_url).with_pinned_master(master.model.id);
     let app = create_app(state);
 
-    let response = app.oneshot(signed_request("GET", "/api/vault-groups", &master, "")).await.unwrap();
+    let response = app
+        .oneshot(signed_request("GET", "/api/vault-groups", &master, ""))
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let groups = body_json(response).await;
     assert_eq!(groups.as_array().unwrap().len(), 0);
@@ -865,32 +1083,35 @@ async fn granting_and_revoking_group_access_round_trips_through_a_live_vault() {
     let state = test_state_with_vault(&db, vault_url).with_pinned_master(master.model.id);
     let app = create_app(state);
 
-    let listed = app.clone().oneshot(signed_request("GET", "/api/vault-groups", &master, "")).await.unwrap();
+    let listed = app
+        .clone()
+        .oneshot(signed_request("GET", "/api/vault-groups", &master, ""))
+        .await
+        .unwrap();
     assert_eq!(listed.status(), StatusCode::OK);
     let groups = body_json(listed).await;
     assert_eq!(groups.as_array().unwrap().len(), 1);
     assert_eq!(groups[0]["name"], "pfBlocker_Blacklist");
 
+    let groups_path = format!("/api/keys/{}/groups", daughter.model.id);
+
     // A grant naming a group id Vault doesn't have is refused, not silently recorded.
+    let bogus_body = format!(r#"{{"vault_group_id":"{}"}}"#, uuid::Uuid::new_v4());
     let bogus = app
         .clone()
-        .oneshot(signed_request(
-            "POST",
-            &format!("/api/keys/{}/groups", daughter.model.id),
-            &master,
-            &format!(r#"{{"vault_group_id":"{}"}}"#, uuid::Uuid::new_v4()),
-        ))
+        .oneshot(signed_request("POST", &groups_path, &master, &bogus_body))
         .await
         .unwrap();
     assert_eq!(bogus.status(), StatusCode::BAD_REQUEST);
 
+    let grant_payload = format!(r#"{{"vault_group_id":"{group_id}"}}"#);
     let grant = app
         .clone()
         .oneshot(signed_request(
             "POST",
-            &format!("/api/keys/{}/groups", daughter.model.id),
+            &groups_path,
             &master,
-            &format!(r#"{{"vault_group_id":"{group_id}"}}"#),
+            &grant_payload,
         ))
         .await
         .unwrap();
@@ -899,58 +1120,45 @@ async fn granting_and_revoking_group_access_round_trips_through_a_live_vault() {
     assert_eq!(grant_body["vault_group_name"], "pfBlocker_Blacklist");
     let permission_id = grant_body["id"].as_str().unwrap().to_owned();
 
-    // Granting the same group again is idempotent, not a conflict. A distinct timestamp (not
-    // `signed_request`'s "now", which a fast test can easily collide with the grant call above
-    // within the same second) — otherwise this would be a byte-identical repeat of that request,
-    // which the anti-replay guard correctly rejects as a replay rather than as a real second call.
-    let regrant = app
-        .clone()
-        .oneshot(signed_request_at(
-            "POST",
-            &format!("/api/keys/{}/groups", daughter.model.id),
-            &master,
-            &format!(r#"{{"vault_group_id":"{group_id}"}}"#),
-            chrono::Utc::now().timestamp() + 1,
-        ))
-        .await
-        .unwrap();
+    // Granting the same group again is idempotent, not a conflict.
+    let regrant_req = signed_request_at(
+        "POST",
+        &groups_path,
+        &master,
+        &grant_payload,
+        chrono::Utc::now().timestamp() + 1,
+    );
+    let regrant = app.clone().oneshot(regrant_req).await.unwrap();
     assert_eq!(regrant.status(), StatusCode::OK);
 
+    let ep_body = r#"{"name":"Now Authorized","vault_groups":"pfBlocker_Blacklist"}"#;
     let use_it = app
         .clone()
-        .oneshot(signed_request(
-            "POST",
-            "/api/endpoints",
-            &daughter,
-            r#"{"name":"Now Authorized","vault_groups":"pfBlocker_Blacklist"}"#,
-        ))
+        .oneshot(signed_request("POST", "/api/endpoints", &daughter, ep_body))
         .await
         .unwrap();
-    assert_eq!(use_it.status(), StatusCode::OK, "the newly granted group must now be usable");
+    assert_eq!(use_it.status(), StatusCode::OK);
 
+    let revoke_path = format!("{groups_path}/{permission_id}");
     let revoke = app
         .clone()
-        .oneshot(signed_request(
-            "DELETE",
-            &format!("/api/keys/{}/groups/{permission_id}", daughter.model.id),
-            &master,
-            "",
-        ))
+        .oneshot(signed_request("DELETE", &revoke_path, &master, ""))
         .await
         .unwrap();
     assert_eq!(revoke.status(), StatusCode::NO_CONTENT);
 
+    let refused_body = r#"{"name":"Revoked Now","vault_groups":"pfBlocker_Blacklist"}"#;
     let now_refused = app
         .clone()
         .oneshot(signed_request(
             "POST",
             "/api/endpoints",
             &daughter,
-            r#"{"name":"Revoked Now","vault_groups":"pfBlocker_Blacklist"}"#,
+            refused_body,
         ))
         .await
         .unwrap();
-    assert_eq!(now_refused.status(), StatusCode::FORBIDDEN, "the revoked group must no longer be usable");
+    assert_eq!(now_refused.status(), StatusCode::FORBIDDEN);
 
     let logs = fetch_audit_logs(app, &master).await;
     for expected_action in ["KEY_GROUP_GRANT", "KEY_GROUP_REVOKE"] {
@@ -1007,18 +1215,28 @@ async fn endpoint_create_update_delete_and_owner_reassign_each_write_an_audit_en
 
     let delete = app
         .clone()
-        .oneshot(signed_request("DELETE", &format!("/api/endpoints/{ep_id}"), &master, ""))
+        .oneshot(signed_request(
+            "DELETE",
+            &format!("/api/endpoints/{ep_id}"),
+            &master,
+            "",
+        ))
         .await
         .unwrap();
     assert_eq!(delete.status(), StatusCode::NO_CONTENT);
 
     let logs = fetch_audit_logs(app, &master).await;
-    for expected_action in
-        ["ENDPOINT_CREATE", "ENDPOINT_UPDATE", "ENDPOINT_OWNER_REASSIGN", "ENDPOINT_DELETE"]
-    {
+    for expected_action in [
+        "ENDPOINT_CREATE",
+        "ENDPOINT_UPDATE",
+        "ENDPOINT_OWNER_REASSIGN",
+        "ENDPOINT_DELETE",
+    ] {
         assert!(
             logs.iter().any(|l| l["action"] == expected_action
-                && l["target_resource"].as_str().is_some_and(|t| t.contains(&ep_id))),
+                && l["target_resource"]
+                    .as_str()
+                    .is_some_and(|t| t.contains(&ep_id))),
             "expected an audit entry for {expected_action} against endpoint {ep_id}, got: {logs:#?}"
         );
     }
@@ -1032,8 +1250,10 @@ async fn audit_logs_are_readable_only_by_the_master_key() {
     let state = test_state(&db).with_pinned_master(master.model.id);
     let app = create_app(state);
 
-    let response =
-        app.oneshot(signed_request("GET", "/api/audit-logs", &daughter, "")).await.unwrap();
+    let response = app
+        .oneshot(signed_request("GET", "/api/audit-logs", &daughter, ""))
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
 
@@ -1045,7 +1265,12 @@ async fn audit_log_action_filter_narrows_results() {
     let app = create_app(state);
 
     app.clone()
-        .oneshot(signed_request("POST", "/api/keys", &master, r#"{"name":"Filter Test Key"}"#))
+        .oneshot(signed_request(
+            "POST",
+            "/api/keys",
+            &master,
+            r#"{"name":"Filter Test Key"}"#,
+        ))
         .await
         .unwrap();
     app.clone()
@@ -1059,7 +1284,12 @@ async fn audit_log_action_filter_narrows_results() {
         .unwrap();
 
     let response = app
-        .oneshot(signed_request("GET", "/api/audit-logs?action=KEY_CREATE", &master, ""))
+        .oneshot(signed_request(
+            "GET",
+            "/api/audit-logs?action=KEY_CREATE",
+            &master,
+            "",
+        ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -1114,8 +1344,15 @@ async fn a_malformed_json_body_is_reported_in_the_normal_error_envelope() {
     let state = test_state(&db).with_pinned_master(master.model.id);
     let app = create_app(state);
 
-    let response =
-        app.oneshot(signed_request("POST", "/api/keys", &master, "{not valid json")).await.unwrap();
+    let response = app
+        .oneshot(signed_request(
+            "POST",
+            "/api/keys",
+            &master,
+            "{not valid json",
+        ))
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let json = body_json(response).await;
     // The envelope is exactly `{"error": "..."}` — a bare string field, present and non-empty —
@@ -1148,7 +1385,9 @@ async fn an_unknown_field_in_a_mutating_payload_is_rejected_rather_than_silently
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let json = body_json(response).await;
     assert!(
-        json["error"].as_str().is_some_and(|s| s.contains("is_master")),
+        json["error"]
+            .as_str()
+            .is_some_and(|s| s.contains("is_master")),
         "the error should name the rejected field: {json:?}"
     );
 }
@@ -1160,8 +1399,15 @@ async fn an_invalid_uuid_path_parameter_is_reported_in_the_normal_error_envelope
     let state = test_state(&db).with_pinned_master(master.model.id);
     let app = create_app(state);
 
-    let response =
-        app.oneshot(signed_request("DELETE", "/api/keys/not-a-uuid", &master, "")).await.unwrap();
+    let response = app
+        .oneshot(signed_request(
+            "DELETE",
+            "/api/keys/not-a-uuid",
+            &master,
+            "",
+        ))
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let json = body_json(response).await;
     assert!(json["error"].as_str().is_some_and(|s| !s.is_empty()));
@@ -1177,8 +1423,14 @@ async fn an_oversized_body_is_413_not_400() {
     let state = test_state(&db).with_pinned_master(master.model.id);
     let app = create_app(state);
 
-    let huge = format!(r#"{{"name":"{}"}}"#, "x".repeat(simply_ip_exporter::MAX_REQUEST_BODY_BYTES));
-    let response = app.oneshot(signed_request("POST", "/api/keys", &master, &huge)).await.unwrap();
+    let huge = format!(
+        r#"{{"name":"{}"}}"#,
+        "x".repeat(simply_ip_exporter::MAX_REQUEST_BODY_BYTES)
+    );
+    let response = app
+        .oneshot(signed_request("POST", "/api/keys", &master, &huge))
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
 
@@ -1207,14 +1459,22 @@ async fn two_concurrent_identical_signed_requests_only_one_succeeds() {
 
     let app_a = app.clone();
     let app_b = app.clone();
-    let (result_a, result_b) =
-        tokio::join!(app_a.oneshot(first), app_b.oneshot(second));
+    let (result_a, result_b) = tokio::join!(app_a.oneshot(first), app_b.oneshot(second));
     let statuses = [result_a.unwrap().status(), result_b.unwrap().status()];
 
     let ok_count = statuses.iter().filter(|s| **s == StatusCode::OK).count();
-    let rejected_count = statuses.iter().filter(|s| **s == StatusCode::UNAUTHORIZED).count();
-    assert_eq!(ok_count, 1, "exactly one of the two identical concurrent requests must succeed, got {statuses:?}");
-    assert_eq!(rejected_count, 1, "the other must be rejected as a replay, got {statuses:?}");
+    let rejected_count = statuses
+        .iter()
+        .filter(|s| **s == StatusCode::UNAUTHORIZED)
+        .count();
+    assert_eq!(
+        ok_count, 1,
+        "exactly one of the two identical concurrent requests must succeed, got {statuses:?}"
+    );
+    assert_eq!(
+        rejected_count, 1,
+        "the other must be rejected as a replay, got {statuses:?}"
+    );
 }
 
 /// Two concurrent `DELETE` requests for the same endpoint: exactly one actually deletes it (`204`)
@@ -1243,18 +1503,35 @@ async fn two_concurrent_deletes_of_the_same_endpoint_do_not_both_succeed() {
     // own find-then-delete logic, not the replay guard from the test above.
     let now = chrono::Utc::now().timestamp();
     let first = signed_request_at("DELETE", &format!("/api/endpoints/{id}"), &master, "", now);
-    let second = signed_request_at("DELETE", &format!("/api/endpoints/{id}"), &master, "", now + 1);
+    let second = signed_request_at(
+        "DELETE",
+        &format!("/api/endpoints/{id}"),
+        &master,
+        "",
+        now + 1,
+    );
 
     let app_a = app.clone();
     let app_b = app.clone();
-    let (result_a, result_b) =
-        tokio::join!(app_a.oneshot(first), app_b.oneshot(second));
+    let (result_a, result_b) = tokio::join!(app_a.oneshot(first), app_b.oneshot(second));
     let statuses = [result_a.unwrap().status(), result_b.unwrap().status()];
 
-    let deleted_count = statuses.iter().filter(|s| **s == StatusCode::NO_CONTENT).count();
-    let not_found_count = statuses.iter().filter(|s| **s == StatusCode::NOT_FOUND).count();
-    assert_eq!(deleted_count, 1, "exactly one concurrent delete must succeed, got {statuses:?}");
-    assert_eq!(not_found_count, 1, "the other must find it already gone, got {statuses:?}");
+    let deleted_count = statuses
+        .iter()
+        .filter(|s| **s == StatusCode::NO_CONTENT)
+        .count();
+    let not_found_count = statuses
+        .iter()
+        .filter(|s| **s == StatusCode::NOT_FOUND)
+        .count();
+    assert_eq!(
+        deleted_count, 1,
+        "exactly one concurrent delete must succeed, got {statuses:?}"
+    );
+    assert_eq!(
+        not_found_count, 1,
+        "the other must find it already gone, got {statuses:?}"
+    );
 }
 
 /// 2026-08-19 hardening pass (see `AGENT_NOTES.MD`): `PUT /api/keys/{id}` had no explicit guard
@@ -1307,8 +1584,14 @@ async fn master_key_name_and_can_manage_keys_cannot_be_changed_via_the_api() {
     assert_eq!(rebind.status(), StatusCode::OK);
     let updated = body_json(rebind).await;
     assert_eq!(updated["bound_ips"], "10.0.0.0/8");
-    assert_eq!(updated["name"], "Test Key", "the rejected rename must not have taken effect");
-    assert_eq!(updated["can_manage_keys"], true, "the rejected escalation attempt must not have taken effect");
+    assert_eq!(
+        updated["name"], "Test Key",
+        "the rejected rename must not have taken effect"
+    );
+    assert_eq!(
+        updated["can_manage_keys"], true,
+        "the rejected escalation attempt must not have taken effect"
+    );
 }
 
 /// `AuditLogQuery` denies unknown fields like every other payload type in this crate — a stray
@@ -1320,12 +1603,21 @@ async fn an_unknown_query_parameter_is_rejected_with_a_400_naming_it() {
     let state = test_state(&db).with_pinned_master(master.model.id);
     let app = create_app(state);
 
-    let response =
-        app.oneshot(signed_request("GET", "/api/audit-logs?stray_field=1", &master, "")).await.unwrap();
+    let response = app
+        .oneshot(signed_request(
+            "GET",
+            "/api/audit-logs?stray_field=1",
+            &master,
+            "",
+        ))
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let json = body_json(response).await;
     assert!(
-        json["error"].as_str().is_some_and(|s| s.contains("stray_field")),
+        json["error"]
+            .as_str()
+            .is_some_and(|s| s.contains("stray_field")),
         "the error should name the rejected query parameter: {json:?}"
     );
 }
@@ -1345,28 +1637,52 @@ async fn deleting_a_key_that_owns_endpoints_without_reassign_to_returns_409_with
 
     let create = app
         .clone()
-        .oneshot(signed_request("POST", "/api/endpoints", &owner, r#"{"name":"Owned Feed","vault_groups":"g1"}"#))
+        .oneshot(signed_request(
+            "POST",
+            "/api/endpoints",
+            &owner,
+            r#"{"name":"Owned Feed","vault_groups":"g1"}"#,
+        ))
         .await
         .unwrap();
     assert_eq!(create.status(), StatusCode::OK);
     let ep_id = body_json(create).await["id"].as_str().unwrap().to_owned();
 
-    let delete =
-        app.clone().oneshot(signed_request("DELETE", &format!("/api/keys/{}", owner.model.id), &master, "")).await.unwrap();
+    let delete = app
+        .clone()
+        .oneshot(signed_request(
+            "DELETE",
+            &format!("/api/keys/{}", owner.model.id),
+            &master,
+            "",
+        ))
+        .await
+        .unwrap();
     assert_eq!(delete.status(), StatusCode::CONFLICT);
     let body = body_json(delete).await;
-    assert!(body["error"].as_str().is_some_and(|s| s.contains('1')), "the message should mention the count: {body:?}");
-    let inventory = body["owned_endpoints"].as_array().expect("owned_endpoints is present");
+    assert!(
+        body["error"].as_str().is_some_and(|s| s.contains('1')),
+        "the message should mention the count: {body:?}"
+    );
+    let inventory = body["owned_endpoints"]
+        .as_array()
+        .expect("owned_endpoints is present");
     assert_eq!(inventory.len(), 1);
     assert_eq!(inventory[0]["id"], ep_id);
     assert_eq!(inventory[0]["name"], "Owned Feed");
 
     // Nothing took effect: the key survives the refused delete. No `GET /api/keys/{id}` route
     // exists, so this is checked against the list.
-    let keys = app.oneshot(signed_request("GET", "/api/keys", &master, "")).await.unwrap();
+    let keys = app
+        .oneshot(signed_request("GET", "/api/keys", &master, ""))
+        .await
+        .unwrap();
     let keys = body_json(keys).await;
     assert!(
-        keys.as_array().unwrap().iter().any(|k| k["id"] == owner.model.id.to_string()),
+        keys.as_array()
+            .unwrap()
+            .iter()
+            .any(|k| k["id"] == owner.model.id.to_string()),
         "the owner key must still exist: {keys:?}"
     );
 }
@@ -1386,7 +1702,12 @@ async fn deleting_a_key_with_reassign_to_atomically_moves_its_endpoints_and_dele
 
     let create = app
         .clone()
-        .oneshot(signed_request("POST", "/api/endpoints", &owner, r#"{"name":"Owned Feed","vault_groups":"g1"}"#))
+        .oneshot(signed_request(
+            "POST",
+            "/api/endpoints",
+            &owner,
+            r#"{"name":"Owned Feed","vault_groups":"g1"}"#,
+        ))
         .await
         .unwrap();
     let ep_id = body_json(create).await["id"].as_str().unwrap().to_owned();
@@ -1395,7 +1716,10 @@ async fn deleting_a_key_with_reassign_to_atomically_moves_its_endpoints_and_dele
         .clone()
         .oneshot(signed_request(
             "DELETE",
-            &format!("/api/keys/{}?reassign_to={}", owner.model.id, new_owner.model.id),
+            &format!(
+                "/api/keys/{}?reassign_to={}",
+                owner.model.id, new_owner.model.id
+            ),
             &master,
             "",
         ))
@@ -1404,16 +1728,27 @@ async fn deleting_a_key_with_reassign_to_atomically_moves_its_endpoints_and_dele
     assert_eq!(delete.status(), StatusCode::NO_CONTENT);
 
     // The key is gone. No `GET /api/keys/{id}` route exists, so this is checked against the list.
-    let keys = app.clone().oneshot(signed_request("GET", "/api/keys", &master, "")).await.unwrap();
+    let keys = app
+        .clone()
+        .oneshot(signed_request("GET", "/api/keys", &master, ""))
+        .await
+        .unwrap();
     let keys = body_json(keys).await;
     assert!(
-        keys.as_array().unwrap().iter().all(|k| k["id"] != owner.model.id.to_string()),
+        keys.as_array()
+            .unwrap()
+            .iter()
+            .all(|k| k["id"] != owner.model.id.to_string()),
         "the deleted key must no longer be listed: {keys:?}"
     );
 
     // The endpoint survived and now belongs to the new owner. No `GET /api/endpoints/{id}` route
     // exists either, so this is checked against the list.
-    let endpoints = app.clone().oneshot(signed_request("GET", "/api/endpoints", &master, "")).await.unwrap();
+    let endpoints = app
+        .clone()
+        .oneshot(signed_request("GET", "/api/endpoints", &master, ""))
+        .await
+        .unwrap();
     let endpoints = body_json(endpoints).await;
     let reassigned = endpoints
         .as_array()
@@ -1426,11 +1761,24 @@ async fn deleting_a_key_with_reassign_to_atomically_moves_its_endpoints_and_dele
     let logs = fetch_audit_logs(app, &master).await;
     let delete_entry = logs
         .iter()
-        .find(|l| l["action"] == "KEY_DELETE" && l["target_resource"].as_str().is_some_and(|t| t.contains(&owner.model.id.to_string())))
+        .find(|l| {
+            l["action"] == "KEY_DELETE"
+                && l["target_resource"]
+                    .as_str()
+                    .is_some_and(|t| t.contains(&owner.model.id.to_string()))
+        })
         .expect("a KEY_DELETE entry for the deleted key");
-    let details = delete_entry["details"].as_str().expect("details is present");
-    assert!(details.contains("reassigned 1 endpoint"), "details should describe the reassignment: {details}");
-    assert!(details.contains(&new_owner.model.id.to_string()), "details should name the new owner: {details}");
+    let details = delete_entry["details"]
+        .as_str()
+        .expect("details is present");
+    assert!(
+        details.contains("reassigned 1 endpoint"),
+        "details should describe the reassignment: {details}"
+    );
+    assert!(
+        details.contains(&new_owner.model.id.to_string()),
+        "details should name the new owner: {details}"
+    );
 }
 
 /// `reassign_to` naming a key that doesn't exist is a client error, not a silent no-op or a
@@ -1446,7 +1794,12 @@ async fn reassign_to_naming_a_nonexistent_key_is_rejected_and_changes_nothing() 
 
     let create = app
         .clone()
-        .oneshot(signed_request("POST", "/api/endpoints", &owner, r#"{"name":"Owned Feed","vault_groups":"g1"}"#))
+        .oneshot(signed_request(
+            "POST",
+            "/api/endpoints",
+            &owner,
+            r#"{"name":"Owned Feed","vault_groups":"g1"}"#,
+        ))
         .await
         .unwrap();
     let ep_id = body_json(create).await["id"].as_str().unwrap().to_owned();
@@ -1466,17 +1819,31 @@ async fn reassign_to_naming_a_nonexistent_key_is_rejected_and_changes_nothing() 
 
     // Neither the key nor the endpoint's ownership changed. Neither single-item `GET` route
     // exists, so both are checked against their list endpoints.
-    let keys = app.clone().oneshot(signed_request("GET", "/api/keys", &master, "")).await.unwrap();
+    let keys = app
+        .clone()
+        .oneshot(signed_request("GET", "/api/keys", &master, ""))
+        .await
+        .unwrap();
     let keys = body_json(keys).await;
     assert!(
-        keys.as_array().unwrap().iter().any(|k| k["id"] == owner.model.id.to_string()),
+        keys.as_array()
+            .unwrap()
+            .iter()
+            .any(|k| k["id"] == owner.model.id.to_string()),
         "the owner key must still exist: {keys:?}"
     );
 
-    let endpoints = app.oneshot(signed_request("GET", "/api/endpoints", &master, "")).await.unwrap();
+    let endpoints = app
+        .oneshot(signed_request("GET", "/api/endpoints", &master, ""))
+        .await
+        .unwrap();
     let endpoints = body_json(endpoints).await;
-    let unchanged =
-        endpoints.as_array().unwrap().iter().find(|e| e["id"] == ep_id).expect("the endpoint must still exist");
+    let unchanged = endpoints
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"] == ep_id)
+        .expect("the endpoint must still exist");
     assert_eq!(unchanged["owner_key_id"], owner.model.id.to_string());
 }
 
@@ -1503,7 +1870,10 @@ async fn max_age_seconds_defaults_to_unlimited_round_trips_and_refuses_negatives
         .unwrap();
     assert_eq!(created.status(), StatusCode::OK);
     let body = body_json(created).await;
-    assert_eq!(body["max_age_seconds"], 0, "omitting the field must mean unlimited");
+    assert_eq!(
+        body["max_age_seconds"], 0,
+        "omitting the field must mean unlimited"
+    );
     let id = body["id"].as_str().unwrap().to_owned();
 
     // Explicitly set on create.
@@ -1565,8 +1935,16 @@ async fn max_age_seconds_defaults_to_unlimited_round_trips_and_refuses_negatives
         .await
         .unwrap();
     let rows = body_json(after).await;
-    let row = rows.as_array().unwrap().iter().find(|r| r["id"] == id.as_str()).unwrap();
-    assert_eq!(row["max_age_seconds"], 86400, "the refused update must not have changed anything");
+    let row = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == id.as_str())
+        .unwrap();
+    assert_eq!(
+        row["max_age_seconds"], 86400,
+        "the refused update must not have changed anything"
+    );
 }
 
 /// Boots a throwaway Vault answering `GET /api/ips` with a fixed record set.
@@ -1580,8 +1958,12 @@ async fn spawn_mock_vault_ips(records: serde_json::Value) -> (String, tokio::tas
             async move { axum::Json(records) }
         }),
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback bind always succeeds");
-    let addr = listener.local_addr().expect("a bound listener has a local address");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("loopback bind always succeeds");
+    let addr = listener
+        .local_addr()
+        .expect("a bound listener has a local address");
     let handle = tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
@@ -1591,7 +1973,9 @@ async fn spawn_mock_vault_ips(records: serde_json::Value) -> (String, tokio::tas
 fn feed_request(path: &str, source: [u8; 4]) -> Request<Body> {
     Request::builder()
         .uri(path)
-        .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((source, 9000))))
+        .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+            source, 9000,
+        ))))
         .body(Body::empty())
         .expect("request builds")
 }
@@ -1628,7 +2012,10 @@ async fn the_startup_sync_populates_endpoints_before_the_first_feed_request_is_s
         .await
         .unwrap();
     assert_eq!(created.status(), StatusCode::OK);
-    let feed_path = body_json(created).await["feed_path"].as_str().unwrap().to_owned();
+    let feed_path = body_json(created).await["feed_path"]
+        .as_str()
+        .unwrap()
+        .to_owned();
 
     // Before the startup sync: served, but empty — the window this feature closes.
     let cold = create_app(state.clone())
@@ -1636,8 +2023,13 @@ async fn the_startup_sync_populates_endpoints_before_the_first_feed_request_is_s
         .await
         .unwrap();
     assert_eq!(cold.status(), StatusCode::OK);
-    let cold_body = axum::body::to_bytes(cold.into_body(), usize::MAX).await.unwrap();
-    assert!(cold_body.is_empty(), "precondition: nothing is cached before the startup sync runs");
+    let cold_body = axum::body::to_bytes(cold.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(
+        cold_body.is_empty(),
+        "precondition: nothing is cached before the startup sync runs"
+    );
 
     // Exactly what `main.rs` awaits before binding the listener.
     simply_ip_exporter::sync::run_boot_sync(&state).await;
@@ -1648,12 +2040,24 @@ async fn the_startup_sync_populates_endpoints_before_the_first_feed_request_is_s
         .await
         .unwrap();
     assert_eq!(warm.status(), StatusCode::OK);
-    let warm_body = axum::body::to_bytes(warm.into_body(), usize::MAX).await.unwrap();
+    let warm_body = axum::body::to_bytes(warm.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let served = String::from_utf8(warm_body.to_vec()).expect("the feed is UTF-8");
 
-    assert!(served.contains("203.0.113.7/32"), "first record must be served: {served:?}");
-    assert!(served.contains("198.51.100.9/32"), "second record must be served: {served:?}");
-    assert_eq!(served.lines().count(), 2, "exactly the two synced records: {served:?}");
+    assert!(
+        served.contains("203.0.113.7/32"),
+        "first record must be served: {served:?}"
+    );
+    assert!(
+        served.contains("198.51.100.9/32"),
+        "second record must be served: {served:?}"
+    );
+    assert_eq!(
+        served.lines().count(),
+        2,
+        "exactly the two synced records: {served:?}"
+    );
 }
 
 /// The boot sync must never be able to stop the process from starting. With Vault unreachable it
@@ -1680,7 +2084,10 @@ async fn an_unreachable_vault_at_startup_does_not_prevent_the_service_from_servi
         ))
         .await
         .unwrap();
-    let feed_path = body_json(created).await["feed_path"].as_str().unwrap().to_owned();
+    let feed_path = body_json(created).await["feed_path"]
+        .as_str()
+        .unwrap()
+        .to_owned();
 
     simply_ip_exporter::sync::run_boot_sync(&state).await;
 
@@ -1688,13 +2095,25 @@ async fn an_unreachable_vault_at_startup_does_not_prevent_the_service_from_servi
         .oneshot(feed_request(&feed_path, [198, 51, 100, 83]))
         .await
         .unwrap();
-    assert_eq!(feed.status(), StatusCode::OK, "the feed is still served, just empty");
+    assert_eq!(
+        feed.status(),
+        StatusCode::OK,
+        "the feed is still served, just empty"
+    );
 
     let ready = create_app(state)
-        .oneshot(with_connect_info(Request::builder().uri("/ready")).body(Body::empty()).unwrap())
+        .oneshot(
+            with_connect_info(Request::builder().uri("/ready"))
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
-    assert_eq!(ready.status(), StatusCode::OK, "readiness is unaffected by Vault being down at boot");
+    assert_eq!(
+        ready.status(),
+        StatusCode::OK,
+        "readiness is unaffected by Vault being down at boot"
+    );
 }
 
 /// Boots a Vault that answers a **full** query (no `since`) and a **differential** one
@@ -1703,10 +2122,14 @@ async fn an_unreachable_vault_at_startup_does_not_prevent_the_service_from_servi
 async fn spawn_staged_mock_vault(
     full: serde_json::Value,
     differential: serde_json::Value,
-) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+) -> (
+    String,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    tokio::task::JoinHandle<()>,
+) {
     use axum::{Router, extract::RawQuery, routing::get};
 
-    let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+    let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> = std::sync::Arc::default();
     let seen_for_handler = std::sync::Arc::clone(&seen);
 
     let app = Router::new().route(
@@ -1721,13 +2144,21 @@ async fn spawn_staged_mock_vault(
                 }
                 // `since=` is present only on a differential fetch — the exporter adds it (together
                 // with include_deleted=true) exactly when it has a last_synced_at to page from.
-                let body = if query.contains("since=") { differential } else { full };
+                let body = if query.contains("since=") {
+                    differential
+                } else {
+                    full
+                };
                 axum::Json(body)
             }
         }),
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback bind always succeeds");
-    let addr = listener.local_addr().expect("a bound listener has a local address");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("loopback bind always succeeds");
+    let addr = listener
+        .local_addr()
+        .expect("a bound listener has a local address");
     let handle = tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
@@ -1743,9 +2174,18 @@ fn record(address: &str, deleted: bool) -> serde_json::Value {
 }
 
 async fn feed_body(app: axum::Router, path: &str, source: [u8; 4]) -> String {
-    let response = app.oneshot(feed_request(path, source)).await.expect("the feed responds");
-    assert_eq!(response.status(), StatusCode::OK, "the feed must always answer 200");
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("body reads");
+    let response = app
+        .oneshot(feed_request(path, source))
+        .await
+        .expect("the feed responds");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the feed must always answer 200"
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body reads");
     String::from_utf8(bytes.to_vec()).expect("the feed is UTF-8")
 }
 
@@ -1790,15 +2230,28 @@ async fn a_delta_sync_after_ttl_expiry_adds_new_records_and_purges_soft_deleted_
         .await
         .unwrap();
     assert_eq!(created.status(), StatusCode::OK);
-    let feed_path = body_json(created).await["feed_path"].as_str().unwrap().to_owned();
+    let feed_path = body_json(created).await["feed_path"]
+        .as_str()
+        .unwrap()
+        .to_owned();
 
     // ── Stage 1: the initial full sync ───────────────────────────────────────
     simply_ip_exporter::sync::run_boot_sync(&state).await;
 
     let stage1 = feed_body(app.clone(), &feed_path, [198, 51, 100, 91]).await;
-    assert!(stage1.contains(IP_A), "IP_A must be published after the full sync: {stage1:?}");
-    assert!(stage1.contains(IP_B), "IP_B must be published after the full sync: {stage1:?}");
-    assert_eq!(stage1.lines().count(), 2, "exactly the two seeded records: {stage1:?}");
+    assert!(
+        stage1.contains(IP_A),
+        "IP_A must be published after the full sync: {stage1:?}"
+    );
+    assert!(
+        stage1.contains(IP_B),
+        "IP_B must be published after the full sync: {stage1:?}"
+    );
+    assert_eq!(
+        stage1.lines().count(),
+        2,
+        "exactly the two seeded records: {stage1:?}"
+    );
 
     assert!(
         !seen.lock().expect("not poisoned")[0].contains("since="),
@@ -1814,10 +2267,11 @@ async fn a_delta_sync_after_ttl_expiry_adds_new_records_and_purges_soft_deleted_
     simply_ip_exporter::sync::run_boot_sync(&state).await;
 
     let queries = seen.lock().expect("not poisoned").clone();
-    let differential = queries
-        .last()
-        .expect("a second pass ran");
-    assert!(differential.contains("since="), "the second pass must carry a cutoff: {differential}");
+    let differential = queries.last().expect("a second pass ran");
+    assert!(
+        differential.contains("since="),
+        "the second pass must carry a cutoff: {differential}"
+    );
     assert!(
         differential.contains("include_deleted=true"),
         "and must ask for tombstones, or a deletion could never be replicated: {differential}"
@@ -1825,13 +2279,23 @@ async fn a_delta_sync_after_ttl_expiry_adds_new_records_and_purges_soft_deleted_
 
     // ── Stage 4: the cache reflects both halves of the delta ─────────────────
     let stage2 = feed_body(app, &feed_path, [198, 51, 100, 92]).await;
-    assert!(stage2.contains(IP_B), "IP_B was untouched and must still be published: {stage2:?}");
-    assert!(stage2.contains(IP_C), "IP_C was added and must now be published: {stage2:?}");
+    assert!(
+        stage2.contains(IP_B),
+        "IP_B was untouched and must still be published: {stage2:?}"
+    );
+    assert!(
+        stage2.contains(IP_C),
+        "IP_C was added and must now be published: {stage2:?}"
+    );
     assert!(
         !stage2.contains(IP_A),
         "IP_A was soft-deleted in Vault and must be purged from the feed entirely: {stage2:?}"
     );
-    assert_eq!(stage2.lines().count(), 2, "exactly IP_B and IP_C remain: {stage2:?}");
+    assert_eq!(
+        stage2.lines().count(),
+        2,
+        "exactly IP_B and IP_C remain: {stage2:?}"
+    );
 }
 
 /// Boots a Vault whose every page response is delayed, simulating the heavy multi-page fetch a
@@ -1855,8 +2319,8 @@ async fn spawn_slow_paginating_vault(
                     .find_map(|kv| kv.strip_prefix(&format!("{name}=")))
                     .and_then(|v| v.parse().ok())
             };
-            let limit = param("limit").unwrap_or(50) as usize;
-            let offset = param("offset").unwrap_or(0) as usize;
+            let limit = usize::try_from(param("limit").unwrap_or(50)).unwrap_or(usize::MAX);
+            let offset = usize::try_from(param("offset").unwrap_or(0)).unwrap_or(usize::MAX);
             // Lone hosts in distinct /24s: nothing aggregates, so a line count is a record count.
             let page: Vec<serde_json::Value> = (offset..total.min(offset + limit))
                 .map(|i| record(&format!("51.{}.{}.1/32", i / 256, i % 256), false))
@@ -1872,8 +2336,12 @@ async fn spawn_slow_paginating_vault(
             axum::Json(serde_json::Value::Array(page))
         }),
     );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback bind always succeeds");
-    let addr = listener.local_addr().expect("a bound listener has a local address");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("loopback bind always succeeds");
+    let addr = listener
+        .local_addr()
+        .expect("a bound listener has a local address");
     let handle = tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
@@ -1947,8 +2415,11 @@ async fn public_feed_reads_stay_fast_and_non_empty_while_a_full_resync_runs() {
     let warm: Vec<simply_ip_exporter::cache::VaultRecord> = (0..RECORDS)
         .map(|i| simply_ip_exporter::cache::VaultRecord {
             target_address: format!("51.{}.{}.1/32", i / 256, i % 256),
-            last_seen_at: chrono::NaiveDateTime::parse_from_str("2026-08-11T10:00:00", "%Y-%m-%dT%H:%M:%S")
-                .expect("a valid fixture timestamp"),
+            last_seen_at: chrono::NaiveDateTime::parse_from_str(
+                "2026-08-11T10:00:00",
+                "%Y-%m-%dT%H:%M:%S",
+            )
+            .expect("a valid fixture timestamp"),
             is_deleted: false,
         })
         .collect();
@@ -1977,11 +2448,21 @@ async fn public_feed_reads_stay_fast_and_non_empty_while_a_full_resync_runs() {
         let app = app.clone();
         let path = feed_path.clone();
         readers.push(tokio::spawn(async move {
-            let source = [10, 0, (i / 256) as u8, (i % 256) as u8];
+            let source = [
+                10,
+                0,
+                u8::try_from(i / 256).unwrap_or(0),
+                u8::try_from(i % 256).unwrap_or(0),
+            ];
             let started = std::time::Instant::now();
-            let response = app.oneshot(feed_request(&path, source)).await.expect("the feed responds");
+            let response = app
+                .oneshot(feed_request(&path, source))
+                .await
+                .expect("the feed responds");
             let status = response.status();
-            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("body reads");
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body reads");
             (status, bytes.len(), started.elapsed())
         }));
     }
@@ -1989,8 +2470,15 @@ async fn public_feed_reads_stay_fast_and_non_empty_while_a_full_resync_runs() {
     let mut slowest = std::time::Duration::ZERO;
     for reader in readers {
         let (status, body_len, latency) = reader.await.expect("no reader task panicked");
-        assert_eq!(status, StatusCode::OK, "every feed read must be 200 during a resync");
-        assert!(body_len > 0, "no reader may observe an empty feed mid-resync");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "every feed read must be 200 during a resync"
+        );
+        assert!(
+            body_len > 0,
+            "no reader may observe an empty feed mid-resync"
+        );
         slowest = slowest.max(latency);
     }
     let flood_elapsed = flood_started.elapsed();
@@ -2015,4 +2503,115 @@ async fn public_feed_reads_stay_fast_and_non_empty_while_a_full_resync_runs() {
         "slowest read was {slowest:?}, at least half of the {sync_elapsed:?} full resync took — \
          that is lock starvation, not a cache read"
     );
+}
+
+#[tokio::test]
+async fn feed_rate_limiter_blocks_unknown_token_brute_force_before_db_lookup() {
+    let db = setup_test_db().await;
+    let state = test_state(&db);
+    let app = create_app(state);
+
+    let first = app
+        .clone()
+        .oneshot(
+            with_connect_info(Request::builder().uri("/feed/v1/unknown-guess-1/list.txt"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::NOT_FOUND);
+
+    let second = app
+        .oneshot(
+            with_connect_info(Request::builder().uri("/feed/v1/unknown-guess-2/list.txt"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn revoking_daughter_vault_group_permission_immediately_blocks_feed_serving() {
+    let db = setup_test_db().await;
+    let master = insert_key(&db, true, true).await;
+    let daughter = insert_key(&db, false, false).await;
+    let (vault_url, _vault) =
+        spawn_mock_vault_groups(serde_json::json!([{"id": uuid::Uuid::new_v4(), "name": "g1"}]))
+            .await;
+    // Wait: use direct grant helper to seed group permission
+    common::grant_group(&db, daughter.model.id, "g1").await;
+
+    let state = test_state_with_vault(&db, vault_url).with_pinned_master(master.model.id);
+    let app = create_app(state.clone());
+
+    let create = app
+        .clone()
+        .oneshot(signed_request(
+            "POST",
+            "/api/endpoints",
+            &daughter,
+            r#"{"name":"Daughter Feed","vault_groups":"g1"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::OK);
+    let created = body_json(create).await;
+    let ep_id: uuid::Uuid = created["id"].as_str().unwrap().parse().unwrap();
+    let feed_path = created["feed_path"].as_str().unwrap().to_owned();
+
+    state
+        .ip_cache
+        .apply_full(
+            ep_id,
+            &[simply_ip_exporter::cache::VaultRecord {
+                target_address: "203.0.113.88/32".to_owned(),
+                last_seen_at: chrono::Utc::now().naive_utc(),
+                is_deleted: false,
+            }],
+        )
+        .await;
+
+    // First fetch from IP .100 succeeds while grant is active
+    let ok_resp = app
+        .clone()
+        .oneshot(feed_request(&feed_path, [198, 51, 100, 100]))
+        .await
+        .unwrap();
+    assert_eq!(ok_resp.status(), StatusCode::OK);
+
+    // Master lists Daughter's group grant and revokes it
+    let list_grants = app
+        .clone()
+        .oneshot(signed_request(
+            "GET",
+            &format!("/api/keys/{}/groups", daughter.model.id),
+            &master,
+            "",
+        ))
+        .await
+        .unwrap();
+    let grants = body_json(list_grants).await;
+    let perm_id = grants[0]["id"].as_str().unwrap();
+
+    let revoke = app
+        .clone()
+        .oneshot(signed_request(
+            "DELETE",
+            &format!("/api/keys/{}/groups/{perm_id}", daughter.model.id),
+            &master,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(revoke.status(), StatusCode::NO_CONTENT);
+
+    // Fetch from another IP .101 must immediately be denied with 403 Forbidden
+    let revoked_resp = app
+        .oneshot(feed_request(&feed_path, [198, 51, 100, 101]))
+        .await
+        .unwrap();
+    assert_eq!(revoked_resp.status(), StatusCode::FORBIDDEN);
 }

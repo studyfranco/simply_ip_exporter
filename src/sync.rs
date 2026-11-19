@@ -12,7 +12,7 @@ use crate::state::AppState;
 use crate::vault_client::VaultApiRecord;
 
 /// How often every endpoint gets a full, unconstrained resync, per `AGENT.MD`.
-pub const FULL_SYNC_INTERVAL: Duration = Duration::from_secs(24 * 3600);
+pub const FULL_SYNC_INTERVAL: Duration = Duration::from_hours(24);
 
 /// How often the worker wakes to check whether any endpoint is due for a sync.
 const TICK_INTERVAL: Duration = Duration::from_secs(15);
@@ -74,17 +74,18 @@ pub async fn run_boot_sync(state: &AppState) {
     tracing::info!("Running the startup sync before opening the HTTP listener...");
     let started = std::time::Instant::now();
 
-    match tokio::time::timeout(BOOT_SYNC_BUDGET, sync_all_endpoints(state)).await {
-        Ok(()) => tracing::info!(
-            "Startup sync finished in {:?}; the cache is populated before the first request.",
-            started.elapsed()
-        ),
-        Err(_) => tracing::warn!(
-            "Startup sync did not finish within {}s. Starting anyway and serving whatever is \
+    if let Err(e) = tokio::time::timeout(BOOT_SYNC_BUDGET, sync_all_endpoints(state)).await {
+        tracing::warn!(
+            "Startup sync did not finish within {}s ({e}). Starting anyway and serving whatever is \
              already cached — the background sync worker continues from here, so no restart is \
              needed. Check that simply_ip_vault is reachable.",
             BOOT_SYNC_BUDGET.as_secs()
-        ),
+        );
+    } else {
+        tracing::info!(
+            "Startup sync finished in {:?}; the cache is populated before the first request.",
+            started.elapsed()
+        );
     }
 }
 
@@ -92,6 +93,7 @@ pub async fn run_boot_sync(state: &AppState) {
 ///
 /// The loop syncs first and sleeps second, so an endpoint created while the process is running is
 /// picked up on the next tick rather than a tick plus a full interval later.
+#[must_use]
 pub fn spawn_sync_worker(state: AppState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -119,8 +121,62 @@ async fn sync_all_endpoints(state: &AppState) {
     }
 }
 
-async fn sync_endpoint(state: &AppState, client: &crate::vault_client::VaultClient, ep: endpoint::Model) {
-    let full_due = state.ip_cache.full_sync_due(ep.id, FULL_SYNC_INTERVAL).await;
+async fn sync_endpoint(
+    state: &AppState,
+    client: &crate::vault_client::VaultClient,
+    ep: endpoint::Model,
+) {
+    let effective_groups = match crate::groups::verify_endpoint_group_permissions(state, &ep).await
+    {
+        Ok(crate::groups::EndpointGroupAuth::AllAuthorized(_)) => None,
+        Ok(crate::groups::EndpointGroupAuth::PartiallyAuthorized(allowed)) => {
+            Some(allowed.join(","))
+        }
+        Ok(crate::groups::EndpointGroupAuth::Denied) => {
+            state.ip_cache.evict(ep.id).await;
+            tracing::warn!(
+                endpoint = %ep.id,
+                "Skipping sync and evicting cache: endpoint owner lacks Vault group permissions."
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(
+                endpoint = %ep.id,
+                "Skipping sync cycle: failed checking endpoint owner permissions ({e})."
+            );
+            return;
+        }
+    };
+
+    if let Some(allowed_groups) = effective_groups {
+        match client.fetch_ips(&allowed_groups, None).await {
+            Ok(records) => {
+                let id = ep.id;
+                state
+                    .ip_cache
+                    .apply_full_partial(id, &map_records(records))
+                    .await;
+                mark_synced(state, ep).await;
+                tracing::info!(
+                    endpoint = %id,
+                    "Full sync completed for permitted subset of Vault groups"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    endpoint = %ep.id,
+                    "Subset full sync against simply_ip_vault failed: {e}. Preserving cache."
+                );
+            }
+        }
+        return;
+    }
+
+    let full_due = state
+        .ip_cache
+        .full_sync_due(ep.id, FULL_SYNC_INTERVAL)
+        .await;
 
     if full_due {
         match client.fetch_ips(&ep.vault_groups, None).await {
@@ -144,7 +200,8 @@ async fn sync_endpoint(state: &AppState, client: &crate::vault_client::VaultClie
     let due = match ep.last_synced_at {
         None => true,
         Some(last) => {
-            Utc::now().naive_utc() - last >= chrono::Duration::seconds(ep.ttl_seconds.max(1) as i64)
+            Utc::now().naive_utc() - last
+                >= chrono::Duration::seconds(i64::from(ep.ttl_seconds.max(1)))
         }
     };
     if !due {
@@ -153,7 +210,10 @@ async fn sync_endpoint(state: &AppState, client: &crate::vault_client::VaultClie
 
     match client.fetch_ips(&ep.vault_groups, ep.last_synced_at).await {
         Ok(records) => {
-            state.ip_cache.apply_diff(ep.id, &map_records(records)).await;
+            state
+                .ip_cache
+                .apply_diff(ep.id, &map_records(records))
+                .await;
             mark_synced(state, ep).await;
         }
         Err(e) => {
@@ -207,8 +267,12 @@ mod tests {
     use crate::crypto::SecretCipher;
 
     async fn test_db() -> DatabaseConnection {
-        let db = Database::connect("sqlite::memory:").await.expect("in-memory sqlite always opens");
-        crate::migration::Migrator::up(&db, None).await.expect("migrations apply");
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite always opens");
+        crate::migration::Migrator::up(&db, None)
+            .await
+            .expect("migrations apply");
         db
     }
 
@@ -219,22 +283,63 @@ mod tests {
             vault_signing_secret: Some("secret".to_owned()),
             ..RuntimeConfig::default()
         };
-        AppState::new(db.clone(), std::sync::Arc::new(config), std::sync::Arc::new(SecretCipher::Plaintext))
+        AppState::new(
+            db.clone(),
+            std::sync::Arc::new(config),
+            std::sync::Arc::new(SecretCipher::Plaintext),
+        )
+    }
+
+    /// Ensures a Master `api_keys` row exists and returns its UUID for endpoint ownership.
+    async fn ensure_test_master_id(db: &DatabaseConnection) -> Uuid {
+        use sea_orm::{ColumnTrait, QueryFilter};
+        if let Some(existing) = crate::entities::prelude::ApiKey::find()
+            .filter(crate::entities::api_key::Column::IsMaster.eq(true))
+            .one(db)
+            .await
+            .expect("query succeeds")
+        {
+            return existing.id;
+        }
+        let id = Uuid::new_v4();
+        let now = Utc::now().naive_utc();
+        crate::entities::api_key::ActiveModel {
+            id: Set(id),
+            name: Set("Test Master".to_owned()),
+            prefix: Set("tmaster1".to_owned()),
+            key_hash: Set(Uuid::new_v4().simple().to_string()),
+            signing_secret: Set(None),
+            bound_ips: Set(None),
+            is_master: Set(true),
+            can_manage_keys: Set(true),
+            parent_key_id: Set(None),
+            owner_key_id: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(db)
+        .await
+        .expect("insert succeeds");
+        id
     }
 
     /// Inserts a real `endpoints` row (so `mark_synced`'s `UPDATE` has something to affect) and
     /// returns the model `sync_endpoint` expects.
-    async fn insert_test_endpoint(db: &DatabaseConnection, last_synced_at: Option<chrono::NaiveDateTime>) -> endpoint::Model {
+    async fn insert_test_endpoint(
+        db: &DatabaseConnection,
+        last_synced_at: Option<chrono::NaiveDateTime>,
+    ) -> endpoint::Model {
+        let master_id = ensure_test_master_id(db).await;
         let now = Utc::now().naive_utc();
         let model = endpoint::ActiveModel {
             id: Set(Uuid::new_v4()),
-            owner_key_id: Set(None),
+            owner_key_id: Set(Some(master_id)),
             name: Set("Resilience Test".to_owned()),
             description: Set(None),
             token_secret: Set(Uuid::new_v4().simple().to_string()),
             vault_groups: Set("g1".to_owned()),
             max_age_seconds: Set(0),
-        ttl_seconds: Set(1),
+            ttl_seconds: Set(1),
             bound_ips: Set(None),
             filter_rfc1918: Set(false),
             filter_bogons: Set(false),
@@ -259,9 +364,12 @@ mod tests {
                 async move { (status, axum::Json(body)) }
             }),
         );
-        let listener =
-            tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback bind always succeeds");
-        let addr = listener.local_addr().expect("a bound listener has a local address");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind always succeeds");
+        let addr = listener
+            .local_addr()
+            .expect("a bound listener has a local address");
         let handle = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
@@ -316,15 +424,29 @@ mod tests {
                 ],
             )
             .await;
-        assert_eq!(state.ip_cache.snapshot(ep.id).await.len(), 3, "precondition: three cached");
+        assert_eq!(
+            state.ip_cache.snapshot(ep.id).await.len(),
+            3,
+            "precondition: three cached"
+        );
 
         // `last_full_sync_at` is still None (only apply_diff ran), so this endpoint is due a full
         // pass — exactly the state a process is in 24h after its last one.
-        assert!(state.ip_cache.full_sync_due(ep.id, FULL_SYNC_INTERVAL).await);
+        assert!(
+            state
+                .ip_cache
+                .full_sync_due(ep.id, FULL_SYNC_INTERVAL)
+                .await
+        );
         sync_endpoint(&state, &client, ep.clone()).await;
 
-        let mut cached: Vec<String> =
-            state.ip_cache.snapshot(ep.id).await.iter().map(|n| n.to_string()).collect();
+        let mut cached: Vec<String> = state
+            .ip_cache
+            .snapshot(ep.id)
+            .await
+            .iter()
+            .map(ToString::to_string)
+            .collect();
         cached.sort();
         assert_eq!(
             cached,
@@ -333,7 +455,10 @@ mod tests {
              added, and both orphans purged"
         );
         assert!(
-            !state.ip_cache.full_sync_due(ep.id, FULL_SYNC_INTERVAL).await,
+            !state
+                .ip_cache
+                .full_sync_due(ep.id, FULL_SYNC_INTERVAL)
+                .await,
             "and the 24h clock restarts, so the next tick does a differential pass instead"
         );
     }
@@ -365,7 +490,11 @@ mod tests {
         run_boot_sync(&state).await;
 
         let cached = state.ip_cache.snapshot(ep.id).await;
-        assert_eq!(cached.len(), 2, "the boot sync must have fetched and cached both records");
+        assert_eq!(
+            cached.len(),
+            2,
+            "the boot sync must have fetched and cached both records"
+        );
     }
 
     /// The resilience contract at boot: Vault being unreachable must leave the process able to
@@ -375,9 +504,12 @@ mod tests {
     async fn the_boot_sync_returns_normally_when_vault_is_unreachable() {
         // Bind then immediately drop, so the port is genuinely closed — a deterministic
         // ECONNREFUSED without depending on a specific port staying free.
-        let listener =
-            tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback bind always succeeds");
-        let addr = listener.local_addr().expect("a bound listener has a local address");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind always succeeds");
+        let addr = listener
+            .local_addr()
+            .expect("a bound listener has a local address");
         drop(listener);
 
         let db = test_db().await;
@@ -409,7 +541,10 @@ mod tests {
         // waited on the timeout would blow this margin by orders of magnitude.
         let started = std::time::Instant::now();
         run_boot_sync(&state).await;
-        assert!(started.elapsed() < Duration::from_secs(5), "the unconfigured path must return at once");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the unconfigured path must return at once"
+        );
         assert!(state.ip_cache.snapshot(ep.id).await.is_empty());
     }
 
@@ -436,9 +571,12 @@ mod tests {
                 }
             }),
         );
-        let listener =
-            tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback bind always succeeds");
-        let addr = listener.local_addr().expect("a bound listener has a local address");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind always succeeds");
+        let addr = listener
+            .local_addr()
+            .expect("a bound listener has a local address");
         let _server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
@@ -452,7 +590,10 @@ mod tests {
 
         run_boot_sync(&state).await;
         let after_boot = hits.load(Ordering::SeqCst);
-        assert_eq!(after_boot, 1, "the boot sync fetches each endpoint exactly once");
+        assert_eq!(
+            after_boot, 1,
+            "the boot sync fetches each endpoint exactly once"
+        );
 
         // Exactly what `spawn_sync_worker` does before its first sleep.
         sync_all_endpoints(&state).await;
@@ -467,9 +608,11 @@ mod tests {
     /// leave the cache empty rather than in some partially-applied state.
     #[tokio::test]
     async fn full_sync_against_401_does_not_panic_and_leaves_an_empty_cache_empty() {
-        let (url, _server) =
-            spawn_mock_vault(axum::http::StatusCode::UNAUTHORIZED, serde_json::json!({"error": "bad key"}))
-                .await;
+        let (url, _server) = spawn_mock_vault(
+            axum::http::StatusCode::UNAUTHORIZED,
+            serde_json::json!({"error": "bad key"}),
+        )
+        .await;
         let db = test_db().await;
         let state = test_state(&db, url);
         let client = state.vault_client.clone().expect("configured");
@@ -485,22 +628,21 @@ mod tests {
     async fn assert_differential_sync_failure_preserves_the_cache(
         status: Option<axum::http::StatusCode>,
     ) {
-        let (url, _server) = match status {
-            Some(status) => {
-                let (url, server) =
-                    spawn_mock_vault(status, serde_json::json!({"error": "rejected"})).await;
-                (url, Some(server))
-            }
+        let (url, _server) = if let Some(status) = status {
+            let (url, server) =
+                spawn_mock_vault(status, serde_json::json!({"error": "rejected"})).await;
+            (url, Some(server))
+        } else {
             // `None` selects the connection-failure case: bind to grab a free port, then drop the
             // listener so nothing answers there.
-            None => {
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                    .await
-                    .expect("loopback bind always succeeds");
-                let addr = listener.local_addr().expect("bound listener has an address");
-                drop(listener);
-                (format!("http://{addr}"), None)
-            }
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("loopback bind always succeeds");
+            let addr = listener
+                .local_addr()
+                .expect("bound listener has an address");
+            drop(listener);
+            (format!("http://{addr}"), None)
         };
 
         let db = test_db().await;
@@ -509,40 +651,69 @@ mod tests {
 
         // A prior successful full sync populated the cache and marked `last_full_sync_at`, so this
         // call takes the differential branch below rather than attempting another full sync.
-        let ep = insert_test_endpoint(&db, Some(Utc::now().naive_utc() - chrono::Duration::hours(1)))
+        let ep = insert_test_endpoint(
+            &db,
+            Some(Utc::now().naive_utc() - chrono::Duration::hours(1)),
+        )
+        .await;
+        state
+            .ip_cache
+            .apply_full(
+                ep.id,
+                &[seed_record("8.8.8.8/32"), seed_record("1.1.1.1/32")],
+            )
             .await;
-        state.ip_cache.apply_full(ep.id, &[seed_record("8.8.8.8/32"), seed_record("1.1.1.1/32")]).await;
         let before = state.ip_cache.snapshot(ep.id).await;
-        assert_eq!(before.len(), 2, "the fixture pre-populates two cached records");
+        assert_eq!(
+            before.len(),
+            2,
+            "the fixture pre-populates two cached records"
+        );
 
         sync_endpoint(&state, &client, ep.clone()).await;
 
         let after = state.ip_cache.snapshot(ep.id).await;
-        assert_eq!(after.len(), before.len(), "the cache must be unchanged after a failed sync");
+        assert_eq!(
+            after.len(),
+            before.len(),
+            "the cache must be unchanged after a failed sync"
+        );
         let after_set: std::collections::HashSet<_> = after.into_iter().collect();
         let before_set: std::collections::HashSet<_> = before.into_iter().collect();
         assert_eq!(after_set, before_set);
 
         // `last_synced_at` in the database must not have been falsely advanced by a failed sync —
         // a later differential fetch should still use the true last-successful timestamp as `since`.
-        let reloaded = Endpoint::find_by_id(ep.id).one(&state.db).await.expect("query succeeds").expect("row exists");
+        let reloaded = Endpoint::find_by_id(ep.id)
+            .one(&state.db)
+            .await
+            .expect("query succeeds")
+            .expect("row exists");
         assert_eq!(reloaded.last_synced_at, ep.last_synced_at);
     }
 
     #[tokio::test]
     async fn differential_sync_against_401_preserves_the_cache() {
-        assert_differential_sync_failure_preserves_the_cache(Some(axum::http::StatusCode::UNAUTHORIZED)).await;
+        assert_differential_sync_failure_preserves_the_cache(Some(
+            axum::http::StatusCode::UNAUTHORIZED,
+        ))
+        .await;
     }
 
     #[tokio::test]
     async fn differential_sync_against_403_preserves_the_cache() {
-        assert_differential_sync_failure_preserves_the_cache(Some(axum::http::StatusCode::FORBIDDEN)).await;
+        assert_differential_sync_failure_preserves_the_cache(Some(
+            axum::http::StatusCode::FORBIDDEN,
+        ))
+        .await;
     }
 
     #[tokio::test]
     async fn differential_sync_against_500_preserves_the_cache() {
-        assert_differential_sync_failure_preserves_the_cache(Some(axum::http::StatusCode::INTERNAL_SERVER_ERROR))
-            .await;
+        assert_differential_sync_failure_preserves_the_cache(Some(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        ))
+        .await;
     }
 
     #[tokio::test]
@@ -566,16 +737,95 @@ mod tests {
         let state = test_state(&db, url);
         let client = state.vault_client.clone().expect("configured");
 
-        let ep = insert_test_endpoint(&db, Some(Utc::now().naive_utc() - chrono::Duration::hours(1)))
+        let ep = insert_test_endpoint(
+            &db,
+            Some(Utc::now().naive_utc() - chrono::Duration::hours(1)),
+        )
+        .await;
+        state
+            .ip_cache
+            .apply_full(ep.id, &[seed_record("8.8.8.8/32")])
             .await;
-        state.ip_cache.apply_full(ep.id, &[seed_record("8.8.8.8/32")]).await;
 
         sync_endpoint(&state, &client, ep.clone()).await;
 
         let after = state.ip_cache.snapshot(ep.id).await;
-        assert_eq!(after.len(), 2, "the new record was merged in alongside the pre-existing one");
+        assert_eq!(
+            after.len(),
+            2,
+            "the new record was merged in alongside the pre-existing one"
+        );
 
-        let reloaded = Endpoint::find_by_id(ep.id).one(&state.db).await.expect("query succeeds").expect("row exists");
-        assert!(reloaded.last_synced_at > ep.last_synced_at, "a successful sync must advance last_synced_at");
+        let reloaded = Endpoint::find_by_id(ep.id)
+            .one(&state.db)
+            .await
+            .expect("query succeeds")
+            .expect("row exists");
+        assert!(
+            reloaded.last_synced_at > ep.last_synced_at,
+            "a successful sync must advance last_synced_at"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_skips_and_evicts_cache_when_daughter_permissions_are_revoked() {
+        let (url, _server) = spawn_mock_vault(
+            axum::http::StatusCode::OK,
+            serde_json::json!([{"target_address": "1.2.3.4/32", "last_seen_at": "2026-08-11T10:00:00", "is_deleted": false}]),
+        )
+        .await;
+        let db = test_db().await;
+        let _master_id = ensure_test_master_id(&db).await;
+        let daughter_id = Uuid::new_v4();
+        let now = Utc::now().naive_utc();
+        crate::entities::api_key::ActiveModel {
+            id: Set(daughter_id),
+            name: Set("Scoped Daughter".to_owned()),
+            prefix: Set("sdaught1".to_owned()),
+            key_hash: Set(Uuid::new_v4().simple().to_string()),
+            signing_secret: Set(None),
+            bound_ips: Set(None),
+            is_master: Set(false),
+            can_manage_keys: Set(false),
+            parent_key_id: Set(None),
+            owner_key_id: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .expect("insert daughter succeeds");
+
+        let ep = endpoint::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            owner_key_id: Set(Some(daughter_id)),
+            name: Set("Revoked Endpoint".to_owned()),
+            description: Set(None),
+            token_secret: Set(Uuid::new_v4().simple().to_string()),
+            vault_groups: Set("g1".to_owned()),
+            max_age_seconds: Set(0),
+            ttl_seconds: Set(1),
+            bound_ips: Set(None),
+            filter_rfc1918: Set(false),
+            filter_bogons: Set(false),
+            filter_loopback: Set(false),
+            last_synced_at: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .expect("insert endpoint succeeds");
+
+        let state = test_state(&db, url);
+        let client = state.vault_client.clone().expect("configured");
+        state
+            .ip_cache
+            .apply_full(ep.id, &[seed_record("8.8.8.8/32")])
+            .await;
+
+        // No grant in vault_group_permissions -> sync must skip & evict cache immediately.
+        sync_endpoint(&state, &client, ep.clone()).await;
+        assert!(state.ip_cache.snapshot(ep.id).await.is_empty());
     }
 }

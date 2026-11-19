@@ -1,7 +1,7 @@
 //! Liveness and readiness probes. Neither requires authentication: the callers are container
 //! orchestrators and load balancers, none of which can compute an HMAC over a rolling timestamp.
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use sea_orm::{EntityTrait, PaginatorTrait};
 use serde_json::json;
 
@@ -16,7 +16,7 @@ pub async fn health_check() -> impl IntoResponse {
 /// `GET /ready` / `/readyz` — readiness. `200` only when the database answers and the Master
 /// identity is pinned; `503` otherwise.
 ///
-/// The database check is an ordinary SeaORM query (`AGENT.MD` forbids raw SQL outside `src/db.rs`
+/// The database check is an ordinary `SeaORM` query (`AGENT.MD` forbids raw SQL outside `src/db.rs`
 /// and migrations) — `count()` against `api_keys` rather than a raw `SELECT 1`, which proves the
 /// connection and the schema are both usable without depending on the table holding any rows.
 pub async fn readiness_check(State(state): State<AppState>) -> impl IntoResponse {
@@ -26,9 +26,10 @@ pub async fn readiness_check(State(state): State<AppState>) -> impl IntoResponse
     if db_ok && master_pinned {
         (StatusCode::OK, Json(json!({ "status": "ready" })))
     } else {
+        tracing::warn!(db_ok, master_pinned, "Readiness check failed");
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "status": "not_ready", "database": db_ok, "master_pinned": master_pinned })),
+            Json(json!({ "status": "not_ready" })),
         )
     }
 }

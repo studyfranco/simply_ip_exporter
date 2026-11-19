@@ -8,10 +8,10 @@
 use std::time::Instant;
 
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, Database, DatabaseBackend,
-    EntityTrait, QueryFilter, QueryOrder, QuerySelect, Statement,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, Database, EntityTrait, QueryFilter,
+    QueryOrder, QuerySelect,
 };
-use sea_orm_migration::MigratorTrait;
+use sea_orm_migration::{MigratorTrait, SchemaManager, prelude::Index};
 use uuid::Uuid;
 
 use simply_ip_exporter::db::has_index;
@@ -23,11 +23,19 @@ async fn verify_all_performance_indexes_are_applied() {
     let db = Database::connect("sqlite::memory:")
         .await
         .expect("in-memory database opens");
-    Migrator::up(&db, None).await.expect("migrations apply cleanly");
+    Migrator::up(&db, None)
+        .await
+        .expect("migrations apply cleanly");
 
     let required_indexes = [
-        ("vault_group_permissions", "idx_vault_group_permissions_vault_group_id"),
-        ("vault_group_permissions", "idx_vault_group_permissions_key_group"),
+        (
+            "vault_group_permissions",
+            "idx_vault_group_permissions_vault_group_id",
+        ),
+        (
+            "vault_group_permissions",
+            "idx_vault_group_permissions_key_group",
+        ),
         ("api_keys", "idx_api_keys_is_master"),
         ("api_keys", "idx_api_keys_created_at_desc"),
         ("api_keys", "idx_api_keys_prefix"),
@@ -41,7 +49,9 @@ async fn verify_all_performance_indexes_are_applied() {
 
     for (table, index) in required_indexes {
         assert!(
-            has_index(&db, table, index).await.expect("index check succeeds"),
+            has_index(&db, table, index)
+                .await
+                .expect("index check succeeds"),
             "Expected index '{index}' on table '{table}' to exist after migrations"
         );
     }
@@ -52,7 +62,9 @@ async fn benchmark_vault_group_id_lookup_performance() {
     let db = Database::connect("sqlite::memory:")
         .await
         .expect("in-memory database opens");
-    Migrator::up(&db, None).await.expect("migrations apply cleanly");
+    Migrator::up(&db, None)
+        .await
+        .expect("migrations apply cleanly");
 
     // Seed 1 master key + 200 daughter keys
     let master_id = Uuid::new_v4();
@@ -83,7 +95,7 @@ async fn benchmark_vault_group_id_lookup_performance() {
         api_key::ActiveModel {
             id: Set(key_id),
             name: Set(format!("Key {i}")),
-            prefix: Set(format!("k{:07}", i)),
+            prefix: Set(format!("k{i:07}")),
             key_hash: Set(format!("hash_{i}")),
             signing_secret: Set(None),
             bound_ips: Set(None),
@@ -125,12 +137,15 @@ async fn benchmark_vault_group_id_lookup_performance() {
     let duration_indexed = start_indexed.elapsed();
 
     // 2. Drop index and measure without index (simulating sequential table scan)
-    db.execute_raw(Statement::from_string(
-        DatabaseBackend::Sqlite,
-        "DROP INDEX idx_vault_group_permissions_vault_group_id;".to_owned(),
-    ))
-    .await
-    .expect("drop index succeeds");
+    SchemaManager::new(&db)
+        .drop_index(
+            Index::drop()
+                .name("idx_vault_group_permissions_vault_group_id")
+                .table("vault_group_permissions")
+                .to_owned(),
+        )
+        .await
+        .expect("drop index succeeds");
 
     let start_unindexed = Instant::now();
     for _ in 0..200 {
@@ -151,9 +166,7 @@ async fn benchmark_vault_group_id_lookup_performance() {
 
     assert!(
         duration_indexed <= duration_unindexed.mul_f64(1.25),
-        "Indexed query ({:?}) should be faster than or comparable to unindexed ({:?})",
-        duration_indexed,
-        duration_unindexed
+        "Indexed query ({duration_indexed:?}) should be faster than or comparable to unindexed ({duration_unindexed:?})"
     );
 }
 
@@ -162,7 +175,9 @@ async fn benchmark_api_keys_is_master_lookup_performance() {
     let db = Database::connect("sqlite::memory:")
         .await
         .expect("in-memory database opens");
-    Migrator::up(&db, None).await.expect("migrations apply cleanly");
+    Migrator::up(&db, None)
+        .await
+        .expect("migrations apply cleanly");
 
     let now = chrono::Utc::now().naive_utc();
 
@@ -171,7 +186,7 @@ async fn benchmark_api_keys_is_master_lookup_performance() {
         api_key::ActiveModel {
             id: Set(Uuid::new_v4()),
             name: Set(format!("Daughter Key {i}")),
-            prefix: Set(format!("d{:07}", i)),
+            prefix: Set(format!("d{i:07}")),
             key_hash: Set(format!("hash_d_{i}")),
             signing_secret: Set(None),
             bound_ips: Set(None),
@@ -219,12 +234,15 @@ async fn benchmark_api_keys_is_master_lookup_performance() {
     let duration_indexed = start_indexed.elapsed();
 
     // 2. Drop index and measure without index
-    db.execute_raw(Statement::from_string(
-        DatabaseBackend::Sqlite,
-        "DROP INDEX idx_api_keys_is_master;".to_owned(),
-    ))
-    .await
-    .expect("drop index succeeds");
+    SchemaManager::new(&db)
+        .drop_index(
+            Index::drop()
+                .name("idx_api_keys_is_master")
+                .table("api_keys")
+                .to_owned(),
+        )
+        .await
+        .expect("drop index succeeds");
 
     let start_unindexed = Instant::now();
     for _ in 0..300 {
@@ -246,9 +264,7 @@ async fn benchmark_api_keys_is_master_lookup_performance() {
 
     assert!(
         duration_indexed <= duration_unindexed.mul_f64(1.25),
-        "Indexed query ({:?}) should be faster than or comparable to unindexed ({:?})",
-        duration_indexed,
-        duration_unindexed
+        "Indexed query ({duration_indexed:?}) should be faster than or comparable to unindexed ({duration_unindexed:?})"
     );
 }
 
@@ -257,7 +273,9 @@ async fn benchmark_endpoints_created_at_ordering_performance() {
     let db = Database::connect("sqlite::memory:")
         .await
         .expect("in-memory database opens");
-    Migrator::up(&db, None).await.expect("migrations apply cleanly");
+    Migrator::up(&db, None)
+        .await
+        .expect("migrations apply cleanly");
 
     let base_time = chrono::Utc::now().naive_utc();
 
@@ -277,7 +295,7 @@ async fn benchmark_endpoints_created_at_ordering_performance() {
             filter_bogons: Set(false),
             filter_loopback: Set(false),
             last_synced_at: Set(None),
-            created_at: Set(base_time - chrono::Duration::seconds(i as i64 * 10)),
+            created_at: Set(base_time - chrono::Duration::seconds(i64::from(i) * 10)),
             updated_at: Set(base_time),
         }
         .insert(&db)
@@ -299,12 +317,15 @@ async fn benchmark_endpoints_created_at_ordering_performance() {
     let duration_indexed = start_indexed.elapsed();
 
     // 2. Drop index and measure without index (forces sorting in memory/filesort)
-    db.execute_raw(Statement::from_string(
-        DatabaseBackend::Sqlite,
-        "DROP INDEX idx_endpoints_created_at_desc;".to_owned(),
-    ))
-    .await
-    .expect("drop index succeeds");
+    SchemaManager::new(&db)
+        .drop_index(
+            Index::drop()
+                .name("idx_endpoints_created_at_desc")
+                .table("endpoints")
+                .to_owned(),
+        )
+        .await
+        .expect("drop index succeeds");
 
     let start_unindexed = Instant::now();
     for _ in 0..100 {
@@ -327,8 +348,6 @@ async fn benchmark_endpoints_created_at_ordering_performance() {
 
     assert!(
         duration_indexed <= duration_unindexed.mul_f64(1.25),
-        "Indexed query ({:?}) should be faster than or comparable to unindexed ({:?})",
-        duration_indexed,
-        duration_unindexed
+        "Indexed query ({duration_indexed:?}) should be faster than or comparable to unindexed ({duration_unindexed:?})"
     );
 }

@@ -36,15 +36,39 @@ impl MigrationTrait for Migration {
                 Table::create()
                     .table(VaultGroupPermissions::Table)
                     .if_not_exists()
-                    .col(ColumnDef::new(VaultGroupPermissions::Id).uuid().not_null().primary_key())
-                    .col(ColumnDef::new(VaultGroupPermissions::ApiKeyId).uuid().not_null())
-                    .col(ColumnDef::new(VaultGroupPermissions::VaultGroupId).uuid().not_null())
-                    .col(ColumnDef::new(VaultGroupPermissions::VaultGroupName).string().not_null())
-                    .col(ColumnDef::new(VaultGroupPermissions::CreatedAt).date_time().not_null())
+                    .col(
+                        ColumnDef::new(VaultGroupPermissions::Id)
+                            .uuid()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(VaultGroupPermissions::ApiKeyId)
+                            .uuid()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(VaultGroupPermissions::VaultGroupId)
+                            .uuid()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(VaultGroupPermissions::VaultGroupName)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(VaultGroupPermissions::CreatedAt)
+                            .date_time()
+                            .not_null(),
+                    )
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk_vault_group_permissions_api_key_id")
-                            .from(VaultGroupPermissions::Table, VaultGroupPermissions::ApiKeyId)
+                            .from(
+                                VaultGroupPermissions::Table,
+                                VaultGroupPermissions::ApiKeyId,
+                            )
                             .to(ApiKeys::Table, ApiKeys::Id)
                             .on_delete(ForeignKeyAction::Cascade)
                             .on_update(ForeignKeyAction::Cascade),
@@ -68,6 +92,8 @@ impl MigrationTrait for Migration {
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager.drop_table(Table::drop().table(VaultGroupPermissions::Table).to_owned()).await
+        manager
+            .drop_table(Table::drop().table(VaultGroupPermissions::Table).to_owned())
+            .await
     }
 }

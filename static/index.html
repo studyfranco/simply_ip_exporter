@@ -81,7 +81,7 @@
             <h2>Endpoints</h2>
             <p class="subtitle">Configure and manage live IP export feeds sourced from Simply IP Vault groups.</p>
           </div>
-          <button type="button" id="open-create-endpoint" class="btn btn-primary">+ Add Endpoint</button>
+          <button type="button" id="open-create-endpoint" class="btn btn-primary">+ New Endpoint</button>
         </div>
         <div class="table-container">
           <table class="data-table data-table-fixed">
@@ -112,7 +112,7 @@
             <h2>API Keys</h2>
             <p class="subtitle">Create and manage Daughter keys. Master status is fixed at bootstrap and cannot be granted here.</p>
           </div>
-          <button type="button" id="btn-open-create-key" class="btn btn-primary">+ New Key</button>
+          <button type="button" id="btn-open-create-key" class="btn btn-primary">+ Create API Key</button>
         </div>
 
         <div class="batch-actions batch-actions-keys hidden">
@@ -124,7 +124,7 @@
             <thead>
               <tr>
                 <th><input type="checkbox" id="select-all-keys" title="Select all" /></th>
-                <th>Name</th><th>Prefix</th><th>Tier</th><th>Global rights</th><th>Vault groups</th><th>Bound IPs</th><th></th>
+                <th>Name</th><th>Prefix</th><th>Tier</th><th>Global rights</th><th title="Read-only Vault group scope for /feed/v1/* endpoints (Master sees all groups)">Vault groups</th><th>Bound IPs</th><th></th>
               </tr>
             </thead>
             <tbody id="keys-body"></tbody>
@@ -175,7 +175,7 @@
           <input type="text" id="audit-ip-filter" class="input-field font-mono" placeholder="Filter by client IP...">
           <input type="text" id="audit-key-filter" class="input-field" placeholder="Filter by API key (name, prefix, or UUID)...">
           <input type="datetime-local" id="audit-since-filter" class="input-field" title="Since (inclusive)">
-          <input type="datetime-local" id="audit-until-filter" class="input-field" title="Until (exclusive)">
+          <input type="datetime-local" id="audit-until-filter" class="input-field" title="Until (inclusive)">
           <button type="button" id="audit-search-btn" class="btn btn-icon" title="Search">🔍</button>
           <button type="button" id="audit-clear-btn" class="btn btn-secondary btn-sm">Clear</button>
         </div>
@@ -239,7 +239,8 @@
              nothing to assign. Each checkbox grants/revokes immediately on toggle — a separate
              action from "Save Changes", which only ever touches name/bound_ips/can_manage_keys. -->
         <div class="form-group hidden" id="kf-groups-section">
-          <label>Vault Group Access (read)</label>
+          <label title="Read-only Vault group scope for /feed/v1/* endpoints">Vault Group Access (read)</label>
+          <small class="field-hint">Read-only Vault group scope: restricts which Vault groups this Daughter key's <code>/feed/v1/*</code> endpoints may pull from.</small>
           <div id="kf-groups-list" class="permissions-grid mt-2 mb-4">
             <span class="text-muted text-sm">Loading…</span>
           </div>
@@ -247,7 +248,7 @@
         </div>
         <div class="form-actions mt-4">
           <button type="submit" class="btn btn-primary" id="kf-submit-btn">Create Key</button>
-          <button type="button" id="kf-cancel" class="btn btn-secondary">Cancel</button>
+          <button type="button" id="kf-cancel" class="btn btn-cancel">Cancel</button>
         </div>
         <div id="key-error" class="message error hidden"></div>
       </form>
@@ -301,7 +302,7 @@
           </div>
         </div>
         <div class="form-group">
-          <label for="ep-groups-list">Vault groups <span class="required-marker">*</span></label>
+          <label for="ep-groups-list" title="Read-only Vault group scope for this /feed/v1/* endpoint">Vault groups <span class="required-marker">*</span></label>
           <div class="permissions-grid" id="ep-groups-list"></div>
           <small class="field-hint" id="ep-groups-hint"></small>
           <div id="ep-groups-error" class="message error hidden"></div>
@@ -361,7 +362,7 @@
           </div>
         </div>
         <div class="form-group">
-          <label for="edit-ep-groups-list">Vault groups <span class="required-marker">*</span></label>
+          <label for="edit-ep-groups-list" title="Read-only Vault group scope for this /feed/v1/* endpoint">Vault groups <span class="required-marker">*</span></label>
           <div class="permissions-grid" id="edit-ep-groups-list"></div>
           <small class="field-hint" id="edit-ep-groups-hint"></small>
           <div id="edit-ep-groups-error" class="message error hidden"></div>

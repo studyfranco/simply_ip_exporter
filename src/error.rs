@@ -1,6 +1,10 @@
 //! Application errors.
 
-use axum::{Json, http::StatusCode, response::{IntoResponse, Response}};
+use axum::{
+    Json,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
 use serde_json::json;
 use thiserror::Error;
 
@@ -96,8 +100,24 @@ impl IntoResponse for AppError {
 
         let (status, error_message) = match self {
             AppError::DbError(err) => {
-                tracing::error!("Database error: {}", err);
-                (StatusCode::INTERNAL_SERVER_ERROR, "Internal database error".to_owned())
+                let msg = err.to_string().to_ascii_lowercase();
+                if msg.contains("database is locked")
+                    || msg.contains("database is busy")
+                    || msg.contains("sqlite_busy")
+                    || msg.contains("pool timed out")
+                {
+                    tracing::warn!("Transient database contention: {}", err);
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Database is temporarily busy; retry shortly".to_owned(),
+                    )
+                } else {
+                    tracing::error!("Database error: {}", err);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Internal database error".to_owned(),
+                    )
+                }
             }
             AppError::InvalidInput(msg) => (StatusCode::BAD_REQUEST, msg),
             AppError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg),
@@ -108,16 +128,18 @@ impl IntoResponse for AppError {
             AppError::ConflictWithDetails { message, .. } => (StatusCode::CONFLICT, message),
             AppError::TooManyRequests(msg) => (StatusCode::TOO_MANY_REQUESTS, msg),
             AppError::BodyRejected(status, msg) => (status, msg),
-            AppError::Internal => {
-                (StatusCode::INTERNAL_SERVER_ERROR, "An internal server error occurred".to_owned())
-            }
+            AppError::Internal => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "An internal server error occurred".to_owned(),
+            ),
             AppError::VaultNotConfigured => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "simply_ip_vault sync is not configured on this instance".to_owned(),
             ),
-            AppError::VaultUnreachable => {
-                (StatusCode::BAD_GATEWAY, "Could not reach simply_ip_vault".to_owned())
-            }
+            AppError::VaultUnreachable => (
+                StatusCode::BAD_GATEWAY,
+                "Could not reach simply_ip_vault".to_owned(),
+            ),
         };
 
         (status, Json(json!({ "error": error_message }))).into_response()

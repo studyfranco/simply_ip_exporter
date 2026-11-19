@@ -123,6 +123,7 @@ pub struct TrustedProxies {
 
 impl TrustedProxies {
     /// Builds from an already-parsed matcher list.
+    #[must_use]
     pub fn new(matchers: Vec<ProxyMatcher>) -> Self {
         let networks: Vec<IpNet> = matchers
             .iter()
@@ -151,6 +152,7 @@ impl TrustedProxies {
     /// `bound_ips` hostname checks (`bound_ips::is_allowed`) resolve through the exact same
     /// cache/TTL policy, and so a name referenced by both `TRUSTED_PROXIES` and some key's/
     /// endpoint's `bound_ips` resolves once rather than twice.
+    #[must_use]
     pub fn dns_resolver(&self) -> DnsResolver {
         self.dns.clone()
     }
@@ -164,6 +166,9 @@ impl TrustedProxies {
     ///
     /// An **unset** variable is not an error: the zero-configuration case means "trust nothing",
     /// the safe posture rather than an ambiguous one.
+    ///
+    /// # Errors
+    /// Returns [`InvalidTrustedProxies`] if any entry is syntactically malformed.
     pub fn from_env() -> Result<Self, InvalidTrustedProxies> {
         let Ok(raw) = std::env::var(TRUSTED_PROXIES_ENV) else {
             return Ok(Self::default());
@@ -189,17 +194,20 @@ impl TrustedProxies {
     /// Overrides both DNS reuse windows. Test-facing: a suite cannot wait 30 seconds to observe
     /// that a re-resolution happened, nor 5 to observe that one was suppressed.
     #[cfg(test)]
+    #[must_use]
     pub fn with_ttls(mut self, positive: Duration, negative: Duration) -> Self {
         self.dns = DnsResolver::with_ttls(positive, negative);
         self
     }
 
     /// Whether nothing at all is trusted — the secure default.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.matchers.is_empty()
     }
 
     /// The configured matchers, for startup logging.
+    #[must_use]
     pub fn matchers(&self) -> &[ProxyMatcher] {
         &self.matchers
     }
@@ -261,7 +269,11 @@ impl TrustedProxies {
                         "All {} {} hostname entr{} resolved at startup.",
                         proxies.hostnames.len(),
                         TRUSTED_PROXIES_ENV,
-                        if proxies.hostnames.len() == 1 { "y" } else { "ies" }
+                        if proxies.hostnames.len() == 1 {
+                            "y"
+                        } else {
+                            "ies"
+                        }
                     );
                 }
                 return;
@@ -316,6 +328,9 @@ impl TrustedProxies {
 ///
 /// The check is purely syntactic and does no I/O: a well-formed hostname is accepted here whether
 /// or not it currently resolves, which is what keeps a DNS outage from becoming a refusal to boot.
+///
+/// # Errors
+/// Returns `Err` listing every syntactically invalid proxy entry found in `raw`.
 pub fn parse_trusted_proxies(raw: &str) -> Result<Vec<ProxyMatcher>, Vec<InvalidProxyEntry>> {
     let mut matchers = Vec::new();
     let mut invalid = Vec::new();
@@ -328,12 +343,19 @@ pub fn parse_trusted_proxies(raw: &str) -> Result<Vec<ProxyMatcher>, Vec<Invalid
         } else {
             match hostname_rejection(entry) {
                 None => matchers.push(ProxyMatcher::Hostname(entry.to_owned())),
-                Some(reason) => invalid.push(InvalidProxyEntry { entry: entry.to_owned(), reason }),
+                Some(reason) => invalid.push(InvalidProxyEntry {
+                    entry: entry.to_owned(),
+                    reason,
+                }),
             }
         }
     }
 
-    if invalid.is_empty() { Ok(matchers) } else { Err(invalid) }
+    if invalid.is_empty() {
+        Ok(matchers)
+    } else {
+        Err(invalid)
+    }
 }
 
 // `hostname_rejection` — the syntactic check backing the `else` branch above — now lives in
@@ -361,18 +383,18 @@ pub fn resolve_client_ip(
         return peer;
     }
 
-    if let Some(forwarded) = headers.get("X-Forwarded-For").and_then(|h| h.to_str().ok()) {
-        let client = forwarded
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .filter_map(|s| s.parse::<IpAddr>().ok())
-            .map(normalize_ip)
-            .rev()
-            .find(|ip| !is_trusted(*ip, trusted));
-        if let Some(client) = client {
-            return client;
-        }
+    let hops: Vec<IpAddr> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|h| h.to_str().ok())
+        .flat_map(|forwarded| forwarded.split(','))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse::<IpAddr>().ok())
+        .map(normalize_ip)
+        .collect();
+    if let Some(client) = hops.into_iter().rev().find(|ip| !is_trusted(*ip, trusted)) {
+        return client;
     }
 
     if let Some(real_ip) = headers
@@ -423,6 +445,9 @@ impl RuntimeConfig {
     /// Builds the configuration from the process environment, falling back to defaults. Fails
     /// only on a syntactically malformed `TRUSTED_PROXIES` entry — a well-formed hostname that
     /// merely doesn't resolve yet is not an error here; see [`TrustedProxies::from_env`].
+    ///
+    /// # Errors
+    /// Returns [`InvalidTrustedProxies`] if `TRUSTED_PROXIES` contains invalid syntax.
     pub fn from_env() -> Result<Self, InvalidTrustedProxies> {
         let defaults = Self::default();
 
@@ -462,12 +487,12 @@ impl RuntimeConfig {
 pub fn get_secret_or_env(var_name: &str) -> Option<String> {
     if let Ok(file_path) = std::env::var(format!("{var_name}_FILE")) {
         let trimmed = file_path.trim();
-        if !trimmed.is_empty() {
-            if let Ok(content) = std::fs::read_to_string(trimmed) {
-                let trimmed_content = content.trim().to_owned();
-                if !trimmed_content.is_empty() {
-                    return Some(trimmed_content);
-                }
+        if !trimmed.is_empty()
+            && let Ok(content) = std::fs::read_to_string(trimmed)
+        {
+            let trimmed_content = content.trim().to_owned();
+            if !trimmed_content.is_empty() {
+                return Some(trimmed_content);
             }
         }
     }
@@ -487,8 +512,11 @@ pub fn get_secret_or_env(var_name: &str) -> Option<String> {
 }
 
 /// Resolves the socket address the HTTP server binds to, from `BIND_HOST`/`HOST` and `PORT`.
+#[must_use]
 pub fn resolve_bind_addr() -> SocketAddr {
-    let host = std::env::var("BIND_HOST").or_else(|_| std::env::var("HOST")).ok();
+    let host = std::env::var("BIND_HOST")
+        .or_else(|_| std::env::var("HOST"))
+        .ok();
     let port = std::env::var("PORT").ok();
     parse_bind_addr(host.as_deref(), port.as_deref())
 }
@@ -536,6 +564,9 @@ pub enum InitialMasterKeyError {
 
 /// Validates the `INITIAL_MASTER_KEY` bootstrap override. Absence is the documented zero-config
 /// path and is not an error; a set-but-invalid value is fatal.
+///
+/// # Errors
+/// Returns [`InitialMasterKeyError`] if the provided value is empty, non-hex, or wrong length.
 pub fn validate_initial_master_key(
     raw: Option<&str>,
 ) -> Result<Option<String>, InitialMasterKeyError> {
@@ -544,7 +575,10 @@ pub fn validate_initial_master_key(
     if candidate.is_empty() {
         return Err(InitialMasterKeyError::Empty);
     }
-    if let Some((index, found)) = candidate.char_indices().find(|(_, c)| !c.is_ascii_hexdigit()) {
+    if let Some((index, found)) = candidate
+        .char_indices()
+        .find(|(_, c)| !c.is_ascii_hexdigit())
+    {
         return Err(InitialMasterKeyError::NonHex(found, index));
     }
     let width = candidate.chars().count();
@@ -573,7 +607,11 @@ mod tests {
     fn parses_cidrs_and_bare_addresses_as_network_matchers() {
         let matchers = parse_trusted_proxies("127.0.0.1, 10.0.0.0/8 ,::1").expect("parses");
         assert_eq!(matchers.len(), 3);
-        assert!(matchers.iter().all(|m| matches!(m, ProxyMatcher::Network(_))));
+        assert!(
+            matchers
+                .iter()
+                .all(|m| matches!(m, ProxyMatcher::Network(_)))
+        );
     }
 
     /// The motivating case (`AGENT_NOTES.MD`, 2026-08-19): a Docker container name like
@@ -582,7 +620,10 @@ mod tests {
     #[test]
     fn a_docker_container_name_parses_as_a_hostname_matcher() {
         let matchers = parse_trusted_proxies("traefik_tomidejetsu").expect("a hostname parses");
-        assert_eq!(matchers, vec![ProxyMatcher::Hostname("traefik_tomidejetsu".to_owned())]);
+        assert_eq!(
+            matchers,
+            vec![ProxyMatcher::Hostname("traefik_tomidejetsu".to_owned())]
+        );
     }
 
     #[test]
@@ -613,7 +654,10 @@ mod tests {
     #[test]
     fn digits_and_dots_only_is_rejected_as_a_malformed_address_not_accepted_as_a_hostname() {
         let err = parse_trusted_proxies("10.0.0.256").unwrap_err();
-        assert_eq!(err[0].reason, "made only of digits and dots, so this is a malformed IPv4 literal");
+        assert_eq!(
+            err[0].reason,
+            "made only of digits and dots, so this is a malformed IPv4 literal"
+        );
     }
 
     /// `10.0.0.0/99` is a near-miss CIDR (contains `/`), not a hostname — must surface as the
@@ -627,16 +671,32 @@ mod tests {
     #[test]
     fn multiple_bad_entries_are_all_reported_not_just_the_first() {
         let err = parse_trusted_proxies("not/valid, also:bad").unwrap_err();
-        assert_eq!(err.len(), 2, "an operator with two typos should see both in one restart");
+        assert_eq!(
+            err.len(),
+            2,
+            "an operator with two typos should see both in one restart"
+        );
     }
 
     #[test]
     fn hostname_edge_cases() {
         assert_eq!(hostname_rejection(""), Some("empty"));
-        assert_eq!(hostname_rejection("-leading-dash"), Some("a hostname must begin and end with a letter or a digit"));
-        assert_eq!(hostname_rejection("trailing-dash-"), Some("a hostname must begin and end with a letter or a digit"));
-        assert_eq!(hostname_rejection("has a space"), Some("contains characters that cannot appear in a DNS name"));
-        assert_eq!(hostname_rejection(&"a".repeat(254)), Some("longer than the 253-character limit on a DNS name"));
+        assert_eq!(
+            hostname_rejection("-leading-dash"),
+            Some("a hostname must begin and end with a letter or a digit")
+        );
+        assert_eq!(
+            hostname_rejection("trailing-dash-"),
+            Some("a hostname must begin and end with a letter or a digit")
+        );
+        assert_eq!(
+            hostname_rejection("has a space"),
+            Some("contains characters that cannot appear in a DNS name")
+        );
+        assert_eq!(
+            hostname_rejection(&"a".repeat(254)),
+            Some("longer than the 253-character limit on a DNS name")
+        );
         assert_eq!(hostname_rejection("traefik_tomidejetsu"), None);
         assert_eq!(hostname_rejection("proxy.internal"), None);
         assert_eq!(hostname_rejection("traefik-1"), None);
@@ -672,11 +732,16 @@ mod tests {
     async fn a_resolvable_hostname_becomes_trusted() {
         let proxies = TrustedProxies::new(vec![ProxyMatcher::Hostname("localhost".to_owned())]);
         let resolved = proxies.resolved().await;
-        assert!(!resolved.is_empty(), "localhost must resolve to at least one address");
+        assert!(
+            !resolved.is_empty(),
+            "localhost must resolve to at least one address"
+        );
         let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let loopback_v6 = IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
         assert!(
-            resolved.iter().any(|n| n.addr() == loopback || n.addr() == loopback_v6),
+            resolved
+                .iter()
+                .any(|n| n.addr() == loopback || n.addr() == loopback_v6),
             "expected a loopback address among {resolved:?}"
         );
     }
@@ -685,8 +750,9 @@ mod tests {
     /// exactly the property `resolve_hostname`'s own doc comment describes.
     #[tokio::test]
     async fn an_unresolvable_hostname_yields_no_addresses_and_does_not_error() {
-        let proxies =
-            TrustedProxies::new(vec![ProxyMatcher::Hostname("this-name-does-not-exist.invalid".to_owned())]);
+        let proxies = TrustedProxies::new(vec![ProxyMatcher::Hostname(
+            "this-name-does-not-exist.invalid".to_owned(),
+        )]);
         let resolved = proxies.resolved().await;
         assert!(resolved.is_empty());
     }
@@ -727,16 +793,24 @@ mod tests {
     /// [`NEGATIVE_TTL`]'s real 5s to something a test suite can afford.
     #[tokio::test]
     async fn a_negative_cache_entry_expires_and_is_retried() {
-        let proxies = TrustedProxies::new(vec![ProxyMatcher::Hostname("this-name-does-not-exist.invalid".to_owned())])
-            .with_ttls(Duration::from_millis(500), Duration::from_millis(20));
+        let proxies = TrustedProxies::new(vec![ProxyMatcher::Hostname(
+            "this-name-does-not-exist.invalid".to_owned(),
+        )])
+        .with_ttls(Duration::from_millis(500), Duration::from_millis(20));
 
-        assert!(proxies.resolved().await.is_empty(), "first attempt: still unresolvable");
+        assert!(
+            proxies.resolved().await.is_empty(),
+            "first attempt: still unresolvable"
+        );
         tokio::time::sleep(Duration::from_millis(40)).await;
         // Past the (shortened) negative TTL: this must re-attempt rather than serve the stale
         // cached failure forever. The hostname is still bogus, so the observable outcome is the
         // same — what this proves is that the second call didn't just trust an expired cache entry
         // (which `is_fresh` gates and `refresh_locked` re-populates either way).
-        assert!(proxies.resolved().await.is_empty(), "second attempt after TTL expiry: still correctly empty");
+        assert!(
+            proxies.resolved().await.is_empty(),
+            "second attempt after TTL expiry: still correctly empty"
+        );
     }
 
     #[test]
@@ -753,19 +827,47 @@ mod tests {
         headers.insert("X-Forwarded-For", "1.2.3.4, 10.0.0.5".parse().unwrap());
         let peer: IpAddr = "10.0.0.5".parse().unwrap();
         let trusted = vec!["10.0.0.0/8".parse().unwrap()];
-        assert_eq!(resolve_client_ip(peer, &headers, &trusted), "1.2.3.4".parse::<IpAddr>().unwrap());
+        assert_eq!(
+            resolve_client_ip(peer, &headers, &trusted),
+            "1.2.3.4".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn multiple_x_forwarded_for_headers_are_walked_in_order() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.append(
+            "X-Forwarded-For",
+            "198.51.100.77, 10.0.0.2".parse().unwrap(),
+        );
+        headers.append("X-Forwarded-For", "10.0.0.3".parse().unwrap());
+        let peer: IpAddr = "10.0.0.5".parse().unwrap();
+        let trusted = vec!["10.0.0.0/8".parse().unwrap()];
+        assert_eq!(
+            resolve_client_ip(peer, &headers, &trusted),
+            "198.51.100.77".parse::<IpAddr>().unwrap()
+        );
     }
 
     #[test]
     fn bind_addr_falls_back_on_malformed_input() {
-        assert_eq!(parse_bind_addr(Some("not-an-ip"), Some("abc")).port(), DEFAULT_BIND_PORT);
-        assert_eq!(parse_bind_addr(Some("0.0.0.0"), Some("9999")), "0.0.0.0:9999".parse().unwrap());
+        assert_eq!(
+            parse_bind_addr(Some("not-an-ip"), Some("abc")).port(),
+            DEFAULT_BIND_PORT
+        );
+        assert_eq!(
+            parse_bind_addr(Some("0.0.0.0"), Some("9999")),
+            "0.0.0.0:9999".parse().unwrap()
+        );
     }
 
     #[test]
     fn initial_master_key_validation() {
         assert_eq!(validate_initial_master_key(None), Ok(None));
-        assert_eq!(validate_initial_master_key(Some("")), Err(InitialMasterKeyError::Empty));
+        assert_eq!(
+            validate_initial_master_key(Some("")),
+            Err(InitialMasterKeyError::Empty)
+        );
         assert_eq!(
             validate_initial_master_key(Some(&"a".repeat(64))),
             Ok(Some("a".repeat(64)))

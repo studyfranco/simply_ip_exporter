@@ -1,99 +1,364 @@
-//! Static source-hygiene checks that nothing else in the build enforces: `AGENT.MD`'s "zero raw
-//! SQL outside `src/db.rs`/migrations" and "zero `.unwrap()`/`.expect()` in production code"
-//! rules, and that the embedded dashboard (`static/`) is actually loadable in a browser.
-//!
-//! `cargo check`/`clippy`/`test` compile and exercise Rust; none of them can see a raw SQL string
-//! literal (as opposed to a SeaORM query builder call) or a syntax error in a file that is served
-//! straight off disk and never compiled. `scripts/verify_convergence.sh` wraps this test suite for
-//! a single `./scripts/verify_convergence.sh` entry point.
+//! Static policy checks for the Rust sources, Cargo manifest, and browser dashboard.
 
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
-/// Resolves a path relative to the crate root, independent of `cargo test`'s working directory.
+use oxc_allocator::Allocator;
+use oxc_parser::{Parser, config::TokensParserConfig};
+use oxc_span::{LabeledSpan, SourceType};
+
 fn repo_path(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
 }
 
-/// Every `.rs` file under `src/`, relative to the crate root, in a stable (sorted) order.
-fn src_files() -> Vec<String> {
-    let mut out = Vec::new();
-    collect_rs_files(&repo_path("src"), &mut out);
-    out.sort();
-    out
+fn read(relative: &str) -> String {
+    std::fs::read_to_string(repo_path(relative))
+        .unwrap_or_else(|error| panic!("{relative} must be readable: {error}"))
 }
 
-fn collect_rs_files(dir: &Path, out: &mut Vec<String>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
+fn files(dir: &str, extensions: &[&str], recursive: bool) -> Vec<String> {
+    let mut paths = Vec::new();
+    collect_files(&repo_path(dir), extensions, recursive, &mut paths);
+    paths.sort();
+    paths
+}
+
+fn collect_files(dir: &Path, extensions: &[&str], recursive: bool, paths: &mut Vec<String>) {
+    for entry in dir
+        .read_dir()
+        .unwrap_or_else(|error| panic!("{}: {error}", dir.display()))
+    {
+        let entry = entry.expect("directory entry must be readable");
         let path = entry.path();
-        if path.is_dir() {
-            collect_rs_files(&path, out);
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
-            let relative = path
-                .strip_prefix(repo_path("."))
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            out.push(relative);
+        if recursive
+            && entry
+                .file_type()
+                .expect("file type must be readable")
+                .is_dir()
+        {
+            collect_files(&path, extensions, recursive, paths);
+        } else if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| extensions.contains(&ext))
+        {
+            paths.push(
+                path.strip_prefix(repo_path(""))
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            );
         }
     }
 }
 
-/// Byte offset of the `#[cfg(test)]\nmod tests` declaration, if the file has one.
-///
-/// Deliberately **not** just the first `#[cfg(test)]` occurrence: `src/ratelimit.rs` and
-/// `src/replay.rs` each carry a small `#[cfg(test)] fn tracked(...)` test-only accessor *inside*
-/// their production `impl` block, ahead of the real test module. Cutting at that inner attribute
-/// would silently exclude the rest of the `impl` block — including, in principle, any production
-/// code placed after it — from every check below. Only the attribute directly guarding the `mod
-/// tests` item marks the real boundary.
-fn test_module_offset(contents: &str) -> Option<usize> {
-    let mut search_from = 0;
-    while let Some(rel) = contents[search_from..].find("#[cfg(test)]") {
-        let attr_start = search_from + rel;
-        let after_attr = &contents[attr_start + "#[cfg(test)]".len()..];
-        if after_attr.trim_start().starts_with("mod tests") {
-            return Some(attr_start);
+fn src_files() -> Vec<String> {
+    files("src", &["rs"], true)
+}
+
+fn line_at(source: &str, offset: usize) -> usize {
+    source[..offset]
+        .bytes()
+        .filter(|&byte| byte == b'\n')
+        .count()
+        + 1
+}
+
+#[derive(Clone, Copy)]
+struct Token<'a> {
+    text: &'a str,
+    offset: usize,
+}
+
+fn words<'a>(tokens: &[Token<'a>]) -> Vec<&'a str> {
+    tokens
+        .iter()
+        .map(|token| {
+            token
+                .text
+                .strip_prefix("r#")
+                .filter(|name| name.starts_with(ident_char))
+                .unwrap_or(token.text)
+        })
+        .collect()
+}
+
+fn has_sequence(tokens: &[&str], sequence: &[&str]) -> bool {
+    tokens
+        .windows(sequence.len())
+        .any(|window| window == sequence)
+}
+
+fn ident_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+fn quoted_end(source: &str, quote: char, escapes: bool) -> Option<usize> {
+    let mut chars = source.char_indices();
+    chars.next();
+    while let Some((index, ch)) = chars.next() {
+        if ch == quote {
+            return Some(index + ch.len_utf8());
         }
-        search_from = attr_start + "#[cfg(test)]".len();
+        if ch == '\\' && escapes {
+            chars.next();
+        }
     }
     None
 }
 
-/// The production-code portion of a file: everything before its `#[cfg(test)] mod tests { ... }`
-/// block. See [`test_module_offset`] for why that boundary, specifically, is what is located.
-fn production_code_lines(contents: &str) -> &str {
-    match test_module_offset(contents) {
-        Some(offset) => &contents[..offset],
-        None => contents,
+fn block_comment_end(source: &str) -> usize {
+    let mut offset = 2;
+    let mut depth = 1;
+    while let Some(index) = source[offset..].find(['/', '*']) {
+        offset += index;
+        if source[offset..].starts_with("/*") {
+            depth += 1;
+            offset += 2;
+        } else if source[offset..].starts_with("*/") {
+            depth -= 1;
+            offset += 2;
+            if depth == 0 {
+                return offset;
+            }
+        } else {
+            offset += 1;
+        }
+    }
+    source.len()
+}
+
+fn rust_string(source: &str) -> Option<(usize, &str)> {
+    let prefix = usize::from(source.starts_with(['b', 'c']));
+    let body = &source[prefix..];
+    if let Some(content) = body.strip_prefix('"') {
+        return Some(match quoted_end(body, '"', true) {
+            Some(end) => (prefix + end, &body[1..end - 1]),
+            None => (source.len(), content),
+        });
+    }
+    let raw = body.strip_prefix('r')?;
+    let hashes = raw.bytes().take_while(|&byte| byte == b'#').count();
+    let content = raw[hashes..].strip_prefix('"')?;
+    let closing = format!("\"{}", "#".repeat(hashes));
+    let end = content.find(&closing).unwrap_or(content.len());
+    Some((
+        (prefix + 2 + hashes + end + closing.len()).min(source.len()),
+        &content[..end],
+    ))
+}
+
+fn rust_char_end(source: &str) -> Option<usize> {
+    let prefix = usize::from(source.starts_with('b'));
+    let content = source[prefix..].strip_prefix('\'')?;
+    if content.starts_with('\\') {
+        return quoted_end(&source[prefix..], '\'', true).map(|end| prefix + end);
+    }
+    let width = content.chars().next()?.len_utf8();
+    content[width..]
+        .starts_with('\'')
+        .then_some(prefix + width + 2)
+}
+
+fn rust_tokens(source: &str) -> Vec<Token<'_>> {
+    let mut tokens = Vec::new();
+    let mut offset = 0;
+    while let Some(ch) = source[offset..].chars().next() {
+        let rest = &source[offset..];
+        if ch.is_whitespace() {
+            offset += ch.len_utf8();
+            continue;
+        }
+        if rest.starts_with("//") {
+            offset += rest.find('\n').unwrap_or(rest.len());
+            continue;
+        }
+        if rest.starts_with("/*") {
+            offset += block_comment_end(rest);
+            continue;
+        }
+        let width = if let Some((width, _)) = rust_string(rest) {
+            width
+        } else if let Some(width) = rust_char_end(rest) {
+            width
+        } else if let Some(identifier) = rest.strip_prefix("r#")
+            && identifier.starts_with(ident_char)
+        {
+            2 + identifier
+                .find(|ch| !ident_char(ch))
+                .unwrap_or(identifier.len())
+        } else if ident_char(ch) {
+            rest.find(|ch| !ident_char(ch)).unwrap_or(rest.len())
+        } else {
+            ch.len_utf8()
+        };
+        tokens.push(Token {
+            text: &rest[..width],
+            offset,
+        });
+        offset += width;
+    }
+    tokens
+}
+
+/// Returns the index of a closing delimiter, including nested occurrences of the same pair.
+fn closing_token(tokens: &[&str], start: usize, open: &str, close: &str) -> Option<usize> {
+    let mut depth = 0;
+    for (index, &token) in tokens.iter().enumerate().skip(start) {
+        if token == open {
+            depth += 1;
+        } else if token == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
+fn test_module_bounds(tokens: &[&str]) -> Option<(usize, usize)> {
+    let mut depth = 0;
+    for (index, &token) in tokens.iter().enumerate() {
+        if depth == 0
+            && let Some(mut tail) = tokens[index..].strip_prefix(&["#", "[", "cfg", "(", "test"])
+        {
+            tail = tail.strip_prefix(&[","]).unwrap_or(tail);
+            if let Some(mut item) = tail.strip_prefix(&[")", "]"]) {
+                while item.starts_with(&["#", "["]) {
+                    let end = closing_token(item, 1, "[", "]")?;
+                    item = &item[end + 1..];
+                }
+                if item.starts_with(&["mod", "tests", "{"]) {
+                    return Some((index, tokens.len() - item.len() + 2));
+                }
+            }
+        }
+        depth += nesting_change(token);
+    }
+    None
+}
+
+fn test_module_offset(tokens: &[Token<'_>]) -> Option<usize> {
+    test_module_bounds(&words(tokens)).map(|(index, _)| tokens[index].offset)
+}
+
+fn test_module_is_last(tokens: &[&str]) -> bool {
+    test_module_bounds(tokens)
+        .is_none_or(|(_, open)| closing_token(tokens, open, "{", "}") == Some(tokens.len() - 1))
+}
+
+#[test]
+fn every_source_file_places_its_test_module_last() {
+    for path in src_files() {
+        assert!(
+            test_module_is_last(&words(&rust_tokens(&read(&path)))),
+            "{path} has code after its test module"
+        );
     }
 }
 
-/// Lines of `text`, paired with 1-indexed line numbers, excluding `//`-comment-only lines.
-fn code_lines(text: &str) -> impl Iterator<Item = (usize, &str)> {
-    text.lines()
-        .enumerate()
-        .map(|(i, line)| (i + 1, line))
-        .filter(|(_, line)| !line.trim_start().starts_with("//"))
+#[test]
+fn the_test_module_check_rejects_production_code_after_the_module() {
+    let module = r#"
+        // #[cfg(test)] mod tests {}
+        #[cfg(test)] fn helper() {}
+        mod sibling { #[cfg(test)] mod tests {} }
+        fn production() {}
+        #[cfg(test)]
+        #[allow(dead_code)]
+        mod tests { fn check() { let _ = "}"; /* } */ } }
+    "#;
+    let tokens = rust_tokens(module);
+    let offset = test_module_offset(&tokens).unwrap();
+    assert!(module[offset..].starts_with("#[cfg(test)]\n        #[allow(dead_code)]"));
+    assert!(test_module_is_last(&words(&tokens)));
+    let misplaced = format!("{module} fn hidden() {{}}");
+    assert!(!test_module_is_last(&words(&rust_tokens(&misplaced))));
 }
 
-/// APIs that mean "this line executes raw SQL", per `AGENT.MD`: "Never write vendor-specific raw
-/// SQL queries. Zero raw SQL for DML in `src/`." `Expr::cust` is included even though it sits
-/// inside the query builder: it splices an uninterpreted fragment into a statement, so it carries
-/// exactly the injection risk the builder otherwise removes.
-///
-/// Ported and strengthened from `example/simply_ip_vault`'s `tests/source_hygiene.rs` (2026-08-17
-/// peer test-harness audit — see `AGENT_NOTES.MD`): the original version here matched only the
-/// bare marker list. Vault's version additionally scans for the *shape* of hand-written DML inside
-/// string literals (below) and pins the allowlist to a documented, freshness-checked reason per
-/// entry, after its own predecessors shipped broken twice — see vault's module doc comment.
+fn production_tokens<'s, 'a>(tokens: &'s [Token<'a>]) -> &'s [Token<'a>] {
+    let end = test_module_offset(tokens).map_or(tokens.len(), |offset| {
+        tokens.partition_point(|token| token.offset < offset)
+    });
+    &tokens[..end]
+}
+
+const FORBIDDEN_PRODUCTION: &[&[&str]] = &[
+    &[".", "unwrap", "("],
+    &[".", "expect", "("],
+    &["panic", "!", "("],
+    &["todo", "!", "("],
+    &["unimplemented", "!", "("],
+    &["dbg", "!", "("],
+    &["unsafe", "{"],
+    &["unsafe", "fn"],
+    &["unsafe", "impl"],
+    &["unsafe", "extern"],
+    &["unsafe", "trait"],
+];
+
+fn forbidden_production_offsets(tokens: &[Token<'_>]) -> Vec<usize> {
+    let code = words(production_tokens(tokens));
+    code.windows(2)
+        .enumerate()
+        .filter_map(|(index, pair)| {
+            let macro_delimiter =
+                pair[1] == "!" && matches!(code.get(index + 2), Some(&("(" | "[" | "{")));
+            FORBIDDEN_PRODUCTION
+                .iter()
+                .any(|pattern| {
+                    code[index..].starts_with(pattern)
+                        || (macro_delimiter && pattern.len() == 3 && pattern.starts_with(pair))
+                })
+                .then_some(tokens[index].offset)
+        })
+        .collect()
+}
+
+#[test]
+fn no_unwrap_or_expect_in_production_code() {
+    for path in src_files() {
+        let source = read(&path);
+        let lines: Vec<_> = forbidden_production_offsets(&rust_tokens(&source))
+            .into_iter()
+            .map(|offset| line_at(&source, offset))
+            .collect();
+        assert!(
+            lines.is_empty(),
+            "{path} uses forbidden production constructs on lines {lines:?}"
+        );
+    }
+}
+
+#[test]
+fn the_production_check_rejects_forbidden_code_and_ignores_literals_and_comments() {
+    let fixture = r###"
+        // bad.unwrap()
+        /* outer /* nested */ panic!() */
+        let _ = ("escaped \" .unwrap(", r##"todo!() " unsafe {"##, '}', b'"');
+        let _ = x. /* comment */ unwrap ();
+        x.r#expect("bad");
+        panic!("bad"); todo!{} unimplemented![]; dbg!(x);
+        unsafe { f(); } unsafe fn f() {} unsafe impl Trait for T {}
+        #[cfg(test)] mod tests { fn allowed() { x.unwrap(); } }
+    "###;
+    assert_eq!(forbidden_production_offsets(&rust_tokens(fixture)).len(), 9);
+}
+
+/// APIs that mean "this line executes raw SQL", per `AGENT.MD`: "100% `SeaORM` — zero raw SQL in
+/// `src/` and `src/migration/` except the single `"SELECT 1"` healthcheck query in `src/db.rs` (if
+/// used)." `Expr::cust` is included even though it sits inside the query builder: it splices an
+/// uninterpreted fragment into a statement, so it carries the injection and dialect-drift risk the
+/// builder otherwise removes.
 const RAW_SQL_MARKERS: &[&str] = &[
-    "Statement::from_string",
-    "Statement::from_sql_and_values",
-    "execute_raw(",
-    "query_one_raw(",
-    "query_all_raw(",
-    "execute_unprepared(",
+    "Statement::from_",
+    "from_raw_sql",
+    "execute_raw",
+    "execute_unprepared",
+    "query_raw",
+    "query_one_raw",
+    "query_all_raw",
     "Expr::cust",
 ];
 
@@ -101,268 +366,176 @@ const RAW_SQL_MARKERS: &[&str] = &[
 /// it. Matching the pair rather than the bare keyword is what makes this usable — a bare-keyword
 /// version flags ordinary English error messages ("Cannot delete this endpoint", "no delete
 /// access") as violations; a statement has a grammar English almost never reproduces by accident.
-const DML_SHAPES: &[(&str, &str)] =
-    &[("SELECT ", " FROM "), ("INSERT ", " INTO "), ("UPDATE ", " SET "), ("DELETE ", " FROM ")];
-
-/// The paths permitted to contain raw SQL, each for a reason the query builder cannot address, and
-/// each checked by [`every_source_file_places_its_test_module_last`]'s sibling checks below for
-/// staying both present and actually still needed.
-const RAW_SQL_ALLOWED: &[(&str, &str)] = &[
-    (
-        "src/db.rs",
-        "SQLite `PRAGMA` statements and their readback. A pragma is not a query — it configures how \
-         the engine behaves, not what it is asked — and SeaORM's builders cannot express one. \
-         Backend-gated to SQLite and issued once at startup.",
-    ),
-    (
-        "src/migration/",
-        "DDL. SeaQuery's schema builder has no representation for it, and migrations run once at \
-         startup, before the listener binds, interpolating no caller-supplied value.",
-    ),
+const DML_SHAPES: &[(&str, &str)] = &[
+    ("SELECT ", " FROM "),
+    ("INSERT ", " INTO "),
+    ("UPDATE ", " SET "),
+    ("DELETE ", " FROM "),
 ];
 
-/// Whether `relative` is covered by a `(path, reason)` allowlist entry. A trailing `/` matches a
-/// whole directory; otherwise the match is exact.
-fn matches_allowed(relative: &str, allowed: &str) -> bool {
-    match allowed.strip_suffix('/') {
-        Some(dir) => relative.starts_with(dir),
-        None => relative == allowed,
-    }
+/// Only the literal `"SELECT 1"` healthcheck in `src/db.rs` may ever appear as a raw query, and
+/// `simply_ip_exporter` currently needs zero raw SQL at all (`readiness_check` uses `SeaORM`'s
+/// `ApiKey::find().count(...)`, migrations use `SeaQuery` builders, and `db` uses
+/// `SqliteConnectOptions` + `SchemaManager::has_index`).
+const SELECT_1_HEALTHCHECK_PATH: &str = "src/db.rs";
+
+fn sql_marker_offsets(tokens: &[Token<'_>]) -> Vec<usize> {
+    let code = words(tokens);
+    code.iter()
+        .enumerate()
+        .filter_map(|(index, &word)| {
+            let is_statement_from = code[index..].starts_with(&["Statement", ":", ":"])
+                && code
+                    .get(index + 3)
+                    .is_some_and(|name| name.starts_with("from_"));
+            let is_expr_cust = code[index..].starts_with(&["Expr", ":", ":"])
+                && code
+                    .get(index + 3)
+                    .is_some_and(|name| name.starts_with("cust"));
+            let is_raw_method = matches!(
+                word,
+                "from_raw_sql"
+                    | "execute_raw"
+                    | "execute_unprepared"
+                    | "query_raw"
+                    | "query_one_raw"
+                    | "query_all_raw"
+            );
+            (is_statement_from || is_expr_cust || is_raw_method).then_some(tokens[index].offset)
+        })
+        .collect()
 }
 
-#[test]
-fn no_raw_sql_outside_the_documented_exceptions() {
-    let mut violations = Vec::new();
-    for path in src_files() {
-        if RAW_SQL_ALLOWED.iter().any(|(allowed, _)| matches_allowed(&path, allowed)) {
+fn is_select_1_literal(tokens: &[Token<'_>], marker_offset: usize) -> bool {
+    // Allow `"SELECT 1"` only on the same statement window in `src/db.rs` if a healthcheck ping is
+    // ever added; any other query/statement or any other file is strictly forbidden.
+    tokens.iter().any(|token| {
+        token.offset >= marker_offset
+            && token.offset <= marker_offset.saturating_add(160)
+            && rust_string(token.text)
+                .is_some_and(|(_, literal)| literal.trim().eq_ignore_ascii_case("SELECT 1"))
+    })
+}
+
+fn dml_offsets(tokens: &[Token<'_>]) -> Vec<usize> {
+    let mut offsets = Vec::new();
+    for token in tokens {
+        let Some((_, literal)) = rust_string(token.text) else {
             continue;
-        }
-        let contents = std::fs::read_to_string(repo_path(&path))
-            .unwrap_or_else(|e| panic!("{path} must be readable: {e}"));
-        let production = production_code_lines(&contents);
-        for (line_no, line) in code_lines(production) {
-            if let Some(marker) = RAW_SQL_MARKERS.iter().find(|m| line.contains(**m)) {
-                violations.push(format!("{path}:{line_no}: contains {marker:?}\n    {line}"));
+        };
+        let start =
+            token.text.len() - token.text.trim_start_matches(['b', 'c', 'r', '#']).len() + 1;
+        let mut offset = token.offset + start;
+        for line in literal.split_inclusive('\n') {
+            // Match each physical line independently, including inside multiline strings.
+            let padded = format!(
+                " {} ",
+                line.split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_ascii_uppercase()
+            );
+            if DML_SHAPES.iter().any(|(verb, follower)| {
+                padded.match_indices(verb).any(|(index, _)| {
+                    index > 0
+                        && padded.as_bytes()[index - 1].is_ascii_whitespace()
+                        && padded[index..].contains(follower)
+                })
+            }) {
+                offsets.push(offset);
             }
+            offset += line.len();
         }
     }
-    assert!(
-        violations.is_empty(),
-        "raw SQL found outside the documented exceptions (AGENT.MD forbids this). If genuinely \
-         unavoidable, add it to RAW_SQL_ALLOWED with the reason and record it in AGENT_NOTES.MD:\n{}",
-        violations.join("\n")
-    );
+    offsets
 }
 
-/// The marker scan above catches the SeaORM constructs that carry raw SQL. This catches the
-/// string itself — a future helper with a different name, or a `format!`-assembled statement
-/// passed to something not on the marker list.
+fn raw_sql_lines_for_path(path: &str, source: &str) -> Vec<usize> {
+    let tokens = rust_tokens(source);
+    let production = production_tokens(&tokens);
+    let allow_select_1 = path == SELECT_1_HEALTHCHECK_PATH;
+    let mut lines: Vec<_> = sql_marker_offsets(production)
+        .into_iter()
+        .filter(|&offset| !(allow_select_1 && is_select_1_literal(production, offset)))
+        .chain(dml_offsets(production))
+        .map(|offset| line_at(source, offset))
+        .collect();
+    lines.sort_unstable();
+    lines.dedup();
+    lines
+}
+
+fn raw_sql_lines(source: &str) -> Vec<usize> {
+    raw_sql_lines_for_path("", source)
+}
+
 #[test]
-fn no_dml_keyword_is_hand_written_outside_the_exceptions() {
-    let mut violations = Vec::new();
+fn no_raw_sql_in_src_or_migrations_except_select_1_in_db() {
     for path in src_files() {
-        if RAW_SQL_ALLOWED.iter().any(|(allowed, _)| matches_allowed(&path, allowed)) {
-            continue;
-        }
-        let contents = std::fs::read_to_string(repo_path(&path))
-            .unwrap_or_else(|e| panic!("{path} must be readable: {e}"));
-        let production = production_code_lines(&contents);
-        for (line_no, line) in code_lines(production) {
-            let Some(open) = line.find('"') else { continue };
-            let literal = line[open..].to_uppercase();
-            for (keyword, follower) in DML_SHAPES {
-                let Some(at) = literal.find(keyword) else { continue };
-                if literal[at..].contains(follower) {
-                    violations.push(format!(
-                        "{path}:{line_no}: string literal contains `{}{}`",
-                        keyword.trim_end(),
-                        follower.trim_end()
-                    ));
-                    break;
-                }
-            }
-        }
-    }
-    assert!(
-        violations.is_empty(),
-        "hand-written DML found outside the documented exceptions:\n{}",
-        violations.join("\n")
-    );
-}
-
-/// **No request handler is ever exempted**, whatever the allowlist says — the allowlist is a proxy
-/// for "not reachable from a request", and this is the invariant it stands in for. Encoded as a
-/// test so the rule survives a future edit to `RAW_SQL_ALLOWED` made by someone who has not read
-/// the comment above it.
-#[test]
-fn no_raw_sql_handler_is_ever_exempted() {
-    for (allowed, _) in RAW_SQL_ALLOWED {
+        let lines = raw_sql_lines_for_path(&path, &read(&path));
         assert!(
-            !allowed.starts_with("src/api/"),
-            "{allowed} is a request-reachable module and must never hold a raw-SQL exemption. Move \
-             the statement into a migration, or express it through SeaORM."
+            lines.is_empty(),
+            "{path} contains forbidden raw SQL on lines {lines:?}"
         );
     }
+    // Keep the documented marker list in sync with the scanner.
+    assert_eq!(RAW_SQL_MARKERS.len(), 8);
 }
 
-/// The allowlist must not outlive its justification: an entry naming a path that no longer exists,
-/// or that no longer contains raw SQL, is an exemption nobody is checking, and the next file to
-/// land there inherits it silently.
-#[test]
-fn every_allowlisted_raw_sql_exception_still_exists_and_is_still_needed() {
-    let all_paths = src_files();
-    for (relative, reason) in RAW_SQL_ALLOWED {
-        let bare = relative.trim_end_matches('/');
-        assert!(repo_path(bare).exists(), "allowlisted path {relative} no longer exists — drop it");
-
-        let still_needed = all_paths.iter().filter(|p| p.starts_with(bare)).any(|p| {
-            let contents = std::fs::read_to_string(repo_path(p)).unwrap_or_default();
-            RAW_SQL_MARKERS.iter().any(|m| contents.contains(m))
-        });
-        assert!(
-            still_needed,
-            "{relative} is allowlisted for raw SQL but no longer contains any — drop the entry \
-             rather than leaving a standing exemption. Recorded reason: {reason}"
-        );
-    }
-}
-
-/// The scanners have to be able to see a violation, or the tests above prove nothing — this is the
-/// check vault's own shell-script predecessors of this idea did not have, and both reported CLEAN
-/// against a deliberately planted violation (see vault's module doc comment for the history).
 #[test]
 fn the_raw_sql_scanner_detects_what_it_is_looking_for() {
-    let marker_hit = |line: &str| RAW_SQL_MARKERS.iter().any(|m| line.contains(m));
-    let dml_hit = |line: &str| {
-        line.find('"').is_some_and(|open| {
-            let literal = line[open..].to_uppercase();
-            DML_SHAPES
-                .iter()
-                .any(|(keyword, follower)| literal.find(keyword).is_some_and(|at| literal[at..].contains(follower)))
-        })
-    };
-
-    assert!(marker_hit(r#"    db.execute_unprepared("DROP TABLE api_keys").await?;"#), "missed a real call");
-    assert!(dml_hit(r#"    let sql = format!("DELETE FROM api_keys WHERE id = {id}");"#), "missed a hand-built statement");
-    for prose in [
-        r#"    return Err(AppError::Forbidden("Cannot delete yourself".to_owned()));"#,
-        r#"        "The Master key cannot be deleted through the API".to_owned(),"#,
-        r#"    let msg = "Deleted the endpoint";"#,
+    for raw_sql in [
+        r#"db.execute_raw(Statement::from_string(backend, "DROP TABLE api_keys")).await?;"#,
+        r#"db.execute_unprepared("DROP TABLE api_keys").await?;"#,
+        "Key::find().from_raw_sql /* gap */ (statement);",
+        r#"db.query_raw(Statement::from_sql_and_values(backend, "SELECT 1", [])).await?;"#,
+        r#"db.query_one_raw(Statement::from_string(backend, "PRAGMA optimize;")).await?;"#,
+        r#"db.query_all_raw(Statement::from_string(backend, "SELECT * FROM api_keys")).await?;"#,
+        "Expr::cust(\"1 = 1\")",
+        r#"let sql = format!("DELETE FROM api_keys WHERE id = {id}");"#,
+        r#"let sql = "update api_keys set is_master = 1";"#,
     ] {
-        assert!(!dml_hit(prose), "flagged prose: {prose}");
-    }
-    assert!(dml_hit(r#"    let sql = "update api_keys set is_master = 1";"#), "missed a lowercase statement");
-}
-
-#[test]
-fn no_unwrap_or_expect_in_production_code() {
-    let mut violations = Vec::new();
-    for path in src_files() {
-        let contents = std::fs::read_to_string(repo_path(&path))
-            .unwrap_or_else(|e| panic!("{path} must be readable: {e}"));
-        let production = production_code_lines(&contents);
-        for (line_no, line) in code_lines(production) {
-            if line.contains(".unwrap(") || line.contains(".expect(") {
-                violations.push(format!("{path}:{line_no}: {}", line.trim()));
-            }
-        }
+        assert!(!raw_sql_lines(raw_sql).is_empty(), "missed {raw_sql}");
     }
     assert!(
-        violations.is_empty(),
-        "`.unwrap()`/`.expect()` found in production code (AGENT.MD requires structured AppError \
-         handling instead):\n{}",
-        violations.join("\n")
+        raw_sql_lines_for_path(
+            SELECT_1_HEALTHCHECK_PATH,
+            r#"db.query_one_raw(Statement::from_string(backend, "SELECT 1")).await?;"#,
+        )
+        .is_empty(),
+        "\"SELECT 1\" healthcheck in src/db.rs is the sole permitted exception"
     );
-}
-
-/// Pins the convention [`production_code_lines`] depends on: every file that has a `mod tests`
-/// keeps its `#[cfg(test)] mod tests { ... }` block as the very last item, so cutting the file at
-/// that boundary is a sound proxy for "production code" without needing a real Rust parser to
-/// track module boundaries. Verified independently of [`test_module_offset`]'s own logic (this
-/// test does its own boundary search) so a bug shared between the two could not hide from both.
-#[test]
-fn every_source_file_places_its_test_module_last() {
-    let mut violations = Vec::new();
-    for path in src_files() {
-        let contents = std::fs::read_to_string(repo_path(&path))
-            .unwrap_or_else(|e| panic!("{path} must be readable: {e}"));
-        // The real module boundary, not merely the first `#[cfg(test)]` attribute — a file may
-        // carry an earlier `#[cfg(test)] fn ...` test-only helper inside its production `impl`
-        // block (src/ratelimit.rs, src/replay.rs), which is not the boundary this test checks.
-        // Independently re-derived (a small forward scan, tolerant of any whitespace between the
-        // attribute and `mod tests`) rather than calling `test_module_offset` directly, so a bug
-        // in that function's own logic could not evade both it and its own verification.
-        let mut offset = None;
-        let mut search_from = 0;
-        while let Some(rel) = contents[search_from..].find("#[cfg(test)]") {
-            let attr_start = search_from + rel;
-            let after = &contents[attr_start + "#[cfg(test)]".len()..];
-            if after.trim_start().starts_with("mod tests") {
-                offset = Some(attr_start);
-                break;
-            }
-            search_from = attr_start + "#[cfg(test)]".len();
-        }
-        let Some(offset) = offset else { continue };
-
-        // From that point onward, the file must be exactly one well-formed `mod tests { ... }`
-        // block (plus whatever trails the marker itself): brace-depth returns to zero exactly
-        // once, at the very last non-whitespace character of the file.
-        let tail = &contents[offset..];
-        let mod_start = tail.find('{').unwrap_or(tail.len());
-        let mut depth = 0i32;
-        let mut closed_at = None;
-        for (i, ch) in tail[mod_start..].char_indices() {
-            match ch {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        closed_at = Some(mod_start + i);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let ends_the_file = match closed_at {
-            Some(end) => tail[end + 1..].trim().is_empty(),
-            None => false,
-        };
-        if !ends_the_file {
-            violations.push(path);
-        }
-    }
     assert!(
-        violations.is_empty(),
-        "these files have code after their #[cfg(test)] module, which would be silently excluded \
-         from the production-code hygiene checks above: {violations:?}"
+        !raw_sql_lines_for_path(
+            "src/api/health.rs",
+            r#"db.query_one_raw(Statement::from_string(backend, "SELECT 1")).await?;"#,
+        )
+        .is_empty(),
+        "\"SELECT 1\" is not permitted outside src/db.rs"
     );
+    for prose in [
+        r#"return Err(AppError::Forbidden("Cannot delete yourself".to_owned()));"#,
+        r#""The Master key cannot be deleted through the API".to_owned(),"#,
+        r#"let msg = "Deleted the endpoint";"#,
+        r#"// db.execute_unprepared("DELETE FROM api_keys");"#,
+    ] {
+        assert!(raw_sql_lines(prose).is_empty(), "flagged {prose}");
+    }
 }
-
-// ── Frontend: syntax and DOM-reference validity ─────────────────────────────
 
 /// Parses one file and returns its syntax errors, each rendered as `path:line:col message`.
-fn js_syntax_errors(relative: &str) -> Vec<String> {
-    use oxc_allocator::Allocator;
-    use oxc_parser::Parser;
-    use oxc_span::SourceType;
-
-    let path = repo_path(relative);
-    let source = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("{relative} must be readable: {e}"));
-
+fn js_syntax_errors(relative: &str, source: &str) -> Vec<String> {
     let allocator = Allocator::default();
     // `cjs`, not `mjs`: app.js is loaded with a plain <script> tag (a classic script), and module
     // source would silently accept `import`/`export` that the browser would reject in this context.
-    let parsed = Parser::new(&allocator, &source, SourceType::cjs()).parse();
+    let parsed = Parser::new(&allocator, source, SourceType::cjs()).parse();
 
     parsed
         .diagnostics
         .iter()
         .map(|err| {
             let offset =
-                (err.labels.first().map_or(0, |span| span.offset()) as usize).min(source.len());
+                (err.labels.first().map_or(0, LabeledSpan::offset) as usize).min(source.len());
             let line = source[..offset].matches('\n').count() + 1;
             let column = offset - source[..offset].rfind('\n').map_or(0, |i| i + 1) + 1;
             format!("{relative}:{line}:{column}  {}", err.message)
@@ -372,7 +545,7 @@ fn js_syntax_errors(relative: &str) -> Vec<String> {
 
 #[test]
 fn app_js_has_no_syntax_errors() {
-    let errors = js_syntax_errors("static/app.js");
+    let errors = js_syntax_errors("static/app.js", &read("static/app.js"));
     assert!(
         errors.is_empty(),
         "static/app.js has {} syntax error(s) and will not load in a browser:\n  {}",
@@ -385,10 +558,6 @@ fn app_js_has_no_syntax_errors() {
 /// deliberately broken fixture (an unterminated template literal) and asserts it is caught.
 #[test]
 fn the_syntax_check_rejects_broken_javascript() {
-    use oxc_allocator::Allocator;
-    use oxc_parser::Parser;
-    use oxc_span::SourceType;
-
     let broken = r#"
         function render(rows) {
             return rows.map(r => `
@@ -397,124 +566,1211 @@ fn the_syntax_check_rejects_broken_javascript() {
         }
         const x = ;
     "#;
-    let allocator = Allocator::default();
-    let parsed = Parser::new(&allocator, broken, SourceType::cjs()).parse();
-    assert!(!parsed.diagnostics.is_empty(), "the fixture is not valid JavaScript and must be rejected");
+    assert!(!js_syntax_errors("broken.js", broken).is_empty());
 }
 
-/// Every `el('some-id')` lookup in `app.js` must resolve to a real `id="some-id"` in `index.html`
-/// — a mismatch here is a runtime `TypeError: Cannot read properties of null`, invisible to a JS
-/// parser (which only checks syntax) and to every other gate in this repository.
+fn literal(token: &str) -> Option<&str> {
+    let quote = token.chars().next()?;
+    if !matches!(quote, '\'' | '"' | '`') || token.len() < 2 {
+        return None;
+    }
+    token[1..].strip_suffix(quote)
+}
+
+// Cargo policy only needs table names, assignments, strings, arrays and inline tables.
+fn manifest_tokens(source: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let mut rest = source;
+    while let Some(ch) = rest.chars().next() {
+        let width = match ch {
+            '#' => rest.find('\n').unwrap_or(rest.len()),
+            '\'' | '"' => {
+                let delimiter = if rest.starts_with("'''") {
+                    "'''"
+                } else if rest.starts_with("\"\"\"") {
+                    "\"\"\""
+                } else {
+                    ""
+                };
+                if delimiter.is_empty() {
+                    quoted_end(rest, ch, ch == '"').unwrap_or(rest.len())
+                } else {
+                    rest[3..].find(delimiter).map_or(rest.len(), |end| end + 6)
+                }
+            }
+            '\n' | '[' | ']' | '{' | '}' | '=' | '.' | ',' => 1,
+            c if c.is_whitespace() => c.len_utf8(),
+            _ => rest
+                .find(|c: char| c.is_whitespace() || "#[]{}=.,'\"".contains(c))
+                .unwrap_or(rest.len()),
+        };
+        if ch == '\n' || !(ch.is_whitespace() || ch == '#') {
+            tokens.push(&rest[..width]);
+        }
+        rest = &rest[width..];
+    }
+    tokens
+}
+
+fn key_path(tokens: &[&str]) -> String {
+    tokens
+        .iter()
+        .map(|token| literal(token).unwrap_or(token))
+        .collect()
+}
+
+fn manifest_assignments(source: &str) -> BTreeMap<String, Vec<&str>> {
+    let tokens = manifest_tokens(source);
+    let mut assignments = BTreeMap::new();
+    let mut section = String::new();
+    let mut statement = Vec::new();
+    let mut depth = 0;
+    for token in tokens.into_iter().chain(["\n"]) {
+        match token {
+            "[" | "{" => depth += 1,
+            "]" | "}" => depth -= 1,
+            "\n" if depth == 0 => {
+                if statement.first() == Some(&"[") {
+                    section = key_path(&statement[1..statement.len() - 1]);
+                } else if let Some(equals) = statement.iter().position(|&part| part == "=") {
+                    let key = key_path(&statement[..equals]);
+                    let name = if section.is_empty() {
+                        key
+                    } else {
+                        format!("{section}.{key}")
+                    };
+                    assignments.insert(name, statement[equals + 1..].to_vec());
+                }
+                statement.clear();
+            }
+            _ => {}
+        }
+        if token != "\n" {
+            statement.push(token);
+        }
+    }
+    assignments
+}
+
+fn manifest_field<'a>(
+    assignments: &BTreeMap<String, Vec<&'a str>>,
+    path: &str,
+) -> Option<Vec<&'a str>> {
+    if let Some(value) = assignments.get(path) {
+        return Some(value.clone());
+    }
+    let (table, key) = path.rsplit_once('.')?;
+    let parent = manifest_field(assignments, table)?;
+    let fields = parent.strip_prefix(&["{"])?.strip_suffix(&["}"])?;
+    split_arguments(fields).into_iter().find_map(|field| {
+        let equals = field.iter().position(|&token| token == "=")?;
+        (key_path(&field[..equals]) == key).then(|| field[equals + 1..].to_vec())
+    })
+}
+
+fn check_manifest(source: &str) -> Vec<String> {
+    let assignments = manifest_assignments(source);
+    let field = |path: &str| manifest_field(&assignments, path);
+    let level = |path: &str| {
+        field(&format!("{path}.level"))
+            .or_else(|| field(path))
+            .filter(|value| value.len() == 1)
+            .and_then(|value| literal(value[0]))
+    };
+    let mut violations = Vec::new();
+    for (path, expected) in [
+        ("package.edition", "2024"),
+        ("lints.rust.unsafe_code", "forbid"),
+        ("lints.clippy.all", "warn"),
+        ("lints.clippy.pedantic", "warn"),
+    ] {
+        if level(path) != Some(expected) {
+            violations.push(format!("{path} must be {expected:?}"));
+        }
+    }
+    if field("package.rust-version").is_some() {
+        violations.push("package.rust-version must be absent".to_owned());
+    }
+    let mut clippy_keys = HashSet::new();
+    for path in assignments
+        .keys()
+        .filter_map(|path| path.strip_prefix("lints.clippy."))
+    {
+        clippy_keys.insert(path.split('.').next().unwrap().to_owned());
+    }
+    if let Some(clippy) = field("lints.clippy")
+        && let Some(body) = clippy
+            .strip_prefix(&["{"])
+            .and_then(|body| body.strip_suffix(&["}"]))
+    {
+        for entry in split_arguments(body) {
+            if let Some(key) = entry.first() {
+                clippy_keys.insert(literal(key).unwrap_or(key).to_string());
+            }
+        }
+    }
+    for key in clippy_keys {
+        let path = format!("lints.clippy.{key}");
+        if level(&path) == Some("allow") {
+            violations.push(format!("{path} may not be allow"));
+        }
+    }
+    let sqlx_features = |dependency: &str| -> HashSet<&str> {
+        field(&format!("dependencies.{dependency}.features"))
+            .into_iter()
+            .flatten()
+            .filter_map(literal)
+            .filter(|feature| feature.starts_with("sqlx-"))
+            .collect()
+    };
+    let orm = sqlx_features("sea-orm");
+    let migration = sqlx_features("sea-orm-migration");
+    for feature in orm.difference(&migration) {
+        violations.push(format!("sea-orm-migration is missing {feature:?}"));
+    }
+    violations.sort();
+    violations
+}
+
 #[test]
-fn every_dom_id_referenced_in_app_js_exists_in_index_html() {
-    let app_js = std::fs::read_to_string(repo_path("static/app.js")).expect("static/app.js must be readable");
-    let index_html =
-        std::fs::read_to_string(repo_path("static/index.html")).expect("static/index.html must be readable");
-
-    let referenced = extract_el_ids(&app_js);
-    assert!(!referenced.is_empty(), "expected app.js to reference at least one element id via el(...)");
-
-    let defined = extract_html_ids(&index_html);
-
-    let missing: Vec<&str> =
-        referenced.iter().filter(|id| !defined.contains(*id)).copied().collect();
+fn cargo_manifest_follows_the_lint_and_database_feature_policy() {
+    let violations = check_manifest(&read("Cargo.toml"));
     assert!(
-        missing.is_empty(),
-        "app.js calls el(...) with id(s) not present in index.html: {missing:?}"
+        violations.is_empty(),
+        "Cargo.toml policy violations: {violations:#?}"
     );
 }
 
-/// Extracts every `el('...')` / `el("...")` argument from a JS source string.
-fn extract_el_ids(source: &str) -> Vec<&str> {
-    let mut ids = Vec::new();
-    let mut rest = source;
-    while let Some(start) = rest.find("el(") {
-        let after = &rest[start + 3..];
-        let quote = after.chars().next();
-        if let Some(q) = quote.filter(|c| *c == '\'' || *c == '"')
-            && let Some(end) = after[1..].find(q)
-        {
-            ids.push(&after[1..1 + end]);
-        }
-        rest = after;
-    }
-    ids
-}
-
-/// Extracts every `id="..."` attribute value from an HTML source string.
-fn extract_html_ids(source: &str) -> std::collections::HashSet<&str> {
-    let mut ids = std::collections::HashSet::new();
-    let mut rest = source;
-    while let Some(start) = rest.find("id=\"") {
-        let after = &rest[start + 4..];
-        if let Some(end) = after.find('"') {
-            ids.insert(&after[..end]);
-        }
-        rest = after;
-    }
-    ids
-}
-
 #[test]
-fn the_dom_id_check_rejects_a_reference_to_a_nonexistent_id() {
-    let js = "document.addEventListener('DOMContentLoaded', () => { el('totally-made-up-id'); });";
-    let ids = extract_el_ids(js);
-    assert_eq!(ids, vec!["totally-made-up-id"]);
-    let html = "<div id=\"something-else\"></div>";
-    let defined = extract_html_ids(html);
-    assert!(!defined.contains("totally-made-up-id"), "the fixture must not accidentally define it");
+fn the_manifest_check_rejects_policy_regressions() {
+    let good = r#"
+        [package]
+        edition = '2024' # rust-version = "ignore this"
+        [lints.rust]
+        unsafe_code = { level = "forbid", priority = 0 }
+        [lints.clippy]
+        all = { priority = -2, level = "warn" }
+        pedantic = "warn"
+        [dependencies]
+        sea-orm = {features = ["sqlx-sqlite", "sqlx-postgres"]}
+        [dependencies.sea-orm-migration]
+        features = [
+            "sqlx-postgres", # another backend
+            'sqlx-sqlite',
+        ]
+    "#;
+    assert!(check_manifest(good).is_empty());
+    let bad = good
+        .replace("'2024'", "\"2021\"\nrust-version = '1.85'")
+        .replace("\"forbid\"", "\"warn\"")
+        .replace(
+            "pedantic = \"warn\"",
+            "pedantic = 'allow'\nother = { level = \"allow\" }",
+        )
+        .replace("\"sqlx-postgres\", # another backend", "");
+    let violations = check_manifest(&bad);
+    assert_eq!(violations.len(), 7, "{violations:#?}");
 }
 
-/// Every `fetch(...)` call whose first argument is a string/template literal starting with `/`
-/// bypasses `REQUEST_BASE` (see the "Proxy-aware base paths" section of `app.js`) and hardcodes a
-/// root-relative URL — exactly the bug that breaks this dashboard when it's mounted behind a
-/// reverse proxy under a subpath. `apiCall`'s own `fetch(requestUrl, ...)` call is fine (its
-/// argument is a variable, not a literal); this only flags a *literal* absolute path.
-fn hardcoded_absolute_fetch_calls(source: &str) -> Vec<String> {
-    let mut violations = Vec::new();
-    let mut rest = source;
-    let mut consumed = 0usize;
-    while let Some(start) = rest.find("fetch(") {
-        let after = &rest[start + "fetch(".len()..];
-        let trimmed = after.trim_start();
-        let quote = trimmed.chars().next();
-        if let Some(q) = quote.filter(|c| *c == '\'' || *c == '"' || *c == '`') {
-            let arg = &trimmed[1..];
-            if arg.starts_with('/') {
-                let offset = consumed + start;
-                let line = source[..offset].matches('\n').count() + 1;
-                let snippet: String = arg.chars().take(30).collect();
-                violations.push(format!("{line}: fetch({q}{snippet}..."));
-            }
+const CLIPPY_SUPPRESSIONS: &[&str] = &[
+    concat!("#[allow(", "clippy::"),
+    concat!("#![allow(", "clippy::"),
+    concat!("#![expect(", "clippy::"),
+    concat!("#[expect(", "clippy::"),
+];
+
+fn model_expectation(code: &[&str], start: usize, end: usize) -> bool {
+    let attribute = &code[start..=end];
+    let Some(body) = attribute
+        .strip_prefix(&[
+            "#",
+            "[",
+            "expect",
+            "(",
+            "clippy",
+            ":",
+            ":",
+            "struct_excessive_bools",
+            ",",
+            "reason",
+            "=",
+        ])
+        .and_then(|body| body.strip_suffix(&[")", "]"]))
+    else {
+        return false;
+    };
+    let ([reason] | [reason, ","]) = body else {
+        return false;
+    };
+    if rust_string(reason).is_none_or(|(_, contents)| contents.trim().is_empty()) {
+        return false;
+    }
+
+    // Attributes on either side of the expectation belong to the same item.
+    let mut first = start;
+    while first > 0 && code[first - 1] == "]" {
+        let Some(previous) = code[..first].iter().rposition(|&token| token == "#") else {
+            break;
+        };
+        if code.get(previous + 1) != Some(&"[")
+            || closing_token(code, previous + 1, "[", "]") != Some(first - 1)
+        {
+            break;
         }
-        consumed += start + "fetch(".len();
-        rest = after;
+        first = previous;
+    }
+    let mut next = first;
+    let mut derives_entity = false;
+    while code[next..].starts_with(&["#", "["]) {
+        let Some(close) = closing_token(code, next + 1, "[", "]") else {
+            return false;
+        };
+        let body = &code[next + 2..close];
+        if let Some(derives) = body
+            .strip_prefix(&["derive", "("])
+            .and_then(|body| body.strip_suffix(&[")"]))
+        {
+            derives_entity |= split_arguments(derives)
+                .iter()
+                .any(|path| path.last() == Some(&"DeriveEntityModel"));
+        }
+        next = close + 1;
+    }
+    if code.get(next) == Some(&"pub") {
+        next += 1;
+        if code.get(next) == Some(&"(") {
+            let Some(close) = closing_token(code, next, "(", ")") else {
+                return false;
+            };
+            next = close + 1;
+        }
+    }
+    if !derives_entity || !code[next..].starts_with(&["struct", "Model", "{"]) {
+        return false;
+    }
+    closing_token(code, next + 2, "{", "}").is_some_and(|close| {
+        split_arguments(&code[next + 3..close])
+            .iter()
+            .filter(|field| field.ends_with(&[":", "bool"]))
+            .count()
+            >= 4
+    })
+}
+
+fn clippy_suppression_offsets(tokens: &[Token<'_>]) -> Vec<usize> {
+    let code = words(tokens);
+    let forbidden: Vec<_> = CLIPPY_SUPPRESSIONS
+        .iter()
+        .map(|pattern| words(&rust_tokens(pattern)))
+        .collect();
+    let mut violations = Vec::new();
+    for (start, _) in code.iter().enumerate().filter(|(_, token)| **token == "#") {
+        let inner = code.get(start + 1) == Some(&"!");
+        let bracket = start + 1 + usize::from(inner);
+        if code.get(bracket) != Some(&"[") {
+            continue;
+        }
+        let Some(end) = closing_token(&code, bracket, "[", "]") else {
+            continue;
+        };
+        let direct = forbidden
+            .iter()
+            .any(|pattern| code[start..=end].starts_with(pattern));
+        let grouped = code[bracket + 1..end]
+            .windows(2)
+            .enumerate()
+            .any(|(index, pair)| {
+                if !matches!(pair, ["allow" | "expect", "("]) {
+                    return false;
+                }
+                let open = bracket + index + 2;
+                closing_token(&code, open, "(", ")").is_some_and(|close| {
+                    has_sequence(&code[open + 1..close], &["clippy", ":", ":"])
+                })
+            });
+        if (direct || grouped) && !model_expectation(&code, start, end) {
+            violations.push(tokens[start].offset);
+        }
     }
     violations
 }
 
 #[test]
-fn no_hardcoded_absolute_path_bypasses_the_subpath_request_base() {
-    let app_js = std::fs::read_to_string(repo_path("static/app.js")).expect("static/app.js must be readable");
-    let violations = hardcoded_absolute_fetch_calls(&app_js);
+fn rust_files_only_suppress_clippy_for_derived_models_with_many_bools() {
+    for path in src_files().into_iter().chain(files("tests", &["rs"], true)) {
+        let source = read(&path);
+        let lines: Vec<_> = clippy_suppression_offsets(&rust_tokens(&source))
+            .into_iter()
+            .map(|offset| line_at(&source, offset))
+            .collect();
+        assert!(
+            lines.is_empty(),
+            "{path} suppresses Clippy on lines {lines:?}"
+        );
+    }
+}
+
+#[test]
+fn the_clippy_check_rejects_suppressions_outside_the_model_exception() {
+    let model = concat!(
+        "#[derive(sea_orm::DeriveEntityModel)]\n",
+        "#[expect(",
+        "clippy::struct_excessive_bools, reason = \"database fields\")]\n",
+        "pub struct Model { a: bool, b: bool, c: bool, d: bool }"
+    );
+    let violations = |source: &str| clippy_suppression_offsets(&rust_tokens(source)).len();
+    assert_eq!(violations(model), 0);
+    for forbidden in [
+        concat!("#[ allow(", "clippy :: too_many_lines)] fn f() {}").to_owned(),
+        concat!("#![allow(", "clippy::all)]").to_owned(),
+        concat!(
+            "#![expect(",
+            "clippy::struct_excessive_bools, reason = \"no\")]"
+        )
+        .to_owned(),
+        concat!(
+            "#[cfg_attr(test, allow(dead_code, ",
+            "clippy::all))] fn f() {}"
+        )
+        .to_owned(),
+        model.replace("d: bool", "d: u32"),
+        model.replace("struct Model", "struct Settings"),
+        model.replace("DeriveEntityModel", "Clone"),
+        model.replace("reason = \"database fields\"", "reason = \"\""),
+        model.replace("pub struct", "fn intervening() {} pub struct"),
+    ] {
+        assert_eq!(violations(&forbidden), 1, "missed {forbidden}");
+    }
+    let ignored = format!("/* {model} */ let _ = r###\"{model}\"###;");
+    assert_eq!(violations(&ignored), 0);
+}
+
+// Oxc tokens distinguish real calls from comments, quoted examples and regex literals.
+fn js_tokens(source: &str) -> Vec<Token<'_>> {
+    let allocator = Allocator::default();
+    Parser::new(&allocator, source, SourceType::mjs())
+        .with_config(TokensParserConfig)
+        .parse()
+        .tokens
+        .iter()
+        .filter(|token| token.start() < token.end())
+        .map(|token| Token {
+            text: &source[token.start() as usize..token.end() as usize],
+            offset: token.start() as usize,
+        })
+        .collect()
+}
+
+fn nesting_change(token: &str) -> i32 {
+    match token {
+        "(" | "[" | "{" => 1,
+        ")" | "]" | "}" => -1,
+        _ if token.starts_with('`') && token.ends_with("${") => 1,
+        _ if token.starts_with('}') && token.ends_with('`') => -1,
+        _ => 0,
+    }
+}
+
+fn top_level_separator(tokens: &[&str], separators: &[&str]) -> Option<usize> {
+    let mut depth = 0;
+    for (index, &token) in tokens.iter().enumerate() {
+        if depth == 0 && separators.contains(&token) {
+            return Some(index);
+        }
+        depth += nesting_change(token);
+    }
+    None
+}
+
+fn split_arguments<'s, 'a>(mut tokens: &'s [&'a str]) -> Vec<&'s [&'a str]> {
+    let mut arguments = Vec::new();
+    while let Some(comma) = top_level_separator(tokens, &[","]) {
+        arguments.push(&tokens[..comma]);
+        tokens = &tokens[comma + 1..];
+    }
+    if !tokens.is_empty() {
+        arguments.push(tokens);
+    }
+    arguments
+}
+
+fn calls<'s, 'a>(
+    tokens: &'s [&'a str],
+    names: &'s [&str],
+) -> impl Iterator<Item = (usize, &'s [&'a str])> {
+    tokens
+        .windows(2)
+        .enumerate()
+        .filter_map(move |(index, pair)| {
+            if pair[1] != "(" || !names.contains(&pair[0]) {
+                return None;
+            }
+            let end = top_level_separator(&tokens[index + 2..], &[")"])? + index + 2;
+            Some((index, &tokens[index + 2..end]))
+        })
+}
+
+fn html_tags(mut source: &str) -> impl Iterator<Item = &str> {
+    std::iter::from_fn(move || {
+        while let Some((_, after)) = source.split_once('<') {
+            source = after;
+            if let Some(comment) = source.strip_prefix("!--") {
+                source = comment.split_once("-->").map_or("", |(_, rest)| rest);
+                continue;
+            }
+            if !source
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphabetic)
+            {
+                continue;
+            }
+            let mut chars = source.char_indices();
+            while let Some((index, ch)) = chars.next() {
+                if ch == '>' {
+                    let tag = &source[..index];
+                    source = &source[index + 1..];
+                    return Some(tag);
+                }
+                if matches!(ch, '\'' | '"') {
+                    let quote = ch;
+                    for (_, ch) in chars.by_ref() {
+                        if ch == quote {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        None
+    })
+}
+
+fn html_attributes(tag: &str) -> impl Iterator<Item = (&str, Option<&str>)> {
+    let mut rest = tag.trim_start_matches(|ch: char| !ch.is_whitespace());
+    std::iter::from_fn(move || {
+        rest = rest.trim_start();
+        if rest.is_empty() || rest == "/" {
+            return None;
+        }
+        let end = rest
+            .find(|ch: char| ch.is_whitespace() || ch == '=')
+            .unwrap_or(rest.len());
+        let name = &rest[..end];
+        rest = rest[end..].trim_start();
+        let value = rest.strip_prefix('=').map(|after| {
+            rest = after.trim_start();
+            if let Some(quote) = rest.chars().next().filter(|&ch| matches!(ch, '\'' | '"')) {
+                let end = quoted_end(rest, quote, false).unwrap_or(rest.len());
+                let value = &rest[1..end.saturating_sub(1).max(1)];
+                rest = &rest[end..];
+                value
+            } else {
+                let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+                let value = &rest[..end];
+                rest = &rest[end..];
+                value
+            }
+        });
+        Some((name, value))
+    })
+}
+
+fn html_values<'a>(source: &'a str, attribute: &'a str) -> impl Iterator<Item = &'a str> {
+    html_tags(source)
+        .flat_map(html_attributes)
+        .filter_map(move |(name, value)| {
+            name.eq_ignore_ascii_case(attribute)
+                .then_some(value)
+                .flatten()
+        })
+}
+
+fn extract_el_ids(source: &str) -> Vec<&str> {
+    let tokens = words(&js_tokens(source));
+    calls(&tokens, &["el", "getElementById"])
+        .filter_map(|(_, args)| literal(args.first()?))
+        .filter(|id| !id.contains("${"))
+        .collect()
+}
+
+fn missing_dom_ids<'a>(js: &'a str, html: &'a str) -> Vec<&'a str> {
+    let code = words(&js_tokens(js));
+    let markup = code
+        .iter()
+        .filter_map(|token| literal_start(token).or_else(|| token.strip_prefix('}')));
+    let assigned_ids = code.windows(4).filter_map(|window| match window {
+        [".", "id", "=", value] => literal(value),
+        _ => None,
+    });
+    let set_attributes = calls(&code, &["setAttribute"]).filter_map(|(_, args)| match args {
+        [name, ",", value] if literal(name) == Some("id") => literal(value),
+        _ => None,
+    });
+    let defined: HashSet<_> = html_values(html, "id")
+        .chain(markup.flat_map(|markup| html_values(markup, "id")))
+        .chain(assigned_ids)
+        .chain(set_attributes)
+        .collect();
+    extract_el_ids(js)
+        .into_iter()
+        .filter(|id| !defined.contains(id))
+        .collect()
+}
+
+fn missing_tab_panels(html: &str) -> Vec<&str> {
+    let ids: HashSet<_> = html_values(html, "id").collect();
+    html_values(html, "data-tab")
+        .filter(|tab| !ids.contains(format!("tab-{tab}").as_str()))
+        .collect()
+}
+
+#[test]
+fn dashboard_assets_exist() {
+    for path in ["static/app.js", "static/index.html", "static/style.css"] {
+        assert!(repo_path(path).is_file(), "{path} must exist");
+    }
+}
+
+#[test]
+fn every_dom_id_referenced_in_app_js_exists_in_index_html() {
+    let js = read("static/app.js");
+    let html = read("static/index.html");
     assert!(
-        violations.is_empty(),
-        "static/app.js calls fetch() with a hardcoded absolute path, bypassing REQUEST_BASE \
-         and breaking reverse-proxy subpath deployments: {violations:?}"
+        !extract_el_ids(&js).is_empty(),
+        "expected dashboard DOM lookups"
+    );
+    let missing = missing_dom_ids(&js, &html);
+    assert!(
+        missing.is_empty(),
+        "DOM lookups reference missing IDs: {missing:?}"
+    );
+    let missing = missing_tab_panels(&html);
+    assert!(
+        missing.is_empty(),
+        "data-tab values without a matching tab panel: {missing:?}"
     );
 }
 
-/// A check that has never been shown to fail is not evidence of anything: this feeds it a
-/// deliberately hardcoded `fetch('/api/...')` call and asserts it is caught.
+#[test]
+fn the_dom_id_check_rejects_a_reference_to_a_nonexistent_id() {
+    let js = r#"
+        el('single'); el ("double");
+        document.getElementById('native-single');
+        document.getElementById("native-double");
+        otherel('ignore'); el(`tab-${name}`); el('injected');
+        target.innerHTML = '<div id="injected"></div>';
+        target.id = 'assigned'; el('assigned');
+        target.setAttribute("id", "attribute"); el("attribute");
+    "#;
+    let html = r#"<div data-tab="missing"></div><div data-tab="present" id="tab-present"></div>"#;
+    assert_eq!(
+        missing_dom_ids(js, html),
+        ["single", "double", "native-single", "native-double"]
+    );
+    assert_eq!(missing_tab_panels(html), ["missing"]);
+}
+
+fn literal_start(token: &str) -> Option<&str> {
+    if let Some(content) = literal(token) {
+        return Some(content);
+    }
+    token.strip_prefix('`')?.strip_suffix("${")
+}
+
+fn hardcoded_absolute_fetch_calls(source: &str) -> Vec<usize> {
+    let tokens = js_tokens(source);
+    let code = words(&tokens);
+    calls(&code, &["fetch"])
+        .filter_map(|(index, args)| {
+            literal_start(args.first()?).filter(|arg| arg.starts_with('/'))?;
+            Some(line_at(source, tokens[index].offset))
+        })
+        .collect()
+}
+
+#[test]
+fn no_hardcoded_absolute_path_bypasses_the_subpath_request_base() {
+    let violations = hardcoded_absolute_fetch_calls(&read("static/app.js"));
+    assert!(
+        violations.is_empty(),
+        "hardcoded absolute fetch paths on lines {violations:?}"
+    );
+}
+
 #[test]
 fn the_hardcoded_fetch_check_rejects_a_literal_absolute_path() {
-    let js = "async function bad() { return fetch('/api/auth/me'); }";
-    let violations = hardcoded_absolute_fetch_calls(js);
-    assert_eq!(violations.len(), 1, "must flag the literal absolute fetch() call");
+    let js = "fetch('/one');\nfetch \n (\n \"/two\");\nfetch (`/three/${id}`);\nfetch(requestUrl);";
+    assert_eq!(hardcoded_absolute_fetch_calls(js), [1, 2, 5]);
+}
 
-    let ok = "async function good() { return fetch(requestUrl, opts); }";
+fn statement_expression<'s, 'a>(tokens: &'s [&'a str]) -> &'s [&'a str] {
+    let end = top_level_separator(tokens, &[";", "}"]).unwrap_or(tokens.len());
+    &tokens[..end]
+}
+
+fn initializer<'s, 'a>(tokens: &'s [&'a str], name: &str) -> Option<&'s [&'a str]> {
+    tokens
+        .windows(3)
+        .position(|window| {
+            matches!(window[0], "const" | "let" | "var") && window[1..] == [name, "="]
+        })
+        .map(|index| statement_expression(&tokens[index + 3..]))
+}
+
+fn function_body<'s, 'a>(tokens: &'s [&'a str], name: &str) -> Option<&'s [&'a str]> {
+    let names = [name];
+    let (start, params) = calls(tokens, &names).find(|(index, _)| {
+        index
+            .checked_sub(1)
+            .is_some_and(|index| tokens[index] == "function")
+    })?;
+    let open = start + params.len() + 3;
+    if tokens.get(open) != Some(&"{") {
+        return None;
+    }
+    let end = closing_token(tokens, open, "{", "}")?;
+    Some(&tokens[open + 1..end])
+}
+
+fn has_optional_api_base(html: &str) -> bool {
+    html_tags(html)
+        .filter(|tag| {
+            tag.split_whitespace()
+                .next()
+                .is_some_and(|name| name.eq_ignore_ascii_case("input"))
+        })
+        .any(|tag| {
+            let attrs: Vec<_> = html_attributes(tag).collect();
+            attrs.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("id") && *value == Some("login-api-base")
+            }) && !attrs
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("required"))
+        })
+}
+
+fn subpath_policy_violations(js: &str, html: &str) -> Vec<&'static str> {
+    let tokens = js_tokens(js);
+    let code = words(&tokens);
+    let pathname = ["window", ".", "location", ".", "pathname"];
+    let request_base = ["REQUEST_BASE", "requestBase"].into_iter().find(|name| {
+        initializer(&code, name).is_some_and(|expr| {
+            has_sequence(expr, &pathname)
+                || calls(expr, &["deriveRequestBase"]).any(|_| {
+                    function_body(&code, "deriveRequestBase")
+                        .is_some_and(|body| has_sequence(body, &pathname))
+                })
+        })
+    });
+    let api = function_body(&code, "apiCall").unwrap_or_default();
+    let request_routed = request_base.is_some_and(|base| {
+        calls(api, &["fetch"]).any(|(_, args)| {
+            let end = top_level_separator(args, &[","]).unwrap_or(args.len());
+            let url = &args[..end];
+            let target = match url {
+                [name] => initializer(api, name).unwrap_or(url),
+                _ => url,
+            };
+            target.contains(&base)
+        })
+    });
+    let signed_with_override = calls(api, &["hmacSign"]).any(|(_, args)| {
+        let arguments = split_arguments(args);
+        let Some(target) = arguments.get(2) else {
+            return false;
+        };
+        let target = if let [name] = **target {
+            initializer(api, name).unwrap_or(target)
+        } else {
+            target
+        };
+        let uses_request_base = |expr: &[&str]| {
+            expr.iter()
+                .any(|token| matches!(*token, "REQUEST_BASE" | "requestBase"))
+        };
+        !uses_request_base(target)
+            && ["apiBaseOverride", "signingBase"].iter().any(|base| {
+                target.contains(base)
+                    && initializer(api, base)
+                        .or_else(|| initializer(&code, base))
+                        .is_none_or(|expr| !uses_request_base(expr))
+            })
+    });
+    let reads_override_input = |expression: &[&str]| {
+        calls(expression, &["el", "getElementById"]).any(|(index, args)| {
+            matches!(args, [id] if literal(id) == Some("login-api-base"))
+                && expression[index + args.len() + 3..].starts_with(&[".", "value"])
+        })
+    };
+    let override_configurable = calls(&code, &["setApiBaseOverride", "setSigningBase"])
+        .any(|(_, args)| reads_override_input(args))
+        || code.windows(2).enumerate().any(|(index, window)| {
+            matches!(window, ["apiBaseOverride" | "signingBase", "="])
+                && reads_override_input(statement_expression(&code[index + 2..]))
+        });
+    let canonical_v1 = function_body(&code, "hmacSign").is_some_and(|body| {
+        initializer(body, "message").is_some_and(|message| {
+            message.concat() == r"`${method}\n${target}\n${timestamp}\n${body}`"
+                && has_sequence(body, &["textToBytes", "(", "message", ")"])
+        })
+    });
+    let mut violations = Vec::new();
+    if !request_routed {
+        violations.push("fetch must use a request base derived from window.location.pathname");
+    }
+    if !signed_with_override || !override_configurable || !canonical_v1 {
+        violations
+            .push("CANONICAL_V1 signing must use the independently configurable signing base");
+    }
+    if !has_optional_api_base(html) {
+        violations.push("index.html must expose an optional login-api-base input");
+    }
+    violations
+}
+
+#[test]
+fn dashboard_routes_requests_and_signs_with_independent_bases() {
+    let js = read("static/app.js");
+    let html = read("static/index.html");
+    let violations = subpath_policy_violations(&js, &html);
+    assert!(violations.is_empty(), "{violations:#?}");
+}
+
+#[test]
+fn the_subpath_check_rejects_a_shared_signing_base_and_a_required_override() {
+    let js = r#"
+        const requestBase = window.location.pathname;
+        let signingBase = '';
+        function save() { signingBase = el("login-api-base").value; }
+        function hmacSign(secret, method, target, timestamp, body) {
+            const message = `${method}\n${target}\n${timestamp}\n${body}`;
+            return hmac(secret, textToBytes(message));
+        }
+        function apiCall(path) {
+            const target = `${signingBase}${path}`;
+            const signature = hmacSign(secret, method, target, timestamp, body);
+            return fetch(`${requestBase}${path}`, { headers: { signature } });
+        }
+    "#;
+    let html = r#"<input id="login-api-base">"#;
+    assert!(subpath_policy_violations(js, html).is_empty());
+    let shared = js.replace("${signingBase}", "${requestBase}");
+    let required = html.replace("<input", "<input REQUIRED");
+    assert_eq!(subpath_policy_violations(&shared, &required).len(), 2);
+    let no_override = js.replace("signingBase = el", "unused = el");
+    assert_eq!(subpath_policy_violations(&no_override, html).len(), 1);
+    let no_subpath = js.replace("window.location.pathname", "'/'");
+    assert_eq!(subpath_policy_violations(&no_subpath, html).len(), 1);
+}
+
+fn key_route(tokens: &[&str]) -> bool {
+    tokens
+        .iter()
+        .filter_map(|token| literal_start(token).or_else(|| token.strip_prefix('}')))
+        .any(|part| {
+            part.match_indices("/api/keys").any(|(start, prefix)| {
+                let tail = &part[start + prefix.len()..];
+                tail.is_empty() || tail.starts_with(['/', '?', '`'])
+            })
+        })
+}
+
+fn visibly_assigned<'s, 'a>(
+    code: &'s [&'a str],
+    before: usize,
+    name: &'s str,
+) -> impl Iterator<Item = (usize, &'s [&'a str])> {
+    code[..before]
+        .windows(2)
+        .enumerate()
+        .filter_map(move |(index, window)| {
+            if window != [name, "="] || !visible_at(code, index, before) {
+                return None;
+            }
+            Some((index, statement_expression(&code[index + 2..before])))
+        })
+}
+
+fn visible_at(code: &[&str], definition: usize, use_at: usize) -> bool {
+    // An initializer or field assignment in a sibling block cannot reach this call.
+    let mut depth = 0;
+    for &token in &code[definition..use_at] {
+        match token {
+            "{" => depth += 1,
+            "}" if depth == 0 => return false,
+            "}" => depth -= 1,
+            _ => {}
+        }
+    }
+    true
+}
+
+fn is_master_field(token: &str) -> bool {
+    literal(token).unwrap_or(token) == "is_master"
+}
+
+fn contains_master_payload_field(expression: &[&str]) -> bool {
+    let mut nesting = Vec::new();
+    for (index, &token) in expression.iter().enumerate() {
+        if is_master_field(token) && index > 0 {
+            let previous = expression[index - 1];
+            let next = expression.get(index + 1);
+            let ordinary = nesting.last() == Some(&"{")
+                && matches!(previous, "{" | ",")
+                && matches!(next, Some(&(":" | "," | "}")));
+            let computed = nesting.ends_with(&["{", "["])
+                && previous == "["
+                && expression[index + 1..].starts_with(&["]", ":"]);
+            if ordinary || computed {
+                return true;
+            }
+        }
+        match nesting_change(token) {
+            1 => nesting.push(token),
+            -1 => {
+                nesting.pop();
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn payload_has_master(code: &[&str], before: usize, expression: &[&str]) -> bool {
+    if contains_master_payload_field(expression) {
+        return true;
+    }
+    let references = expression.iter().enumerate().filter_map(|(index, &token)| {
+        let previous = index.checked_sub(1).and_then(|index| expression.get(index));
+        let identifier = token
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_alphabetic() || ch == '_');
+        (identifier
+            && !matches!(previous, Some(&("." | "?.")))
+            && !matches!(expression.get(index + 1), Some(&(":" | "." | "?." | "["))))
+        .then_some(token)
+    });
+    for name in references {
+        if visibly_assigned(code, before, name)
+            .any(|(at, value)| payload_has_master(code, at, value))
+        {
+            return true;
+        }
+        if code[..before]
+            .windows(5)
+            .enumerate()
+            .any(|(index, window)| {
+                window[0] == name
+                    && visible_at(code, index, before)
+                    && ((window[1] == "." && is_master_field(window[2]) && window[3] == "=")
+                        || (window[1] == "["
+                            && is_master_field(window[2])
+                            && window[3..] == ["]", "="]))
+            })
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn key_payloads_with_master(source: &str) -> Vec<usize> {
+    let tokens = js_tokens(source);
+    let code = words(&tokens);
+    calls(&code, &["apiCall", "fetch"]).filter_map(|(index, args)| {
+        let args = split_arguments(args);
+        let (route, payload) = match (code[index], args.as_slice()) {
+            ("apiCall", [method, route, payload, ..])
+                if method.first().and_then(|token| literal(token)).is_some_and(|method| matches!(method, "POST" | "PUT" | "PATCH")) =>
+            {
+                (*route, *payload)
+            }
+            ("fetch", [route, options, ..]) => (*route, *options),
+            _ => return None,
+        };
+        let is_key_route = key_route(route) || matches!(route, [name] if visibly_assigned(&code, index, name).any(|(_, value)| key_route(value)));
+        (is_key_route && payload_has_master(&code, index, payload)).then(|| line_at(source, tokens[index].offset))
+    }).collect()
+}
+
+#[test]
+fn the_dashboard_never_sends_is_master_in_a_key_payload() {
+    let violations = key_payloads_with_master(&read("static/app.js"));
     assert!(
-        hardcoded_absolute_fetch_calls(ok).is_empty(),
-        "must not flag a fetch() call whose argument is a variable"
+        violations.is_empty(),
+        "key payloads send is_master on lines {violations:?}"
     );
+}
+
+#[test]
+fn the_key_payload_check_rejects_is_master_fields_but_permits_reads() {
+    let js = r#"
+apiCall('POST', '/api/keys', { is_master: true });
+const flags = { 'is_master': true };
+const payload = { name: 'example', ...flags };
+apiCall("PUT", `/api/keys/${key.id}`, payload);
+const changed = {};
+changed["is_master"] = localFlag;
+apiCall("PATCH", "/api/keys/42", changed);
+fetch('/api/keys', {method: 'POST', body: JSON.stringify({is_master})});
+apiCall('POST', '/api/settings', { is_master: true });
+apiCall('POST', '/api/keys', { name: k.is_master ? 'master' : 'regular' });
+if (me.is_master) render();
+const row = { is_master: true };
+apiCall('POST', '/api/keys', { name: row.is_master ? 'master' : 'regular' });
+"#;
+    assert_eq!(key_payloads_with_master(js), [2, 5, 8, 9]);
+}
+
+const FORBIDDEN_ASSET_MARKERS: &[&str] = &[
+    "fonts.googleapis",
+    "fonts.gstatic",
+    "cdn.jsdelivr",
+    "unpkg.com",
+    "cdnjs.cloudflare",
+    "data:image/svg+xml",
+];
+
+fn external_url(value: &str) -> bool {
+    let value = value.trim_start().to_ascii_lowercase();
+    ["http://", "https://", "//", "ws://", "wss://"]
+        .iter()
+        .any(|scheme| value.starts_with(scheme))
+}
+
+fn css_asset_violations(source: &str) -> Vec<&'static str> {
+    let mut violations = Vec::new();
+    let lower = source.to_ascii_lowercase();
+    let mut rest = lower.as_str();
+    while let Some(ch) = rest.chars().next() {
+        if let Some(comment) = rest.strip_prefix("/*") {
+            rest = comment.split_once("*/").map_or("", |(_, rest)| rest);
+        } else if matches!(ch, '\'' | '"') {
+            rest = &rest[quoted_end(rest, ch, true).unwrap_or(rest.len())..];
+        } else if ch == '@'
+            && rest
+                .strip_prefix("@import")
+                .is_some_and(|after| !after.starts_with(|ch| ident_char(ch) || ch == '-'))
+        {
+            violations.push("CSS @import");
+            rest = &rest["@import".len()..];
+        } else if ident_char(ch) || ch == '-' {
+            let end = rest
+                .find(|ch| !(ident_char(ch) || ch == '-'))
+                .unwrap_or(rest.len());
+            if &rest[..end] == "url"
+                && let Some(value) = rest[end..].trim_start().strip_prefix('(')
+            {
+                let value = value
+                    .trim_start()
+                    .trim_start_matches(['\'', '"'])
+                    .trim_start();
+                if external_url(value) {
+                    violations.push("external CSS url()");
+                }
+            }
+            rest = &rest[end..];
+        } else {
+            rest = &rest[ch.len_utf8()..];
+        }
+    }
+    violations
+}
+
+fn html_asset_violations(source: &str) -> Vec<&'static str> {
+    let mut violations = Vec::new();
+    for tag in html_tags(source) {
+        let name = tag
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        for (attribute, value) in html_attributes(tag) {
+            let Some(value) = value else { continue };
+            let attr = attribute.to_ascii_lowercase();
+            if attr == "style" {
+                violations.extend(css_asset_violations(value));
+            }
+            if matches!(attr.as_str(), "src" | "poster" | "background")
+                || (attr == "data" && name == "object")
+                || (matches!(attr.as_str(), "href" | "xlink:href")
+                    && matches!(
+                        name.as_str(),
+                        "link" | "script" | "use" | "image" | "feimage" | "base"
+                    ))
+            {
+                if external_url(value) {
+                    violations.push("external HTML resource");
+                }
+            } else if matches!(attr.as_str(), "srcset" | "imagesrcset")
+                && value.split(',').any(external_url)
+            {
+                violations.push("external HTML source set");
+            }
+        }
+    }
+    violations
+}
+
+fn js_asset_violations(source: &str) -> Vec<&'static str> {
+    let code = words(&js_tokens(source));
+    let is_external = |token| literal_start(token).is_some_and(external_url);
+    let mut violations = Vec::new();
+    for (_, args) in calls(
+        &code,
+        &[
+            "fetch",
+            "WebSocket",
+            "EventSource",
+            "import",
+            "importScripts",
+            "setAttribute",
+        ],
+    ) {
+        let external_argument = args.first().is_some_and(|&token| is_external(token));
+        let external_attribute = matches!(args, [name, ",", value, ..]
+            if matches!(literal(name), Some("src" | "href")) && is_external(value));
+        if external_argument || external_attribute {
+            violations.push("external JavaScript call");
+        }
+    }
+    for window in code.windows(3) {
+        if (matches!(literal(window[0]).unwrap_or(window[0]), "src" | "href")
+            && matches!(window[1], "=" | ":")
+            && is_external(window[2]))
+            || (window[0] == "from" && is_external(window[1]))
+            || (window[0] == "import" && is_external(window[1]))
+        {
+            violations.push("external JavaScript resource");
+        }
+    }
+    for window in code.windows(5) {
+        if matches!(window, ["[", name, "]", "=" | ":", value]
+            if matches!(literal(name), Some("src" | "href")) && is_external(value))
+        {
+            violations.push("external JavaScript resource");
+        }
+    }
+    for token in code {
+        if let Some(markup) = literal_start(token).or_else(|| token.strip_prefix('}')) {
+            violations.extend(html_asset_violations(markup));
+        }
+    }
+    violations
+}
+
+fn asset_violations(path: &str, source: &str) -> Vec<&'static str> {
+    let lower = source.to_ascii_lowercase();
+    let mut violations: Vec<_> = FORBIDDEN_ASSET_MARKERS
+        .iter()
+        .copied()
+        .filter(|marker| lower.contains(marker))
+        .collect();
+    let extension = Path::new(path).extension().and_then(|ext| ext.to_str());
+    if extension == Some("css") {
+        violations.extend(css_asset_violations(source));
+    } else if extension == Some("js") {
+        violations.extend(js_asset_violations(source));
+    } else if extension == Some("html") {
+        violations.extend(html_asset_violations(source));
+        for (tag, close) in [("style", "</style"), ("script", "</script")] {
+            for (start, _) in lower.match_indices(&format!("<{tag}")) {
+                if let Some((head, body)) = source[start + 1..].split_once('>')
+                    && head
+                        .split_whitespace()
+                        .next()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(tag))
+                    && let Some(end) = lower[source.len() - body.len()..].find(close)
+                {
+                    if tag == "style" {
+                        violations.extend(css_asset_violations(&body[..end]));
+                    } else {
+                        violations.extend(js_asset_violations(&body[..end]));
+                    }
+                }
+            }
+        }
+    }
+    violations
+}
+
+#[test]
+fn frontend_has_no_external_assets_or_svg_data_uris() {
+    for path in files("static", &["html", "css", "js"], false) {
+        let violations = asset_violations(&path, &read(&path));
+        assert!(
+            violations.is_empty(),
+            "{path} contains forbidden assets: {violations:?}"
+        );
+    }
+}
+
+#[test]
+fn the_offline_asset_check_rejects_external_resources_and_svg_data_uris() {
+    for (path, input) in [
+        ("bad.css", "@IMPORT 'local.css';"),
+        (
+            "bad.css",
+            ".x { background: URL( '//example.org/bg.png' ); }",
+        ),
+        ("bad.css", ".x { src: url(HTTPS://example.org/font); }"),
+        (
+            "bad.html",
+            r#"<script async src = "//example.org/js"></script>"#,
+        ),
+        ("bad.html", "<link href='http://example.org/css'>"),
+        (
+            "bad.html",
+            r#"<img srcset="local.png 1x, https://example.org/large.png 2x">"#,
+        ),
+        (
+            "bad.html",
+            "<style> .x { background: url(https://example.org/bg) } </style>",
+        ),
+        (
+            "bad.html",
+            "<script> const s = new WebSocket('wss://example.org/stream'); </script>",
+        ),
+        ("bad.js", "fetch (\n 'https://example.org/api');"),
+        (
+            "bad.js",
+            "new EventSource(`https://example.org/events/${id}`);",
+        ),
+        ("bad.js", "import x from 'https://example.org/js';"),
+        ("bad.js", "import('https://example.org/js');"),
+        ("bad.js", "script.src = 'https://example.org/js';"),
+        ("bad.js", "link['href'] = 'http://example.org/css';"),
+        (
+            "bad.js",
+            r#"target.innerHTML = '<img src="https://example.org/image">';"#,
+        ),
+        ("bad.js", "const image = 'data:image/svg+xml,<svg></svg>';"),
+    ] {
+        assert!(!asset_violations(path, input).is_empty(), "missed {input}");
+    }
+    for marker in FORBIDDEN_ASSET_MARKERS {
+        assert!(!asset_violations("bad.css", marker).is_empty());
+    }
+    for (path, input) in [
+        (
+            "good.css",
+            "/* @import 'old.css'; */ .x {background: url('local.png')}",
+        ),
+        (
+            "good.html",
+            r#"<link rel="icon" href="favicon.svg"><script src="app.js"></script>"#,
+        ),
+        (
+            "good.js",
+            "fetch(requestUrl); /* fetch('https://example.org'); */",
+        ),
+        (
+            "good.js",
+            "const prose = 'Open over https:// for a secure context';",
+        ),
+    ] {
+        assert!(asset_violations(path, input).is_empty(), "flagged {input}");
+    }
 }

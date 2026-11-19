@@ -37,9 +37,9 @@ where
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
         match Json::<T>::from_request(req, state).await {
             Ok(Json(value)) => Ok(Self(value)),
-            Err(rejection @ (JsonRejection::JsonDataError(_) | JsonRejection::JsonSyntaxError(_))) => {
-                Err(AppError::InvalidInput(rejection.body_text()))
-            }
+            Err(
+                rejection @ (JsonRejection::JsonDataError(_) | JsonRejection::JsonSyntaxError(_)),
+            ) => Err(AppError::InvalidInput(rejection.body_text())),
             Err(other) => Err(AppError::BodyRejected(other.status(), other.body_text())),
         }
     }
@@ -101,22 +101,29 @@ mod tests {
     }
 
     fn parts_for(uri: &str) -> Parts {
-        Request::builder().uri(uri).body(()).expect("a request with no body always builds").into_parts().0
+        Request::builder()
+            .uri(uri)
+            .body(())
+            .expect("a request with no body always builds")
+            .into_parts()
+            .0
     }
 
     #[tokio::test]
     async fn a_well_formed_query_string_parses() {
         let mut parts = parts_for("/x?limit=10");
-        let StrictQuery(value) =
-            StrictQuery::<TestQuery>::from_request_parts(&mut parts, &()).await.expect("parses");
+        let StrictQuery(value) = StrictQuery::<TestQuery>::from_request_parts(&mut parts, &())
+            .await
+            .expect("parses");
         assert_eq!(value.limit, Some(10));
     }
 
     #[tokio::test]
     async fn an_absent_query_string_uses_field_defaults() {
         let mut parts = parts_for("/x");
-        let StrictQuery(value) =
-            StrictQuery::<TestQuery>::from_request_parts(&mut parts, &()).await.expect("parses");
+        let StrictQuery(value) = StrictQuery::<TestQuery>::from_request_parts(&mut parts, &())
+            .await
+            .expect("parses");
         assert_eq!(value.limit, None);
     }
 
@@ -125,7 +132,7 @@ mod tests {
         let mut parts = parts_for("/x?limit=not-a-number");
         match StrictQuery::<TestQuery>::from_request_parts(&mut parts, &()).await {
             Err(AppError::InvalidInput(_)) => {}
-            Err(_) => panic!("expected AppError::InvalidInput"),
+            Err(other) => panic!("expected AppError::InvalidInput, got {other:?}"),
             Ok(_) => panic!("a non-numeric limit must not parse"),
         }
     }
@@ -138,9 +145,12 @@ mod tests {
         let mut parts = parts_for("/x?limit=10&stray=1");
         match StrictQuery::<TestQuery>::from_request_parts(&mut parts, &()).await {
             Err(AppError::InvalidInput(msg)) => {
-                assert!(msg.contains("stray"), "the error should name the rejected field: {msg}");
+                assert!(
+                    msg.contains("stray"),
+                    "the error should name the rejected field: {msg}"
+                );
             }
-            Err(_) => panic!("expected AppError::InvalidInput"),
+            Err(other) => panic!("expected AppError::InvalidInput, got {other:?}"),
             Ok(_) => panic!("an unknown field must not parse"),
         }
     }

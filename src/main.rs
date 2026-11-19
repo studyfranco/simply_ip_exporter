@@ -1,14 +1,21 @@
 //! `simply_ip_exporter` entry point: database bootstrap, master key provisioning, HTTP server,
 //! and graceful shutdown.
 
+use std::fmt::Write as _;
+use std::io::Write as _;
 use std::net::SocketAddr;
 
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use sea_orm::{
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
+};
 use simply_ip_exporter::{
-    api, config, config::RuntimeConfig, create_app, crypto, db, entities, groups, state::AppState, sync,
+    api, config, config::RuntimeConfig, create_app, crypto, db, entities, groups, state::AppState,
+    sync,
 };
 use tokio::net::TcpListener;
 use uuid::Uuid;
+
+const BANNER_WIDTH: usize = 82;
 
 async fn shutdown_signal() {
     let ctrl_c = async {
@@ -34,8 +41,8 @@ async fn shutdown_signal() {
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
+        () = ctrl_c => {},
+        () = terminate => {},
     }
     tracing::info!("Received shutdown signal.");
 }
@@ -48,7 +55,12 @@ async fn bootstrap_master_key(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use entities::{api_key, prelude::ApiKey};
 
-    if ApiKey::find().filter(api_key::Column::IsMaster.eq(true)).one(db).await?.is_some() {
+    if ApiKey::find()
+        .filter(api_key::Column::IsMaster.eq(true))
+        .one(db)
+        .await?
+        .is_some()
+    {
         return Ok(());
     }
 
@@ -63,21 +75,26 @@ async fn bootstrap_master_key(
         None => api::support::generate_random_key(),
     };
     let key_hash = api::support::hash_key(&plaintext_key);
-    let bound_ip = std::env::var("BOOTSTRAP_SUBNET").unwrap_or_else(|_| "0.0.0.0/0,::/0".to_owned());
+    let bound_ip =
+        std::env::var("BOOTSTRAP_SUBNET").unwrap_or_else(|_| "0.0.0.0/0,::/0".to_owned());
     let prefix: String = plaintext_key.chars().take(8).collect();
     let now = chrono::Utc::now().naive_utc();
 
     // As with INITIAL_MASTER_KEY above: deterministic test/CI bootstrap only, so a script never
     // has to scrape the signing secret back out of stdout.
-    let signing_secret = match config::get_secret_or_env("INITIAL_MASTER_SIGNING_SECRET") {
-        Some(fixed) if !fixed.is_empty() => {
+    let signing_secret_raw = config::get_secret_or_env("INITIAL_MASTER_SIGNING_SECRET");
+    let signing_secret = match config::validate_initial_master_key(signing_secret_raw.as_deref()) {
+        Ok(Some(fixed)) => {
             tracing::warn!(
                 "INITIAL_MASTER_SIGNING_SECRET is set: using the provided value instead of \
                  generating one. Intended for deterministic test/CI bootstrap only."
             );
             fixed
         }
-        _ => crypto::generate_signing_secret(),
+        Ok(None) => crypto::generate_signing_secret(),
+        Err(e) => {
+            return Err(format!("Invalid INITIAL_MASTER_SIGNING_SECRET: {e}").into());
+        }
     };
 
     let model = api_key::ActiveModel {
@@ -96,26 +113,25 @@ async fn bootstrap_master_key(
     };
     model.insert(db).await?;
 
-    const W: usize = 82;
-    let border = "═".repeat(W);
-    let body: String = [
+    let border = "═".repeat(BANNER_WIDTH);
+    let rows = [
         format!("X-API-Key      : {plaintext_key}"),
         format!("Signing secret : {signing_secret}"),
         format!("Bound IPs      : {bound_ip}"),
         String::new(),
         "Both values are needed to sign requests (X-Timestamp + X-Signature-256).".to_owned(),
         "They will NOT be shown again — store them securely!".to_owned(),
-    ]
-    .iter()
-    .map(|row| format!("║ {row:<W$} ║\n"))
-    .collect();
+    ];
+    let mut body = String::new();
+    for row in rows {
+        let _ = writeln!(body, "║ {row:<BANNER_WIDTH$} ║");
+    }
 
     tracing::info!(
-        "\n╔{border}╗\n║ {:<W$} ║\n╠{border}╣\n{body}╚{border}╝",
+        "\n╔{border}╗\n║ {:<BANNER_WIDTH$} ║\n╠{border}╣\n{body}╚{border}╝",
         "BOOTSTRAP: Master API Key Generated"
     );
 
-    use std::io::Write;
     std::io::stdout().flush().ok();
     std::io::stderr().flush().ok();
 
@@ -159,13 +175,18 @@ async fn verify_encryption_key(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use entities::{api_key, prelude::ApiKey};
 
-    let Some(master) = ApiKey::find().filter(api_key::Column::IsMaster.eq(true)).one(db).await?
+    let Some(master) = ApiKey::find()
+        .filter(api_key::Column::IsMaster.eq(true))
+        .one(db)
+        .await?
     else {
         // bootstrap_master_key runs before this and always leaves exactly one master row behind;
         // absence here means that invariant broke, which pin_at_boot will report properly next.
         return Ok(());
     };
-    let Some(stored) = master.signing_secret.as_deref() else { return Ok(()) };
+    let Some(stored) = master.signing_secret.as_deref() else {
+        return Ok(());
+    };
 
     cipher.open(stored).map_err(EncryptionKeyMismatch)?;
     Ok(())
@@ -191,29 +212,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let initial_key_raw = config::get_secret_or_env("INITIAL_MASTER_KEY");
-    let initial_master_key =
-        match config::validate_initial_master_key(initial_key_raw.as_deref()) {
-            Ok(key) => key,
-            Err(e) => {
-                tracing::error!("{e}");
-                std::process::exit(1);
-            }
-        };
+    let initial_master_key = match config::validate_initial_master_key(initial_key_raw.as_deref()) {
+        Ok(key) => key,
+        Err(e) => {
+            tracing::error!("{e}");
+            std::process::exit(1);
+        }
+    };
 
-    let db_url =
-        config::get_secret_or_env("DATABASE_URL").unwrap_or_else(|| "sqlite://simply_ip_exporter.db?mode=rwc".to_owned());
+    let db_url = config::get_secret_or_env("DATABASE_URL")
+        .unwrap_or_else(|| "sqlite://simply_ip_exporter.db?mode=rwc".to_owned());
 
     tracing::info!("Connecting to database...");
     let db: DatabaseConnection = db::connect(&db_url).await?;
 
-    if let Err(e) = db::apply_sqlite_pragmas(&db).await {
-        tracing::warn!("Could not apply the SQLite concurrency pragmas: {e}. Starting anyway.");
-    }
-
     db::run_migrations(&db).await?;
-    if let Err(e) = db::run_sqlite_optimize(&db).await {
-        tracing::warn!("Could not run SQLite optimization: {e}");
-    }
 
     let cipher = crypto::SecretCipher::from_env()?;
     if cipher.is_encrypting() {
@@ -269,9 +282,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bound = listener.local_addr().unwrap_or(addr);
     tracing::info!("simply_ip_exporter listening on http://{}", bound);
 
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     sync_handle.abort();
     group_cleanup_handle.abort();
@@ -291,7 +307,9 @@ mod tests {
     }
 
     async fn fresh_db() -> DatabaseConnection {
-        let db = Database::connect("sqlite::memory:").await.expect("in-memory sqlite opens");
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite opens");
         db::run_migrations(&db).await.expect("migrations apply");
         db
     }
@@ -300,7 +318,9 @@ mod tests {
     async fn a_freshly_bootstrapped_master_passes_the_canary_check() {
         let db = fresh_db().await;
         let cipher = crypto::SecretCipher::from_hex_key(KEY_A).expect("valid key");
-        bootstrap_master_key(&db, &cipher, None).await.expect("bootstrap succeeds");
+        bootstrap_master_key(&db, &cipher, None)
+            .await
+            .expect("bootstrap succeeds");
 
         assert!(verify_encryption_key(&db, &cipher).await.is_ok());
     }
@@ -309,21 +329,28 @@ mod tests {
     async fn a_mismatched_key_is_refused_after_restart_not_silently_accepted() {
         let db = fresh_db().await;
         let sealing_cipher = crypto::SecretCipher::from_hex_key(KEY_A).expect("valid key");
-        bootstrap_master_key(&db, &sealing_cipher, None).await.expect("bootstrap succeeds");
+        bootstrap_master_key(&db, &sealing_cipher, None)
+            .await
+            .expect("bootstrap succeeds");
 
         // Simulates a restart with the wrong EXPORTER_ENCRYPTION_KEY against the same database:
         // bootstrap_master_key sees the existing master row and does nothing, so this canary check
         // is the only thing standing between a key mismatch and silent per-request auth failures.
         let wrong_cipher = crypto::SecretCipher::from_hex_key(&key_b()).expect("valid key");
         let err = verify_encryption_key(&db, &wrong_cipher).await.unwrap_err();
-        assert!(err.to_string().contains("EXPORTER_ENCRYPTION_KEY does not match"));
+        assert!(
+            err.to_string()
+                .contains("EXPORTER_ENCRYPTION_KEY does not match")
+        );
     }
 
     #[tokio::test]
     async fn plaintext_mode_is_unaffected_by_the_canary_check() {
         let db = fresh_db().await;
         let cipher = crypto::SecretCipher::Plaintext;
-        bootstrap_master_key(&db, &cipher, None).await.expect("bootstrap succeeds");
+        bootstrap_master_key(&db, &cipher, None)
+            .await
+            .expect("bootstrap succeeds");
 
         assert!(verify_encryption_key(&db, &cipher).await.is_ok());
     }

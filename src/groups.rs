@@ -13,19 +13,83 @@ use std::time::Duration;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use uuid::Uuid;
 
-use crate::entities::{prelude::VaultGroupPermission, vault_group_permission};
+use crate::entities::{
+    endpoint, prelude::ApiKey, prelude::VaultGroupPermission, vault_group_permission,
+};
+use crate::error::AppError;
 use crate::state::AppState;
+
+/// Result of real-time `vault_group_permissions` verification for an endpoint's owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EndpointGroupAuth {
+    /// Every group listed in `endpoint.vault_groups` is currently authorized.
+    AllAuthorized(Vec<String>),
+    /// Only a subset of `endpoint.vault_groups` remains authorized (some grants were revoked).
+    PartiallyAuthorized(Vec<String>),
+    /// The endpoint is orphaned, its owner no longer exists, or zero grants remain.
+    Denied,
+}
+
+/// Re-verifies in real time that `ep.owner_key_id` still exists and holds `vault_group_permissions`
+/// for the groups configured on `ep`.
+///
+/// # Errors
+/// Returns [`AppError`] if querying API keys or group permissions fails.
+pub async fn verify_endpoint_group_permissions(
+    state: &AppState,
+    ep: &endpoint::Model,
+) -> Result<EndpointGroupAuth, AppError> {
+    let configured: Vec<String> = ep
+        .vault_groups
+        .split(',')
+        .map(str::trim)
+        .filter(|g| !g.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if configured.is_empty() {
+        return Ok(EndpointGroupAuth::Denied);
+    }
+
+    let Some(owner_id) = ep.owner_key_id else {
+        return Ok(EndpointGroupAuth::Denied);
+    };
+
+    let Some(mut owner) = ApiKey::find_by_id(owner_id).one(&state.db).await? else {
+        return Ok(EndpointGroupAuth::Denied);
+    };
+
+    state.master_pin.authenticate(&state.db, &mut owner).await;
+    if owner.is_master {
+        return Ok(EndpointGroupAuth::AllAuthorized(configured));
+    }
+
+    let granted = crate::api::groups::granted_group_names(&state.db, owner.id).await?;
+    let allowed: Vec<String> = configured
+        .iter()
+        .filter(|g| granted.contains(g.as_str()))
+        .cloned()
+        .collect();
+
+    if allowed.is_empty() {
+        Ok(EndpointGroupAuth::Denied)
+    } else if allowed.len() < configured.len() {
+        Ok(EndpointGroupAuth::PartiallyAuthorized(allowed))
+    } else {
+        Ok(EndpointGroupAuth::AllAuthorized(allowed))
+    }
+}
 
 /// Once a month. Named per the user's own framing of how often this needs to run — Vault-side
 /// group deletions are rare and the consequence of a stale grant lingering a while longer is
 /// nothing worse than an operator being able to name an already-gone group in `vault_groups` (the
 /// endpoint sync itself would then just see that group return nothing from Vault, same as any
 /// other empty/unreadable group), not a security issue that needs faster cleanup.
-const CLEANUP_INTERVAL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const CLEANUP_INTERVAL: Duration = Duration::from_hours(30 * 24);
 
 /// Spawns the background cleanup loop, returning its join handle for graceful shutdown. Runs once
 /// immediately (so a long-lived instance doesn't wait a full month for its first pass) and then
 /// every [`CLEANUP_INTERVAL`] thereafter.
+#[must_use]
 pub fn spawn_group_permission_cleanup_worker(state: AppState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -69,8 +133,11 @@ async fn cleanup_stale_group_permissions(state: &AppState) {
             return;
         }
     };
-    let stale_ids: Vec<Uuid> =
-        all_grants.iter().filter(|g| !live_ids.contains(&g.vault_group_id)).map(|g| g.id).collect();
+    let stale_ids: Vec<Uuid> = all_grants
+        .iter()
+        .filter(|g| !live_ids.contains(&g.vault_group_id))
+        .map(|g| g.id)
+        .collect();
     if stale_ids.is_empty() {
         return;
     }
@@ -99,8 +166,12 @@ mod tests {
     use sea_orm_migration::MigratorTrait;
 
     async fn test_db() -> DatabaseConnection {
-        let db = Database::connect("sqlite::memory:").await.expect("in-memory sqlite always opens");
-        crate::migration::Migrator::up(&db, None).await.expect("migrations apply");
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite always opens");
+        crate::migration::Migrator::up(&db, None)
+            .await
+            .expect("migrations apply");
         db
     }
 
@@ -111,7 +182,11 @@ mod tests {
             vault_signing_secret: Some("secret".to_owned()),
             ..crate::config::RuntimeConfig::default()
         };
-        AppState::new(db.clone(), std::sync::Arc::new(config), std::sync::Arc::new(crate::crypto::SecretCipher::Plaintext))
+        AppState::new(
+            db.clone(),
+            std::sync::Arc::new(config),
+            std::sync::Arc::new(crate::crypto::SecretCipher::Plaintext),
+        )
     }
 
     async fn insert_grant(db: &DatabaseConnection, vault_group_id: Uuid, name: &str) {
@@ -148,7 +223,9 @@ mod tests {
         id
     }
 
-    async fn spawn_mock_vault_groups(groups: serde_json::Value) -> (String, tokio::task::JoinHandle<()>) {
+    async fn spawn_mock_vault_groups(
+        groups: serde_json::Value,
+    ) -> (String, tokio::task::JoinHandle<()>) {
         use axum::{Router, routing::get};
 
         let app = Router::new().route(
@@ -158,22 +235,30 @@ mod tests {
                 async move { axum::Json(groups) }
             }),
         );
-        let listener =
-            tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback bind always succeeds");
-        let addr = listener.local_addr().expect("a bound listener has a local address");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind always succeeds");
+        let addr = listener
+            .local_addr()
+            .expect("a bound listener has a local address");
         let handle = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
         (format!("http://{addr}"), handle)
     }
 
-    async fn spawn_mock_vault_error(status: axum::http::StatusCode) -> (String, tokio::task::JoinHandle<()>) {
+    async fn spawn_mock_vault_error(
+        status: axum::http::StatusCode,
+    ) -> (String, tokio::task::JoinHandle<()>) {
         use axum::{Router, routing::get};
 
         let app = Router::new().route("/api/groups", get(move || async move { status }));
-        let listener =
-            tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback bind always succeeds");
-        let addr = listener.local_addr().expect("a bound listener has a local address");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind always succeeds");
+        let addr = listener
+            .local_addr()
+            .expect("a bound listener has a local address");
         let handle = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
@@ -189,8 +274,15 @@ mod tests {
 
         cleanup_stale_group_permissions(&state).await;
 
-        let remaining = VaultGroupPermission::find().all(&db).await.expect("query succeeds");
-        assert_eq!(remaining.len(), 1, "no Vault client configured means no cleanup at all, not a wipe");
+        let remaining = VaultGroupPermission::find()
+            .all(&db)
+            .await
+            .expect("query succeeds");
+        assert_eq!(
+            remaining.len(),
+            1,
+            "no Vault client configured means no cleanup at all, not a wipe"
+        );
     }
 
     #[tokio::test]
@@ -198,13 +290,21 @@ mod tests {
         let db = test_db().await;
         let group_id = Uuid::new_v4();
         insert_grant(&db, group_id, "some_group").await;
-        let (url, _server) = spawn_mock_vault_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR).await;
+        let (url, _server) =
+            spawn_mock_vault_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR).await;
         let state = test_state(&db, Some(url));
 
         cleanup_stale_group_permissions(&state).await;
 
-        let remaining = VaultGroupPermission::find().all(&db).await.expect("query succeeds");
-        assert_eq!(remaining.len(), 1, "a failed Vault call must not be treated as \"the group is gone\"");
+        let remaining = VaultGroupPermission::find()
+            .all(&db)
+            .await
+            .expect("query succeeds");
+        assert_eq!(
+            remaining.len(),
+            1,
+            "a failed Vault call must not be treated as \"the group is gone\""
+        );
     }
 
     #[tokio::test]
@@ -217,8 +317,15 @@ mod tests {
 
         cleanup_stale_group_permissions(&state).await;
 
-        let remaining = VaultGroupPermission::find().all(&db).await.expect("query succeeds");
-        assert_eq!(remaining.len(), 1, "a 403 Forbidden response must leave grants untouched");
+        let remaining = VaultGroupPermission::find()
+            .all(&db)
+            .await
+            .expect("query succeeds");
+        assert_eq!(
+            remaining.len(),
+            1,
+            "a 403 Forbidden response must leave grants untouched"
+        );
     }
 
     #[tokio::test]
@@ -234,7 +341,10 @@ mod tests {
 
         cleanup_stale_group_permissions(&state).await;
 
-        let remaining = VaultGroupPermission::find().all(&db).await.expect("query succeeds");
+        let remaining = VaultGroupPermission::find()
+            .all(&db)
+            .await
+            .expect("query succeeds");
         assert_eq!(remaining.len(), 1);
     }
 
@@ -253,8 +363,15 @@ mod tests {
 
         cleanup_stale_group_permissions(&state).await;
 
-        let remaining = VaultGroupPermission::find().all(&db).await.expect("query succeeds");
-        assert_eq!(remaining.len(), 1, "only the grant for the still-existing group must survive");
+        let remaining = VaultGroupPermission::find()
+            .all(&db)
+            .await
+            .expect("query succeeds");
+        assert_eq!(
+            remaining.len(),
+            1,
+            "only the grant for the still-existing group must survive"
+        );
         assert_eq!(remaining[0].vault_group_id, live_group_id);
     }
 }

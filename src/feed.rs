@@ -1,15 +1,8 @@
 //! `GET /feed/v1/<token_secret>/list.txt` — the public, unauthenticated feed endpoint.
 //!
-//! Security here rests entirely on the secrecy of `token_secret`, not on HTTP headers.
-//!
-//! The rate limiter gates the expensive path — serving a full `200` body — rather than every
-//! request indiscriminately. A conditional request whose `If-None-Match` matches the current
-//! ETag is answered `304` for free, with no rate-limit consumption at all: the caller has already
-//! proven it holds an up-to-date copy, computing the ETag is a cheap in-memory operation, and
-//! throttling that exchange would defeat the entire point of supporting ETags — a well-behaved
-//! poller (pfBlockerNG et al.) that dutifully revalidates would get needlessly `429`'d instead of
-//! the cheap `304` the mechanism exists to provide. Guessing an ETag to farm free responses is not
-//! a workable attack: an attacker without the current body cannot produce a matching digest.
+//! Security here rests on the secrecy of `token_secret`, optional `bound_ips`, real-time owner
+//! permission verification against `vault_group_permissions`, and per-IP rate limiting applied at
+//! the entry of every request before database lookups or DNS resolution.
 
 use axum::{
     extract::{ConnectInfo, Path, State},
@@ -27,6 +20,9 @@ use crate::ipfilter::filter_and_aggregate;
 use crate::state::AppState;
 
 /// `GET /feed/v1/{token_secret}/list.txt`.
+///
+/// # Errors
+/// Returns [`AppError`] if the token is unknown, client IP/permissions are forbidden, or database lookups fail.
 pub async fn serve_feed(
     State(state): State<AppState>,
     Path(token_secret): Path<String>,
@@ -38,6 +34,15 @@ pub async fn serve_feed(
     let trusted_proxies = state.config.trusted_proxies.resolved().await;
     let client_ip = resolve_client_ip(addr.ip(), &headers, &trusted_proxies);
 
+    if let Err(remaining) = state.rate_limiter.check_and_record(client_ip) {
+        return Ok((
+            StatusCode::TOO_MANY_REQUESTS,
+            [("Retry-After", remaining.as_secs().to_string())],
+            "Rate limit exceeded: at most one request per source IP every 2 minutes\n",
+        )
+            .into_response());
+    }
+
     let ep = Endpoint::find()
         .filter(endpoint::Column::TokenSecret.eq(token_secret))
         .one(&state.db)
@@ -46,11 +51,27 @@ pub async fn serve_feed(
 
     if let Some(raw) = ep.bound_ips.as_deref().filter(|s| !s.trim().is_empty()) {
         let entries = bound_ips::parse_bound_ips(raw).map_err(|_| {
-            tracing::error!("Invalid bound_ips in database for endpoint {}: {:?}", ep.id, ep.bound_ips);
+            tracing::error!(
+                "Invalid bound_ips in database for endpoint {}: {:?}",
+                ep.id,
+                ep.bound_ips
+            );
             AppError::Internal
         })?;
         if !bound_ips::is_allowed(&entries, client_ip, &state.dns_resolver).await {
-            return Err(AppError::Forbidden("Client IP not allowed for this endpoint".to_owned()));
+            return Err(AppError::Forbidden(
+                "Client IP not allowed for this endpoint".to_owned(),
+            ));
+        }
+    }
+
+    match crate::groups::verify_endpoint_group_permissions(&state, &ep).await? {
+        crate::groups::EndpointGroupAuth::AllAuthorized(_) => {}
+        crate::groups::EndpointGroupAuth::PartiallyAuthorized(_)
+        | crate::groups::EndpointGroupAuth::Denied => {
+            return Err(AppError::Forbidden(
+                "Endpoint owner lacks permission for configured Vault groups".to_owned(),
+            ));
         }
     }
 
@@ -62,12 +83,20 @@ pub async fn serve_feed(
         .ip_cache
         .snapshot_within(ep.id, ep.max_age_seconds, chrono::Utc::now().naive_utc())
         .await;
-    let aggregated =
-        filter_and_aggregate(&raw, ep.filter_rfc1918, ep.filter_bogons, ep.filter_loopback);
+    let aggregated = filter_and_aggregate(
+        &raw,
+        ep.filter_rfc1918,
+        ep.filter_bogons,
+        ep.filter_loopback,
+    );
 
-    let mut lines: Vec<String> = aggregated.iter().map(|net| net.to_string()).collect();
+    let mut lines: Vec<String> = aggregated.iter().map(ToString::to_string).collect();
     lines.sort();
-    let body = if lines.is_empty() { String::new() } else { format!("{}\n", lines.join("\n")) };
+    let body = if lines.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", lines.join("\n"))
+    };
 
     let mut hasher = Sha256::new();
     hasher.update(body.as_bytes());
@@ -79,18 +108,12 @@ pub async fn serve_feed(
         return Ok((StatusCode::NOT_MODIFIED, [("ETag", etag)]).into_response());
     }
 
-    if let Err(remaining) = state.rate_limiter.check_and_record(client_ip) {
-        return Ok((
-            StatusCode::TOO_MANY_REQUESTS,
-            [("Retry-After", remaining.as_secs().to_string())],
-            "Rate limit exceeded: at most one request per source IP every 2 minutes\n",
-        )
-            .into_response());
-    }
-
     Ok((
         StatusCode::OK,
-        [("Content-Type", "text/plain; charset=utf-8".to_owned()), ("ETag", etag)],
+        [
+            ("Content-Type", "text/plain; charset=utf-8".to_owned()),
+            ("ETag", etag),
+        ],
         body,
     )
         .into_response())

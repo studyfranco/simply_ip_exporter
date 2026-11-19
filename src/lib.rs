@@ -64,8 +64,14 @@ pub fn create_app(state: AppState) -> Router {
         .route("/vault-groups", get(api::list_vault_groups))
         .route("/keys/{id}/groups", get(api::list_key_groups))
         .route("/keys/{id}/groups", post(api::grant_key_group))
-        .route("/keys/{id}/groups/{permission_id}", delete(api::revoke_key_group))
-        .layer(axum::middleware::from_fn_with_state(state.clone(), middleware::auth_middleware));
+        .route(
+            "/keys/{id}/groups/{permission_id}",
+            delete(api::revoke_key_group),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middleware::auth_middleware,
+        ));
 
     Router::new()
         .fallback_service(ServeDir::new("static"))

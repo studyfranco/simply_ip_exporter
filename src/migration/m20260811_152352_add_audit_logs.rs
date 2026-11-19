@@ -38,7 +38,12 @@ impl MigrationTrait for Migration {
                 Table::create()
                     .table(AuditLogs::Table)
                     .if_not_exists()
-                    .col(ColumnDef::new(AuditLogs::Id).uuid().not_null().primary_key())
+                    .col(
+                        ColumnDef::new(AuditLogs::Id)
+                            .uuid()
+                            .not_null()
+                            .primary_key(),
+                    )
                     .col(ColumnDef::new(AuditLogs::ApiKeyId).uuid().null())
                     .col(ColumnDef::new(AuditLogs::ApiKeyName).string().not_null())
                     .col(ColumnDef::new(AuditLogs::ApiKeyPrefix).string().not_null())
@@ -89,6 +94,8 @@ impl MigrationTrait for Migration {
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager.drop_table(Table::drop().table(AuditLogs::Table).to_owned()).await
+        manager
+            .drop_table(Table::drop().table(AuditLogs::Table).to_owned())
+            .await
     }
 }

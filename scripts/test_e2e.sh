@@ -16,8 +16,8 @@
 #      groups with ttl_seconds=2, filter_rfc1918=true, filter_bogons=true.
 #   4. Feed verification: text/plain output, ipnet::IpNet::aggregate() merging the overlapping
 #      pair, and both filters actually removing what they claim to.
-#   5. HTTP optimizations & anti-DoS: ETag + If-None-Match -> 304 (and that a matching conditional
-#      request is NOT rate-limited), then a bare repeat -> 429.
+#   5. HTTP optimizations & anti-DoS: ETag + If-None-Match -> 304 for a fresh client,
+#      with both conditional and unconditional repeats returning 429 for a throttled client.
 #   6. Vault soft-delete propagation: soft-delete a Vault record and confirm the next differential
 #      sync (since=<last_synced_at>&include_deleted=true) removes it from the feed.
 #   7. Hot-reload of endpoint configuration: flip filter_rfc1918 via a signed PUT and confirm the
@@ -41,11 +41,13 @@
 #      serving the same in-memory cached feed without interruption.
 #  14. Audit log traversal: fetch GET /api/audit-logs as Master and confirm every administrative
 #      action performed during this run is present, correctly attributed, and timestamped.
-#  15. Cleanup: terminate both processes and remove every temporary file.
+#  15. Boundary checks for group revocation, readiness, request signing, and API validation.
+#  16. Key and endpoint ownership boundaries, including transactional reassignment.
+#  17. Concurrent audit filtering and pagination, and oversized request rejection.
 #
 # Usage: ./scripts/test_e2e.sh
-# Requires: curl, jq, cargo, openssl, cargo-audit. Needs example/simply_ip_vault present (a reference checkout;
-# see AGENT.MD) and two free ports (defaults below; override with VAULT_PORT/EXPORTER_PORT).
+# Requires: curl, jq, cargo, openssl, python3, cargo-audit. Needs example/simply_ip_vault present
+# (see AGENT.MD). Ports are assigned from the OS ephemeral range unless VAULT_PORT/EXPORTER_PORT are set.
 # Exit code: 0 if every check passed, 1 otherwise.
 
 set -uo pipefail
@@ -59,11 +61,6 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 VAULT_DIR="$PROJECT_ROOT/example/simply_ip_vault"
 # Ensure local cargo-installed binaries (e.g. cargo-audit in ~/.cargo/bin) are on PATH
 export PATH="$HOME/.cargo/bin:$PATH"
-
-VAULT_PORT="${VAULT_PORT:-13000}"
-EXPORTER_PORT="${EXPORTER_PORT:-13002}"
-VAULT_URL="http://127.0.0.1:$VAULT_PORT"
-EXPORTER_URL="http://127.0.0.1:$EXPORTER_PORT"
 
 # Deterministic bootstrap credentials — fixed rather than scraped from a (buffered) log, for both
 # instances. Both services require INITIAL_MASTER_KEY to be exactly 64 hex characters (the same
@@ -84,9 +81,9 @@ PAGINATION_PAGE_SIZE=1000
 PAGINATION_EXPECTED_PAGES=4
 
 VAULT_MASTER_KEY="a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
-VAULT_MASTER_SECRET="e2e_vault_master_signing_secret_for_testing"
+VAULT_MASTER_SECRET="c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3"
 EXPORTER_MASTER_KEY="b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"
-EXPORTER_MASTER_SECRET="e2e_exporter_master_signing_secret_for_testing"
+EXPORTER_MASTER_SECRET="d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4"
 # 64 hex characters, as `openssl rand -hex 32` would produce. Fixed rather than random so a
 # failed run leaves databases an operator can still open with the same value.
 E2E_ENCRYPTION_KEY="0f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a69780f1e2d3c4b5a6978"
@@ -335,7 +332,7 @@ wait_ready() {
 
 log_section "Preflight"
 
-for bin in curl jq cargo openssl; do
+for bin in curl jq cargo openssl python3; do
     if ! command -v "$bin" >/dev/null 2>&1; then
         err "$bin is required but not found on PATH"
         exit 1
@@ -356,13 +353,6 @@ if [ ! -d "$VAULT_DIR" ]; then
     err "$VAULT_DIR not found. This suite needs the reference simply_ip_vault checkout under example/ (see AGENT.MD)."
     exit 1
 fi
-
-for port in "$VAULT_PORT" "$EXPORTER_PORT"; do
-    if command -v fuser >/dev/null 2>&1 && fuser "$port/tcp" >/dev/null 2>&1; then
-        err "Port $port is already in use. Stop whatever is bound to it, or override VAULT_PORT/EXPORTER_PORT."
-        exit 1
-    fi
-done
 
 # ── Dependencies & Security Audit ────────────────────────────────────────────
 
@@ -410,6 +400,35 @@ log "simply_ip_exporter build succeeded."
 # ── 1. Environment setup ─────────────────────────────────────────────────────
 
 log_section "1. Environment Setup"
+
+# Select ports after the builds. Hold both probes open until both ports are known, and
+# bind explicit overrides first so an ephemeral pick cannot consume either override.
+# Both services bind loopback, matching the probes. The probes release ports before startup.
+export BIND_HOST=127.0.0.1
+if ! PORT_PAIR=$(python3 - "${VAULT_PORT:-}" "${EXPORTER_PORT:-}" <<'PY'
+import socket
+import sys
+
+overrides = sys.argv[1:]
+with socket.socket() as vault, socket.socket() as exporter:
+    probes = list(zip(("VAULT_PORT", "EXPORTER_PORT"), overrides, (vault, exporter)))
+    for name, value, probe in sorted(probes, key=lambda entry: not entry[1]):
+        try:
+            port = int(value) if value else 0
+            if value and not 1 <= port <= 65535:
+                raise ValueError("expected a port between 1 and 65535")
+            probe.bind(("127.0.0.1", port))
+        except (ValueError, OSError) as error:
+            sys.exit(f"{name}: {error}")
+    print(vault.getsockname()[1], exporter.getsockname()[1])
+PY
+); then
+    err "Could not select two distinct free ports."
+    exit 1
+fi
+read -r VAULT_PORT EXPORTER_PORT <<< "$PORT_PAIR"
+VAULT_URL="http://127.0.0.1:$VAULT_PORT"
+EXPORTER_URL="http://127.0.0.1:$EXPORTER_PORT"
 
 log "Starting simply_ip_vault on port $VAULT_PORT against a fresh database at $VAULT_DB_PATH"
 DATABASE_URL="sqlite://$VAULT_DB_PATH?mode=rwc" RUST_LOG=info \
@@ -695,6 +714,13 @@ api_call "$VAULT_URL" GET "/api/ips?groups=pfBlocker_Blacklist,pfBlocker_Private
 check "200" "the scoped Exporter key can read across all three groups"
 check_jq "length" "6" "sees all 6 seeded records (restrict-not-reject: no group is silently rejected)"
 
+# Vault permits loopback records in whitelist groups. Seed them after the scoped read count above.
+for loopback in 127.0.0.1/32 ::1/128; do
+    api_call "$VAULT_URL" POST "/api/white" "$VAULT_MASTER_KEY" \
+        "{\"target_address\":\"$loopback\",\"group_name\":\"pfBlocker_Private_Test\"}"
+    check "200" "$loopback is registered for the loopback feed test"
+done
+
 # ── 3. Exporter configuration ───────────────────────────────────────────────
 
 log_section "3. Exporter Configuration"
@@ -749,11 +775,14 @@ register_key_secret "$GSD_KEY" "$GSD_SECRET"
 log "Granting read access on live Vault group pfBlocker_Blacklist to the Daughter key..."
 api_call "$EXPORTER_URL" POST "/api/keys/$GSD_ID/groups" "$EXPORTER_MASTER_KEY" "{\"vault_group_id\":\"$BLACKLIST_GROUP_ID\"}"
 check "200" "Vault group grant for pfBlocker_Blacklist succeeded"
+GSD_BLACKLIST_PERM_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
 log "Creating an endpoint using selected Vault group pfBlocker_Blacklist via the Daughter key..."
 api_call "$EXPORTER_URL" POST "/api/endpoints" "$GSD_KEY" \
     '{"name":"Daughter Blacklist Feed","vault_groups":"pfBlocker_Blacklist","ttl_seconds":2}'
 check "200" "endpoint created using selected Vault group by Daughter key"
+GSD_ENDPOINT_ID=$(echo "$RESP_BODY" | jq -r '.id')
+GSD_FEED_PATH=$(echo "$RESP_BODY" | jq -r '.feed_path')
 
 log "Attempting to create an endpoint using an ungranted Vault group as Daughter key..."
 api_call "$EXPORTER_URL" POST "/api/endpoints" "$GSD_KEY" \
@@ -782,7 +811,7 @@ check "204" "temp group deleted in Vault"
 
 log "Creating the public feed endpoint (ttl_seconds=2, filter_rfc1918=true, filter_bogons=true), spanning all three Vault groups..."
 api_call "$EXPORTER_URL" POST "/api/endpoints" "$EXPORTER_MASTER_KEY" \
-    '{"name":"pfBlockerNG DMZ Feed","vault_groups":"pfBlocker_Blacklist,pfBlocker_Private_Test,pfBlocker_Secondary_Test","ttl_seconds":2,"filter_rfc1918":true,"filter_bogons":true}'
+    '{"name":"pfBlockerNG DMZ Feed","vault_groups":"pfBlocker_Blacklist,pfBlocker_Private_Test,pfBlocker_Secondary_Test","ttl_seconds":2,"filter_rfc1918":true,"filter_bogons":true,"filter_loopback":true}'
 check "200" "the feed endpoint is created"
 check_jq ".filter_rfc1918" "true" "filter_rfc1918 is set as configured"
 check_jq ".filter_bogons" "true" "filter_bogons is set as configured"
@@ -1174,14 +1203,14 @@ else
     PASS_COUNT=$((PASS_COUNT + 1))
     log "Captured ETag: $ETAG"
 
-    raw_call GET "$EXPORTER_URL$FEED_PATH" -H "X-Forwarded-For: 198.51.100.12" -H "If-None-Match: $ETAG"
-    check "304" "a matching If-None-Match returns 304 Not Modified"
-
     raw_call GET "$EXPORTER_URL$FEED_PATH" -H "X-Forwarded-For: 198.51.100.12"
     check "429" "an immediate unconditional repeat from the same source IP is rate-limited"
 
     raw_call GET "$EXPORTER_URL$FEED_PATH" -H "X-Forwarded-For: 198.51.100.12" -H "If-None-Match: $ETAG"
-    check "304" "a matching conditional request is STILL free even though this IP is currently throttled"
+    check "429" "a conditional repeat from the same already-throttled IP is also rate-limited before DB/ETag evaluation"
+
+    raw_call GET "$EXPORTER_URL$FEED_PATH" -H "X-Forwarded-For: 198.51.100.112" -H "If-None-Match: $ETAG"
+    check "304" "a matching If-None-Match from an unthrottled client IP returns 304 Not Modified"
 fi
 
 # ── 6. Vault soft-delete propagation ────────────────────────────────────────
@@ -1233,6 +1262,22 @@ api_call "$EXPORTER_URL" PUT "/api/endpoints/$FEED_ENDPOINT_ID" "$EXPORTER_MASTE
 check "200" "filter_rfc1918 is restored"
 raw_call GET "$EXPORTER_URL$FEED_PATH" -H "X-Forwarded-For: 198.51.100.33"
 check_not_contains "$RESP_BODY" "192.168.1.50" "the private IP is hidden again immediately after restoring the filter"
+
+api_call "$EXPORTER_URL" PUT "/api/endpoints/$FEED_ENDPOINT_ID" "$EXPORTER_MASTER_KEY" '{"filter_loopback":false}'
+check "200" "Master can disable filter_loopback"
+raw_call GET "$EXPORTER_URL$FEED_PATH" -H "X-Forwarded-For: 198.51.100.34"
+check "200" "the feed serves immediately after disabling filter_loopback"
+check_local "$(grep -Fxc '127.0.0.1/32' <<< "$RESP_BODY")" "1" "IPv4 loopback appears with filter_loopback disabled"
+check_local "$(grep -Fxc '::1/128' <<< "$RESP_BODY")" "1" "IPv6 loopback appears with filter_loopback disabled"
+
+api_call "$EXPORTER_URL" PUT "/api/endpoints/$FEED_ENDPOINT_ID" "$EXPORTER_MASTER_KEY" '{"filter_loopback":true}'
+check "200" "Master can enable filter_loopback"
+check_jq ".filter_loopback" "true" "the endpoint reports filter_loopback enabled"
+raw_call GET "$EXPORTER_URL$FEED_PATH" -H "X-Forwarded-For: 198.51.100.35"
+check "200" "the feed serves immediately after enabling filter_loopback"
+check_not_contains "$RESP_BODY" "127.0.0.1" "filter_loopback removes the IPv4 loopback fixture"
+check_local "$(grep -Fxc '::1/128' <<< "$RESP_BODY")" "0" "filter_loopback removes the IPv6 loopback fixture"
+check_contains "$RESP_BODY" "8.8.8.0/24" "filter_loopback preserves public feed records"
 
 # ── 8. Client IP restriction (bound_ips) ────────────────────────────────────
 
@@ -1557,6 +1602,351 @@ check_local "$PRE_RESTART_COUNT" "10" "all ten ENDPOINT_CREATE entries (created 
 log "Confirming a Daughter key cannot read the audit log..."
 api_call "$EXPORTER_URL" GET "/api/audit-logs" "$DAUGHTER_KEY"
 check "403" "a Daughter key is forbidden from GET /api/audit-logs"
+
+# ── 15. Boundary, Security & Edge-Case Hardening ────────────────────────────
+
+log_section "15. Boundary, Security & Edge-Case Hardening"
+
+# 15a. Real-time Vault group permission revocation
+log "15a. Verifying Daughter-owned endpoint ($GSD_FEED_PATH) serves pfBlocker_Blacklist while grant is active..."
+raw_call GET "$EXPORTER_URL$GSD_FEED_PATH" -H "X-Forwarded-For: 198.51.100.201"
+check "200" "Daughter-owned endpoint serves 200 OK while Daughter holds permission on pfBlocker_Blacklist"
+check_contains "$RESP_BODY" "8.8.8.0/24" "Daughter-owned endpoint includes pfBlocker_Blacklist records before revocation"
+
+log "Revoking Daughter key ($GSD_ID) permission ($GSD_BLACKLIST_PERM_ID) on pfBlocker_Blacklist..."
+api_call "$EXPORTER_URL" DELETE "/api/keys/$GSD_ID/groups/$GSD_BLACKLIST_PERM_ID" "$EXPORTER_MASTER_KEY"
+check "204" "DELETE /api/keys/{id}/groups/{permission_id} revokes Daughter group permission (204 No Content)"
+
+api_call "$EXPORTER_URL" GET "/api/keys/$GSD_ID/groups" "$EXPORTER_MASTER_KEY"
+check "200" "GET /api/keys/{id}/groups succeeds after revocation"
+check_jq "length" "0" "Daughter key now holds 0 group permissions"
+
+log "Fetching Daughter-owned feed ($GSD_FEED_PATH) immediately after permission revocation..."
+raw_call GET "$EXPORTER_URL$GSD_FEED_PATH" -H "X-Forwarded-For: 198.51.100.202"
+check "403" "Revoked Daughter endpoint immediately returns 403 Forbidden instead of leaking group records"
+check_contains "$RESP_BODY" "lacks permission" "403 error message explains endpoint owner lacks Vault group permission"
+check_not_contains "$RESP_BODY" "8.8.8.0/24" "Revoked Daughter endpoint does NOT leak pfBlocker_Blacklist IP data"
+
+log "Verifying Daughter key can no longer update or create an endpoint sourcing the revoked group..."
+api_call "$EXPORTER_URL" PUT "/api/endpoints/$GSD_ENDPOINT_ID" "$GSD_KEY" '{"vault_groups":"pfBlocker_Blacklist"}'
+check "403" "Daughter key is forbidden (403) from updating endpoint with revoked Vault group"
+
+api_call "$EXPORTER_URL" POST "/api/endpoints" "$GSD_KEY" \
+    '{"name":"Post-Revocation Endpoint","vault_groups":"pfBlocker_Blacklist","ttl_seconds":60}'
+check "403" "Daughter key is forbidden (403) from creating a new endpoint with revoked Vault group"
+
+# 15b. Rate-limiting before DB/DNS on /feed/v1/*
+log "15b. Verifying per-IP rate limiting executes before DB lookup or DNS resolution on /feed/v1/*..."
+raw_call GET "$EXPORTER_URL/feed/v1/nonexistent_brute_force_guess_1/list.txt" -H "X-Forwarded-For: 198.51.100.210"
+check "404" "First request from 198.51.100.210 to unknown token returns 404 Not Found and records IP"
+
+raw_call GET "$EXPORTER_URL/feed/v1/nonexistent_brute_force_guess_2/list.txt" -H "X-Forwarded-For: 198.51.100.210" \
+    -D "$WORK_DIR/headers_15b"
+check "429" "Second request from 198.51.100.210 to another unknown token is blocked with 429 before DB lookup"
+RETRY_AFTER_HDR=$(grep -i '^retry-after:' "$WORK_DIR/headers_15b" | tr -d '\r' | awk -F': ' '{print $2}')
+if [ -n "$RETRY_AFTER_HDR" ] && [ "$RETRY_AFTER_HDR" -ge 1 ] 2>/dev/null; then
+    PASS_COUNT=$((PASS_COUNT + 1))
+    echo -e "$(ts)   ${GREEN}✓ PASS${RESET} 429 response includes Retry-After header ($RETRY_AFTER_HDR seconds)" >&2
+else
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo -e "$(ts)   ${RED}✗ FAIL${RESET} 429 response missing valid Retry-After header (got '$RETRY_AFTER_HDR')" >&2
+fi
+
+raw_call GET "$EXPORTER_URL$FEED_PATH" -H "X-Forwarded-For: 198.51.100.210"
+check "429" "Burst request from throttled IP 198.51.100.210 to valid feed is also blocked with 429"
+
+# 15c. /ready and /readyz opacity
+log "15c. Verifying unauthenticated GET /ready and GET /readyz opacity..."
+raw_call GET "$EXPORTER_URL/ready"
+check "200" "Unauthenticated GET /ready returns 200 OK"
+check_jq ".status" "ready" "GET /ready reports status=ready"
+check_jq "keys | length" "1" "GET /ready exposes only the single 'status' field"
+check_jq 'has("master_pinned")' "false" "GET /ready does not leak internal 'master_pinned' flag"
+check_jq 'has("database")' "false" "GET /ready does not leak internal 'database' flag"
+
+raw_call GET "$EXPORTER_URL/readyz"
+check "200" "Unauthenticated GET /readyz returns 200 OK"
+check_jq 'has("master_pinned")' "false" "GET /readyz does not leak internal 'master_pinned' flag"
+
+# 15d. Anti-replay hex case swap (a-f <-> A-F) & invalid timestamps
+log "15d. Verifying anti-replay digest case-insensitivity (a-f <-> A-F hex swap) and malformed timestamps..."
+next_timestamp "$EXPORTER_URL|GET|/api/auth/me|$EXPORTER_MASTER_KEY|"
+CASE_TS="$SIGNED_TS"
+ORIG_CASE_SIG=$(hmac_sign "$EXPORTER_MASTER_SECRET" "GET" "/api/auth/me" "$CASE_TS" "")
+ORIG_CASE_HEX="${ORIG_CASE_SIG#sha256=}"
+SWAPPED_CASE_HEX=$(printf '%s' "$ORIG_CASE_HEX" | tr 'a-fA-F' 'A-Fa-f')
+SWAPPED_CASE_SIG="sha256=$SWAPPED_CASE_HEX"
+
+raw_call GET "$EXPORTER_URL/api/auth/me" \
+    -H "X-API-Key: $EXPORTER_MASTER_KEY" \
+    -H "X-Timestamp: $CASE_TS" \
+    -H "X-Signature-256: $ORIG_CASE_SIG"
+check "200" "Initial request with fresh lowercase-hex signature succeeds (200 OK)"
+
+raw_call GET "$EXPORTER_URL/api/auth/me" \
+    -H "X-API-Key: $EXPORTER_MASTER_KEY" \
+    -H "X-Timestamp: $CASE_TS" \
+    -H "X-Signature-256: $SWAPPED_CASE_SIG"
+check "401" "Replaying the same signature with swapped hex case (a-f <-> A-F) is rejected with 401"
+check_contains "$RESP_BODY" "already been used" "Hex case-swapped replay is caught by digest-based ReplayGuard"
+
+raw_call GET "$EXPORTER_URL/api/auth/me" \
+    -H "X-API-Key: $EXPORTER_MASTER_KEY" \
+    -H "X-Timestamp: not-a-unix-timestamp" \
+    -H "X-Signature-256: $ORIG_CASE_SIG"
+check "401" "Non-numeric X-Timestamp is rejected with 401 Unauthorized"
+
+raw_call GET "$EXPORTER_URL/api/auth/me" \
+    -H "X-API-Key: $EXPORTER_MASTER_KEY" \
+    -H "X-Timestamp: " \
+    -H "X-Signature-256: $ORIG_CASE_SIG"
+check "401" "Empty X-Timestamp is rejected with 401 Unauthorized"
+
+# 15e. Endpoint bounds, malformed UUIDs, deny_unknown_fields & inclusive 'until' in /api/audit-logs
+log "15e. Verifying endpoint numeric bounds, malformed UUIDs, and inclusive 'until' on /api/audit-logs..."
+
+api_call "$EXPORTER_URL" POST "/api/endpoints" "$EXPORTER_MASTER_KEY" \
+    '{"name":"Zero TTL Feed","vault_groups":"pfBlocker_Blacklist","ttl_seconds":0}'
+check "400" "POST /api/endpoints rejects ttl_seconds=0 with 400 Bad Request"
+
+api_call "$EXPORTER_URL" POST "/api/endpoints" "$EXPORTER_MASTER_KEY" \
+    '{"name":"Negative TTL Feed","vault_groups":"pfBlocker_Blacklist","ttl_seconds":-30}'
+check "400" "POST /api/endpoints rejects negative ttl_seconds=-30 with 400 Bad Request"
+
+api_call "$EXPORTER_URL" PUT "/api/endpoints/$FEED_ENDPOINT_ID" "$EXPORTER_MASTER_KEY" \
+    '{"ttl_seconds":0}'
+check "400" "PUT /api/endpoints/{id} rejects ttl_seconds=0 with 400 Bad Request"
+
+api_call "$EXPORTER_URL" PUT "/api/endpoints/$FEED_ENDPOINT_ID" "$EXPORTER_MASTER_KEY" \
+    '{"max_age_seconds":-100}'
+check "400" "PUT /api/endpoints/{id} rejects negative max_age_seconds=-100 with 400 Bad Request"
+
+api_call "$EXPORTER_URL" POST "/api/endpoints" "$EXPORTER_MASTER_KEY" \
+    '{"name":"Empty Groups Feed","vault_groups":" , , "}'
+check "400" "POST /api/endpoints rejects blank vault_groups with 400 Bad Request"
+
+api_call "$EXPORTER_URL" POST "/api/endpoints" "$EXPORTER_MASTER_KEY" \
+    '{"name":"Bad Bound IP Feed","vault_groups":"pfBlocker_Blacklist","bound_ips":"999.999.999.999/32"}'
+check "400" "POST /api/endpoints rejects invalid bound_ips with 400 Bad Request"
+
+api_call "$EXPORTER_URL" POST "/api/endpoints" "$EXPORTER_MASTER_KEY" \
+    '{"name":"Unknown Field Feed","vault_groups":"pfBlocker_Blacklist","stray_field":true}'
+check "400" "POST /api/endpoints rejects unknown JSON field (deny_unknown_fields) with 400"
+
+# Malformed UUID path parameters
+api_call "$EXPORTER_URL" PUT "/api/endpoints/not-a-valid-uuid" "$EXPORTER_MASTER_KEY" '{"name":"x"}'
+check "400" "PUT /api/endpoints/{malformed_uuid} returns 400 Bad Request"
+
+api_call "$EXPORTER_URL" DELETE "/api/endpoints/not-a-valid-uuid" "$EXPORTER_MASTER_KEY"
+check "400" "DELETE /api/endpoints/{malformed_uuid} returns 400 Bad Request"
+
+api_call "$EXPORTER_URL" DELETE "/api/keys/not-a-valid-uuid" "$EXPORTER_MASTER_KEY"
+check "400" "DELETE /api/keys/{malformed_uuid} returns 400 Bad Request"
+
+api_call "$EXPORTER_URL" DELETE "/api/keys/$GSD_ID/groups/not-a-valid-uuid" "$EXPORTER_MASTER_KEY"
+check "400" "DELETE /api/keys/{id}/groups/{malformed_uuid} returns 400 Bad Request"
+
+# Inclusive 'until' boundary on /api/audit-logs
+api_call "$EXPORTER_URL" GET "/api/audit-logs?limit=1" "$EXPORTER_MASTER_KEY"
+check "200" "GET /api/audit-logs?limit=1 fetches most recent audit entry"
+LATEST_RAW_TS=$(echo "$RESP_BODY" | jq -r '.[0].timestamp')
+LATEST_RFC3339="${LATEST_RAW_TS%Z}Z"
+
+api_call "$EXPORTER_URL" GET "/api/audit-logs?since=$LATEST_RFC3339&until=$LATEST_RFC3339&limit=50" "$EXPORTER_MASTER_KEY"
+check "200" "GET /api/audit-logs with since==until ($LATEST_RFC3339) returns 200 OK"
+INCLUSIVE_UNTIL_COUNT=$(echo "$RESP_BODY" | jq 'length')
+if [ -n "$INCLUSIVE_UNTIL_COUNT" ] && [ "$INCLUSIVE_UNTIL_COUNT" -ge 1 ] 2>/dev/null; then
+    PASS_COUNT=$((PASS_COUNT + 1))
+    echo -e "$(ts)   ${GREEN}✓ PASS${RESET} /api/audit-logs 'until' filter is inclusive (<=) and returned $INCLUSIVE_UNTIL_COUNT entry at exact timestamp" >&2
+else
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo -e "$(ts)   ${RED}✗ FAIL${RESET} /api/audit-logs 'until' filter excluded entry at exact timestamp $LATEST_RFC3339" >&2
+fi
+
+api_call "$EXPORTER_URL" GET "/api/audit-logs?until=not-an-rfc3339-date" "$EXPORTER_MASTER_KEY"
+check "400" "GET /api/audit-logs rejects malformed 'until' timestamp with 400 Bad Request"
+
+api_call "$EXPORTER_URL" GET "/api/audit-logs?since=not-an-rfc3339-date" "$EXPORTER_MASTER_KEY"
+check "400" "GET /api/audit-logs rejects malformed 'since' timestamp with 400 Bad Request"
+
+api_call "$EXPORTER_URL" GET "/api/audit-logs?unknown_query_param=1" "$EXPORTER_MASTER_KEY"
+check "400" "GET /api/audit-logs rejects unknown query parameter (deny_unknown_fields) with 400"
+
+log_section "16. Key and Endpoint Ownership Boundaries"
+
+api_call "$EXPORTER_URL" GET "/api/auth/me" "$EXPORTER_MASTER_KEY"
+check "200" "Master authenticates before the immutability checks"
+MASTER_ID=$(jq -r '.id' <<< "$RESP_BODY")
+MASTER_IDENTITY=$(jq -cS . <<< "$RESP_BODY")
+OWNER_PAYLOAD="{\"owner_key_id\":\"$MASTER_ID\"}"
+
+# Exercise the key routes with an unprivileged but valid signature, including self-management.
+for method in GET POST PUT DELETE; do
+    case "$method" in
+        GET) api_call "$EXPORTER_URL" GET "/api/keys" "$GSD_KEY" ;;
+        POST) api_call "$EXPORTER_URL" POST "/api/keys" "$GSD_KEY" '{"name":"Forbidden Daughter"}' ;;
+        PUT) api_call "$EXPORTER_URL" PUT "/api/keys/$GSD_ID" "$GSD_KEY" '{"can_manage_keys":true}' ;;
+        DELETE) api_call "$EXPORTER_URL" DELETE "/api/keys/$GSD_ID" "$GSD_KEY" ;;
+    esac
+    check "403" "Daughter cannot manage keys with $method"
+done
+for operation in rotate rotate-secret; do
+    api_call "$EXPORTER_URL" POST "/api/keys/$GSD_ID/$operation" "$GSD_KEY"
+    check "403" "Daughter cannot $operation on its own key"
+done
+api_call "$EXPORTER_URL" GET "/api/settings" "$GSD_KEY"
+check "403" "Daughter cannot read settings"
+api_call "$EXPORTER_URL" GET "/api/settings" "$EXPORTER_MASTER_KEY"
+check "200" "Master can read settings"
+
+api_call "$EXPORTER_URL" PUT "/api/keys/$MASTER_ID" "$EXPORTER_MASTER_KEY" '{"name":"Renamed Master"}'
+check "403" "Master cannot change its name through the API"
+api_call "$EXPORTER_URL" PUT "/api/keys/$MASTER_ID" "$EXPORTER_MASTER_KEY" '{"can_manage_keys":false}'
+check "403" "Master cannot change its can_manage_keys flag through the API"
+api_call "$EXPORTER_URL" DELETE "/api/keys/$MASTER_ID" "$EXPORTER_MASTER_KEY"
+check "403" "Master cannot delete its own key through the API"
+for operation in rotate rotate-secret; do
+    api_call "$EXPORTER_URL" POST "/api/keys/$MASTER_ID/$operation" "$EXPORTER_MASTER_KEY"
+    check "403" "Master cannot $operation on its own key through the API"
+done
+api_call "$EXPORTER_URL" GET "/api/auth/me" "$EXPORTER_MASTER_KEY"
+check "200" "Master's original credentials still authenticate after refused mutations"
+check_local "$(jq -cS . <<< "$RESP_BODY")" "$MASTER_IDENTITY" "Master identity and flags are unchanged"
+
+AUDIT_CLIENT_IP="198.51.100.220"
+api_call "$EXPORTER_URL" POST "/api/keys/$DAUGHTER_ID/rotate-secret" "$EXPORTER_MASTER_KEY" "" "$AUDIT_CLIENT_IP"
+check "200" "Master can rotate a Daughter's signing secret independently"
+check_jq ".id" "$DAUGHTER_ID" "secret rotation preserves the key ID"
+check_jq 'has("api_key")' "false" "secret rotation does not return a replacement API key"
+ROTATED_SECRET=$(jq -r '.signing_secret' <<< "$RESP_BODY")
+api_call "$EXPORTER_URL" GET "/api/auth/me" "$DAUGHTER_KEY"
+check "401" "the same API key signed with the previous secret fails immediately"
+register_key_secret "$DAUGHTER_KEY" "$ROTATED_SECRET"
+api_call "$EXPORTER_URL" GET "/api/auth/me" "$DAUGHTER_KEY"
+check "200" "the same API key signed with the new secret works immediately"
+check_jq ".id" "$DAUGHTER_ID" "the new secret authenticates the same Daughter identity"
+
+GSD_OWNER_PATH="/api/endpoints/$GSD_ENDPOINT_ID/owner"
+api_call "$EXPORTER_URL" PUT "$GSD_OWNER_PATH" "$GSD_KEY" "$OWNER_PAYLOAD"
+check "403" "Daughter cannot transfer its own endpoint"
+for invalid_owner in null "\"$DOOMED_ID\""; do
+    api_call "$EXPORTER_URL" PUT "$GSD_OWNER_PATH" "$EXPORTER_MASTER_KEY" "{\"owner_key_id\":$invalid_owner}"
+    check "400" "Master cannot transfer an endpoint to a null or deleted owner ($invalid_owner)"
+done
+
+# Keep these updates on one endpoint and vary one filter at a time for the audit checks.
+api_call "$EXPORTER_URL" PUT "/api/endpoints/$GSD_ENDPOINT_ID" "$GSD_KEY" \
+    '{"description":"Audit entry from Daughter"}' "$AUDIT_CLIENT_IP"
+check "200" "Daughter still owns and can update the endpoint after refused transfers"
+check_jq ".owner_key_id" "$GSD_ID" "refused transfers preserve the endpoint owner"
+for update in 1 2 3; do
+    api_call "$EXPORTER_URL" PUT "/api/endpoints/$GSD_ENDPOINT_ID" "$EXPORTER_MASTER_KEY" \
+        "{\"description\":\"Audit update $update\"}" "$AUDIT_CLIENT_IP"
+    check "200" "Master records audit update $update from the selected IP"
+done
+api_call "$EXPORTER_URL" PUT "/api/endpoints/$GSD_ENDPOINT_ID" "$EXPORTER_MASTER_KEY" \
+    '{"description":"Audit update from another IP"}' "198.51.100.221"
+check "200" "Master records an endpoint update from a different client IP"
+
+api_call "$EXPORTER_URL" POST "/api/endpoints" "$EXPORTER_MASTER_KEY" \
+    '{"name":"Ownership Transfer Feed","vault_groups":"pfBlocker_Blacklist"}'
+check "200" "Master creates a second endpoint for the reassignment test"
+TRANSFER_ENDPOINT_ID=$(jq -r '.id' <<< "$RESP_BODY")
+TRANSFER_FEED_PATH=$(jq -r '.feed_path' <<< "$RESP_BODY")
+api_call "$EXPORTER_URL" PUT "/api/endpoints/$TRANSFER_ENDPOINT_ID/owner" "$EXPORTER_MASTER_KEY" \
+    "{\"owner_key_id\":\"$GSD_ID\"}"
+check "200" "Master can transfer an endpoint to a Daughter"
+check_jq ".owner_key_id" "$GSD_ID" "the ownership response identifies the new owner"
+api_call "$EXPORTER_URL" GET "/api/endpoints" "$GSD_KEY"
+check "200" "Daughter can list its own endpoints after the transfer"
+OWNED_IDS=$(jq -c '[.[].id] | sort' <<< "$RESP_BODY")
+EXPECTED_OWNED_IDS=$(jq -cn --arg first "$GSD_ENDPOINT_ID" --arg second "$TRANSFER_ENDPOINT_ID" '[$first, $second] | sort')
+check_local "$OWNED_IDS" "$EXPECTED_OWNED_IDS" "Daughter sees exactly the two endpoints it owns"
+
+api_call "$EXPORTER_URL" DELETE "/api/keys/$GSD_ID" "$EXPORTER_MASTER_KEY"
+check "409" "deleting an endpoint owner without reassignment conflicts"
+check_jq '[.owned_endpoints[].id] | sort | @json' "$EXPECTED_OWNED_IDS" "the conflict inventories both owned endpoints"
+for invalid_target in "$GSD_ID" "$DOOMED_ID"; do
+    api_call "$EXPORTER_URL" DELETE "/api/keys/$GSD_ID?reassign_to=$invalid_target" "$EXPORTER_MASTER_KEY"
+    check "400" "deletion rejects reassignment to the same or a deleted key ($invalid_target)"
+done
+api_call "$EXPORTER_URL" GET "/api/endpoints" "$GSD_KEY"
+check "200" "the original owner still authenticates after refused deletions"
+check_jq '[.[].id] | sort | @json' "$EXPECTED_OWNED_IDS" "refused deletions preserve both endpoints under their original owner"
+
+api_call "$EXPORTER_URL" DELETE "/api/keys/$GSD_ID?reassign_to=$MASTER_ID" "$EXPORTER_MASTER_KEY"
+check "204" "one DELETE reassigns both endpoints and removes their former owner"
+api_call "$EXPORTER_URL" GET "/api/auth/me" "$GSD_KEY"
+check "401" "the former owner's credentials stop working immediately"
+api_call "$EXPORTER_URL" GET "/api/endpoints" "$EXPORTER_MASTER_KEY"
+check "200" "Master can list endpoints after the transactional reassignment"
+MOVED_IDS=$(jq -c --arg owner "$MASTER_ID" --arg first "$GSD_ENDPOINT_ID" --arg second "$TRANSFER_ENDPOINT_ID" \
+    --arg first_path "$GSD_FEED_PATH" --arg second_path "$TRANSFER_FEED_PATH" '
+    [.[] | select(.owner_key_id == $owner and
+        ((.id == $first and .feed_path == $first_path) or (.id == $second and .feed_path == $second_path))) | .id] | sort
+' <<< "$RESP_BODY")
+check_local "$MOVED_IDS" "$EXPECTED_OWNED_IDS" "both endpoints retain their IDs and feed paths under the new owner"
+raw_call GET "$EXPORTER_URL$GSD_FEED_PATH" -H "X-Forwarded-For: 198.51.100.222"
+check "200" "the transferred cached feed uses the new owner's permissions immediately"
+check_contains "$RESP_BODY" "8.8.8.0/24" "the transferred feed still serves cached records with Vault offline"
+
+log_section "17. Concurrent Audit Filtering and Request Size"
+
+AUDIT_QUERY="/api/audit-logs?action=ENDPOINT_UPDATE&api_key=$MASTER_ID&client_ip=$AUDIT_CLIENT_IP"
+api_call "$EXPORTER_URL" GET "$AUDIT_QUERY" "$EXPORTER_MASTER_KEY"
+check "200" "the audit endpoint accepts all three filters together"
+check_jq "length" "3" "combined filters exclude the other action, actor and IP"
+check_local "$(jq -r --arg key "$MASTER_ID" --arg ip "$AUDIT_CLIENT_IP" '
+    length == 3 and all(.[]; .action == "ENDPOINT_UPDATE" and .api_key_id == $key and .client_ip == $ip)
+' <<< "$RESP_BODY")" "true" "every filtered row matches all three predicates"
+AUDIT_BASELINE="$RESP_BODY"
+
+# Run each request with separate files and a distinct signed target so the replay guard
+# and the shared files used by api_call do not interfere with concurrent reads.
+AUDIT_PIDS=()
+for offset in 0 1 2 3; do
+    (
+        path="$AUDIT_QUERY&limit=1&offset=$offset"
+        timestamp=$(date -u +%s)
+        signature=$(hmac_sign "$EXPORTER_MASTER_SECRET" GET "$path" "$timestamp")
+        curl -sS --max-time 20 -o "$WORK_DIR/audit_page_$offset.json" -w '%{http_code}' \
+            -H "X-API-Key: $EXPORTER_MASTER_KEY" -H "X-Timestamp: $timestamp" \
+            -H "X-Signature-256: $signature" "$EXPORTER_URL$path" > "$WORK_DIR/audit_page_$offset.status"
+    ) &
+    AUDIT_PIDS+=("$!")
+done
+for offset in 0 1 2 3; do
+    if wait "${AUDIT_PIDS[$offset]}"; then
+        PAGE_STATUS=$(cat "$WORK_DIR/audit_page_$offset.status")
+    else
+        PAGE_STATUS="curl failed"
+    fi
+    check_local "$PAGE_STATUS" "200" "concurrent filtered audit request at offset $offset succeeds"
+    EXPECTED_PAGE=$(jq -c --argjson offset "$offset" '.[$offset:$offset+1] | map(.id)' <<< "$AUDIT_BASELINE")
+    ACTUAL_PAGE=$(jq -c 'map(.id)' "$WORK_DIR/audit_page_$offset.json" 2>/dev/null)
+    check_local "$ACTUAL_PAGE" "$EXPECTED_PAGE" "audit offset $offset returns exactly its expected row IDs"
+done
+
+api_call "$EXPORTER_URL" GET "/api/audit-logs?action=KEY_DELETE&api_key=$MASTER_ID" "$EXPORTER_MASTER_KEY"
+check "200" "Master can retrieve key deletion audit entries"
+check_local "$(jq -r --arg id "$GSD_ID" '
+    [.[] | select(.target_resource | contains($id))] |
+    length == 1 and (.[0].details | contains("reassigned 2 endpoint(s)"))
+' <<< "$RESP_BODY")" "true" "the delete audit entry records the reassignment once"
+
+# Keep the oversized JSON on disk to avoid shell argument limits. Sign the exact file bytes.
+OVERSIZE_BODY="$WORK_DIR/oversize.json"
+python3 -c 'import sys; sys.stdout.write("{\"name\":\"" + "x" * (3 * 1024 * 1024) + "\"}")' > "$OVERSIZE_BODY"
+OVERSIZE_TS=$(date -u +%s)
+OVERSIZE_DIGEST=$(
+    { printf 'POST\n/api/keys\n%s\n' "$OVERSIZE_TS"; cat "$OVERSIZE_BODY"; } |
+        openssl dgst -sha256 -hmac "$EXPORTER_MASTER_SECRET" | sed 's/^.*= //'
+)
+raw_call POST "$EXPORTER_URL/api/keys" --max-time 20 \
+    -H "X-API-Key: $EXPORTER_MASTER_KEY" -H "X-Timestamp: $OVERSIZE_TS" \
+    -H "X-Signature-256: sha256=$OVERSIZE_DIGEST" -H "Content-Type: application/json" \
+    --data-binary "@$OVERSIZE_BODY"
+check "413" "a signed JSON body larger than 3 MiB returns Payload Too Large"
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 

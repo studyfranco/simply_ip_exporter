@@ -45,14 +45,20 @@ impl std::fmt::Display for MasterPinError {
                  Decide which key is the Master and demote the others with `UPDATE api_keys SET \
                  is_master = false WHERE id IN (...);`, then restart.",
                 ids.len(),
-                ids.iter().map(Uuid::to_string).collect::<Vec<_>>().join(", ")
+                ids.iter()
+                    .map(Uuid::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
             Self::MissingConstraint => write!(
                 f,
                 "the unique index '{MASTER_MARKER_INDEX}' is missing from '{API_KEYS_TABLE}'. \
                  Re-run migrations."
             ),
-            Self::Db(e) => write!(f, "could not query the database to establish the master key: {e}"),
+            Self::Db(e) => write!(
+                f,
+                "could not query the database to establish the master key: {e}"
+            ),
         }
     }
 }
@@ -73,11 +79,15 @@ pub struct MasterPin {
 
 impl MasterPin {
     /// An unresolved pin.
+    #[must_use]
     pub fn new() -> Self {
-        Self { cell: OnceCell::new() }
+        Self {
+            cell: OnceCell::new(),
+        }
     }
 
     /// A pin fixed to a known id, without consulting the database. Test-facing.
+    #[must_use]
     pub fn pinned_to(id: Uuid) -> Self {
         let cell = OnceCell::new();
         // A freshly constructed `OnceCell` is always empty, so `set` cannot fail here.
@@ -86,20 +96,23 @@ impl MasterPin {
     }
 
     /// The pinned id, if one has been established.
+    #[must_use]
     pub fn get(&self) -> Option<Uuid> {
         self.cell.get().copied()
     }
 
     /// Establishes the Master identity at startup, asserting every §5 invariant on the way.
+    ///
+    /// # Errors
+    /// Returns [`MasterPinError`] if no Master key exists, multiple exist, the marker index is missing, or the database query fails.
     pub async fn pin_at_boot(&self, db: &DatabaseConnection) -> Result<Uuid, MasterPinError> {
-        // `crate::db::has_index` rather than `sea_orm_migration::SchemaManager::has_index`: the
-        // latter's catalog query is gated behind cargo features this crate does not enable for
-        // PostgreSQL and answers `BackendNotSupported` there — see that function's doc comment.
+        let id = self.resolve_inner(db).await?;
+
+        // Delegates to `SeaORM`'s `SchemaManager::has_index` via `crate::db::has_index`.
         if !crate::db::has_index(db, API_KEYS_TABLE, MASTER_MARKER_INDEX).await? {
             return Err(MasterPinError::MissingConstraint);
         }
 
-        let id = self.resolve_inner(db).await?;
         let _ = self.cell.set(id);
 
         let pinned = self.cell.get().copied().unwrap_or(id);
@@ -125,13 +138,17 @@ impl MasterPin {
     }
 
     async fn resolve_inner(&self, db: &DatabaseConnection) -> Result<Uuid, MasterPinError> {
-        let masters =
-            ApiKey::find().filter(api_key::Column::IsMaster.eq(true)).all(db).await?;
+        let masters = ApiKey::find()
+            .filter(api_key::Column::IsMaster.eq(true))
+            .all(db)
+            .await?;
 
         match masters.len() {
             0 => Err(MasterPinError::NoMaster),
             1 => Ok(masters[0].id),
-            _ => Err(MasterPinError::Duplicates(masters.iter().map(|k| k.id).collect())),
+            _ => Err(MasterPinError::Duplicates(
+                masters.iter().map(|k| k.id).collect(),
+            )),
         }
     }
 
@@ -188,7 +205,15 @@ mod tests {
     fn every_failure_names_a_remedy() {
         assert!(MasterPinError::NoMaster.to_string().contains("restart"));
         let dupes = MasterPinError::Duplicates(vec![Uuid::nil(), Uuid::max()]);
-        assert!(dupes.to_string().contains("UPDATE api_keys SET is_master = false"));
-        assert!(MasterPinError::MissingConstraint.to_string().contains(MASTER_MARKER_INDEX));
+        assert!(
+            dupes
+                .to_string()
+                .contains("UPDATE api_keys SET is_master = false")
+        );
+        assert!(
+            MasterPinError::MissingConstraint
+                .to_string()
+                .contains(MASTER_MARKER_INDEX)
+        );
     }
 }

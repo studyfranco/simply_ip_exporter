@@ -343,7 +343,7 @@ async function loadEndpoints() {
   const tbody = el('endpoints-body');
   tbody.innerHTML = '';
   if (endpoints.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="8" class="table-empty">No endpoints yet — create one below.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8" class="table-empty">No endpoints yet — click + New Endpoint above to create one.</td></tr>';
   }
   for (const ep of endpoints) {
     const tr = document.createElement('tr');
@@ -363,10 +363,12 @@ async function loadEndpoints() {
       <td title="${escapeHtml(filters)}">${escapeHtml(filters)}</td>
       <td class="font-mono text-sm" title="${ep.bound_ips ? escapeHtml(ep.bound_ips) : ''}">${ep.bound_ips ? escapeHtml(ep.bound_ips) : '<span class="text-muted">Unrestricted</span>'}</td>
       <td class="text-sm" title="${ep.last_synced_at ? escapeHtml(ep.last_synced_at) : ''}">${ep.last_synced_at ? escapeHtml(formatTimestamp(ep.last_synced_at)) : '<span class="text-muted">never</span>'}</td>
-      <td class="row">
-        <button class="btn btn-secondary btn-sm" data-edit-endpoint="${ep.id}">Edit</button>
-        <button class="btn btn-secondary btn-sm" data-copy="${escapeHtml(feedUrl)}">Copy URL</button>
-        <button class="btn btn-danger btn-sm" data-delete-endpoint="${ep.id}">Delete</button>
+      <td class="row-actions">
+        <div class="row-actions-group">
+          <button class="btn btn-secondary btn-sm" data-edit-endpoint="${ep.id}">Edit</button>
+          <button class="btn btn-secondary btn-sm" data-copy="${escapeHtml(feedUrl)}">Copy URL</button>
+          <button class="btn btn-danger btn-sm" data-delete-endpoint="${ep.id}">Delete</button>
+        </div>
       </td>`;
     tbody.appendChild(tr);
   }
@@ -627,9 +629,9 @@ async function loadKeys() {
       .join("");
 
     const groupBadgesRaw = k.is_master
-      ? '<span class="badge badge-scope">all groups</span>'
+      ? '<span class="badge badge-scope" title="Master keys may read all Vault groups for /feed/v1/* feeds">all groups</span>'
       : (grantsByKeyId.get(k.id) || [])
-          .map((g) => `<span class="badge badge-scope">${escapeHtml(g.vault_group_name)}</span>`)
+          .map((g) => `<span class="badge badge-scope" title="Read-only Vault group scope for /feed/v1/* feeds">${escapeHtml(g.vault_group_name)}</span>`)
           .join("");
     const groupBadges = groupBadgesRaw
       ? `<div class="scope-badges">${groupBadgesRaw}</div>`

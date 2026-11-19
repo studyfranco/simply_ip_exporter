@@ -65,7 +65,11 @@ pub struct DnsResolver {
 
 impl Default for DnsResolver {
     fn default() -> Self {
-        Self { positive_ttl: POSITIVE_TTL, negative_ttl: NEGATIVE_TTL, cache: Arc::default() }
+        Self {
+            positive_ttl: POSITIVE_TTL,
+            negative_ttl: NEGATIVE_TTL,
+            cache: Arc::default(),
+        }
     }
 }
 
@@ -79,6 +83,7 @@ impl std::fmt::Debug for HostnameState {
 
 impl DnsResolver {
     /// Builds a resolver with the default TTL policy.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -86,8 +91,13 @@ impl DnsResolver {
     /// Overrides both DNS reuse windows. Test-facing: a suite cannot wait 30 seconds to observe
     /// that a re-resolution happened, nor 5 to observe that one was suppressed.
     #[cfg(test)]
+    #[must_use]
     pub fn with_ttls(positive: Duration, negative: Duration) -> Self {
-        Self { positive_ttl: positive, negative_ttl: negative, cache: Arc::default() }
+        Self {
+            positive_ttl: positive,
+            negative_ttl: negative,
+            cache: Arc::default(),
+        }
     }
 
     /// Resolves `hostname`, reusing a cached attempt when it is still fresh.
@@ -132,7 +142,14 @@ impl DnsResolver {
     ) -> Vec<IpNet> {
         let addresses = lookup_hostname(hostname).await;
         let resolved = !addresses.is_empty();
-        cache.insert(hostname.to_owned(), HostnameState { addresses: addresses.clone(), attempted_at: Instant::now(), resolved });
+        cache.insert(
+            hostname.to_owned(),
+            HostnameState {
+                addresses: addresses.clone(),
+                attempted_at: Instant::now(),
+                resolved,
+            },
+        );
         addresses
     }
 }
@@ -147,25 +164,36 @@ pub(crate) async fn lookup_hostname(hostname: &str) -> Vec<IpNet> {
     // Port 0: `lookup_host` wants a socket address, but only the address half is used.
     match tokio::net::lookup_host((hostname, 0u16)).await {
         Ok(addrs) => {
-            let networks: Vec<IpNet> = addrs.map(|addr| IpNet::from(normalize_ip(addr.ip()))).collect();
+            let networks: Vec<IpNet> = addrs
+                .map(|addr| IpNet::from(normalize_ip(addr.ip())))
+                .collect();
             if networks.is_empty() {
-                tracing::warn!("Hostname {hostname:?} resolved to no addresses; it is not trusted/matched until it does.");
+                tracing::warn!(
+                    "Hostname {hostname:?} resolved to no addresses; it is not trusted/matched until it does."
+                );
             } else {
                 tracing::debug!(
                     "Hostname {hostname:?} resolved to {}",
-                    networks.iter().map(|n| n.addr().to_string()).collect::<Vec<_>>().join(", ")
+                    networks
+                        .iter()
+                        .map(|n| n.addr().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 );
             }
             networks
         }
         Err(e) => {
-            tracing::warn!("Could not resolve hostname {hostname:?}: {e}. It is not trusted/matched until resolution succeeds.");
+            tracing::warn!(
+                "Could not resolve hostname {hostname:?}: {e}. It is not trusted/matched until resolution succeeds."
+            );
             Vec::new()
         }
     }
 }
 
 /// Normalizes an IPv4-mapped IPv6 address (`::ffff:192.168.1.1`) down to its plain IPv4 form.
+#[must_use]
 pub fn normalize_ip(ip: IpAddr) -> IpAddr {
     ip.to_canonical()
 }
@@ -207,6 +235,7 @@ pub struct InvalidHostEntry {
 ///   apply. Reused here for `bound_ips` so a hostname entry is refused/accepted by the identical
 ///   rule `TRUSTED_PROXIES` uses, not a second, potentially-drifting definition of "looks like a
 ///   hostname".
+#[must_use]
 pub fn hostname_rejection(entry: &str) -> Option<&'static str> {
     if entry.is_empty() {
         return Some("empty");
@@ -231,7 +260,10 @@ pub fn hostname_rejection(entry: &str) -> Option<&'static str> {
     if entry.chars().all(|c| c.is_ascii_digit() || c == '.') {
         return Some("made only of digits and dots, so this is a malformed IPv4 literal");
     }
-    if !entry.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_') {
+    if !entry
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_')
+    {
         return Some("contains characters that cannot appear in a DNS name");
     }
     None
@@ -244,10 +276,22 @@ mod tests {
     #[test]
     fn hostname_edge_cases() {
         assert_eq!(hostname_rejection(""), Some("empty"));
-        assert_eq!(hostname_rejection("-leading-dash"), Some("a hostname must begin and end with a letter or a digit"));
-        assert_eq!(hostname_rejection("trailing-dash-"), Some("a hostname must begin and end with a letter or a digit"));
-        assert_eq!(hostname_rejection("has a space"), Some("contains characters that cannot appear in a DNS name"));
-        assert_eq!(hostname_rejection(&"a".repeat(254)), Some("longer than the 253-character limit on a DNS name"));
+        assert_eq!(
+            hostname_rejection("-leading-dash"),
+            Some("a hostname must begin and end with a letter or a digit")
+        );
+        assert_eq!(
+            hostname_rejection("trailing-dash-"),
+            Some("a hostname must begin and end with a letter or a digit")
+        );
+        assert_eq!(
+            hostname_rejection("has a space"),
+            Some("contains characters that cannot appear in a DNS name")
+        );
+        assert_eq!(
+            hostname_rejection(&"a".repeat(254)),
+            Some("longer than the 253-character limit on a DNS name")
+        );
         assert_eq!(hostname_rejection("traefik_tomidejetsu"), None);
         assert_eq!(hostname_rejection("proxy.internal"), None);
         assert_eq!(hostname_rejection("traefik-1"), None);
@@ -256,26 +300,40 @@ mod tests {
     #[tokio::test]
     async fn a_resolvable_hostname_is_cached_and_returned() {
         let resolver = DnsResolver::new();
-        let resolved = resolver.resolve("localhost").await;
-        assert!(!resolved.is_empty(), "localhost must resolve to at least one address");
+        let addrs = resolver.resolve("localhost").await;
+        assert!(
+            !addrs.is_empty(),
+            "localhost must resolve to at least one address"
+        );
     }
 
     #[tokio::test]
     async fn an_unresolvable_hostname_yields_no_addresses_and_does_not_error() {
         let resolver = DnsResolver::new();
-        let resolved = resolver.resolve("this-name-does-not-exist.invalid").await;
-        assert!(resolved.is_empty());
+        let addrs = resolver.resolve("this-name-does-not-exist.invalid").await;
+        assert!(addrs.is_empty());
     }
 
     #[tokio::test]
     async fn a_negative_cache_entry_expires_and_is_retried() {
-        let resolver = DnsResolver::with_ttls(Duration::from_millis(500), Duration::from_millis(20));
-        assert!(resolver.resolve("this-name-does-not-exist.invalid").await.is_empty());
+        let resolver =
+            DnsResolver::with_ttls(Duration::from_millis(500), Duration::from_millis(20));
+        assert!(
+            resolver
+                .resolve("this-name-does-not-exist.invalid")
+                .await
+                .is_empty()
+        );
         tokio::time::sleep(Duration::from_millis(40)).await;
         // Past the (shortened) negative TTL: this must re-attempt rather than serve the stale
         // cached failure forever — the same property `config::TrustedProxies` relied on before
         // this cache was extracted out from under it.
-        assert!(resolver.resolve("this-name-does-not-exist.invalid").await.is_empty());
+        assert!(
+            resolver
+                .resolve("this-name-does-not-exist.invalid")
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -284,7 +342,7 @@ mod tests {
         let _ = resolver.resolve("localhost").await;
         // Would normally be served from the (very long-lived) cache; force_resolve must still do a
         // real lookup rather than trusting it.
-        let resolved = resolver.force_resolve("localhost").await;
-        assert!(!resolved.is_empty());
+        let addrs = resolver.force_resolve("localhost").await;
+        assert!(!addrs.is_empty());
     }
 }

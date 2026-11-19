@@ -1,6 +1,7 @@
 //! Outbound `simply_ip_vault` API client: `CANONICAL_V1` HMAC-signed `GET /api/ips` requests for
 //! the hybrid differential/full sync protocol.
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
@@ -13,6 +14,8 @@ use uuid::Uuid;
 
 use crate::crypto::{canonical_v1_payload, compute_signature};
 
+/// Connection establishment timeout before a dead upstream TCP handshake is aborted.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Hard ceiling on how long one sync request may take, covering connect, send, and receive.
 ///
 /// Without this, a Vault that accepts a TCP connection and then never answers (a black-holed
@@ -73,7 +76,9 @@ pub enum VaultError {
     /// Vault kept serving the same page while `offset` advanced, so the walk could never end.
     /// Reported as a failure rather than returned as a truncated result: a full sync has replace
     /// semantics, and a silently short feed is worse than keeping the previous cache.
-    #[error("simply_ip_vault pagination made no progress for groups {0:?} (is it honouring `offset`?)")]
+    #[error(
+        "simply_ip_vault pagination made no progress for groups {0:?} (is it honouring `offset`?)"
+    )]
     PaginationStalled(String),
 }
 
@@ -166,21 +171,35 @@ impl VaultClient {
     /// Builds a client from the runtime configuration, or `None` if Vault sync is not configured
     /// or the underlying HTTP client cannot be built (a TLS backend failure — not reachable in
     /// practice with the `rustls` feature this crate compiles, but reported rather than unwrapped).
+    #[must_use]
     pub fn from_config(config: &crate::config::RuntimeConfig) -> Option<Self> {
         let (base_url, api_key, signing_secret) = (
             config.vault_base_url.clone()?,
             config.vault_api_key.clone()?,
             config.vault_signing_secret.clone()?,
         );
-        let http = reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build().ok()?;
+        let http = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .ok()?;
         let last_timestamp = Arc::new(AtomicI64::new(0));
-        Some(Self { http, base_url, api_key, signing_secret, last_timestamp, page_size: PAGE_SIZE })
+        Some(Self {
+            http,
+            base_url,
+            api_key,
+            signing_secret,
+            last_timestamp,
+            page_size: PAGE_SIZE,
+        })
     }
 
     /// Overrides the pagination page size. Test-facing: exercising a multi-page walk against the
     /// real [`PAGE_SIZE`] would mean seeding a thousand fixture records per page, so a suite shrinks
     /// it instead — the same trade `config::TrustedProxies::with_ttls` makes for its DNS TTLs.
     #[cfg(test)]
+    #[must_use]
     pub fn with_page_size(mut self, page_size: u64) -> Self {
         self.page_size = page_size;
         self
@@ -230,6 +249,9 @@ impl VaultClient {
     /// full-sort cliff. Splitting changes nothing downstream — the cache is keyed by address, and
     /// the same address in two groups already arrived twice from the combined query (one item per
     /// membership).
+    ///
+    /// # Errors
+    /// Returns [`VaultError`] if HTTP requests fail, return non-2xx, or yield malformed JSON.
     pub async fn fetch_ips(
         &self,
         groups: &str,
@@ -261,10 +283,11 @@ impl VaultClient {
     ) -> Result<Vec<VaultApiRecord>, VaultError> {
         let mut base = format!("/api/ips?groups={}", urlencode(groups));
         if let Some(since) = since {
-            base.push_str(&format!(
+            let _ = write!(
+                base,
                 "&since={}&include_deleted=true",
                 urlencode(&since.and_utc().timestamp().to_string())
-            ));
+            );
         }
 
         // Page one doubles as a capability probe: `include_total=true&format=minimal` asks a
@@ -290,7 +313,8 @@ impl VaultClient {
                     )
                     .await
                 } else {
-                    self.fetch_remaining_pages_in_parallel(&base, envelope, groups).await
+                    self.fetch_remaining_pages_in_parallel(&base, envelope, groups)
+                        .await
                 }
             }
             Ok(IpsResponse::Cursor(envelope)) => {
@@ -398,8 +422,9 @@ impl VaultClient {
 
         // `total_pages` is 0 when there is nothing to page through and 1 when it all fit in page
         // one; both mean "no follow-up requests", which this range expresses without a branch.
-        let offsets: Vec<u64> =
-            (1..envelope.total_pages).map(|page| page * self.page_size).collect();
+        let offsets: Vec<u64> = (1..envelope.total_pages)
+            .map(|page| page * self.page_size)
+            .collect();
         if offsets.is_empty() {
             return Ok(all);
         }
@@ -444,7 +469,11 @@ impl VaultClient {
             return Ok(all);
         }
 
-        let mut offset: u64 = if resume_at_second_page { self.page_size } else { 0 };
+        let mut offset: u64 = if resume_at_second_page {
+            self.page_size
+        } else {
+            0
+        };
         // Identity of the previous page's first row, for the no-progress guard below. Seeded from
         // the already-fetched page one when the walk resumes at page two.
         let first_key = |r: &VaultApiRecord| (r.target_address.clone(), r.last_seen_at);
@@ -487,6 +516,9 @@ impl VaultClient {
     /// Vault key can read. Used both to populate the Master-only "grant a key read access to a
     /// group" UI and by `groups::spawn_group_permission_cleanup_worker` to find grants whose
     /// group Vault no longer has.
+    ///
+    /// # Errors
+    /// Returns [`VaultError`] if the HTTP request fails, returns non-2xx, or yields malformed JSON.
     pub async fn list_groups(&self) -> Result<Vec<VaultGroup>, VaultError> {
         self.signed_get("/api/groups").await
     }
@@ -498,19 +530,22 @@ impl VaultClient {
     async fn signed_get<T: DeserializeOwned>(&self, path_and_query: &str) -> Result<T, VaultError> {
         let now = chrono::Utc::now().timestamp();
         let mut ts = now;
-        let _ = self.last_timestamp.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
-            let next = if now > last || last.saturating_sub(now) >= 5 {
-                now
-            } else {
-                last + 1
-            };
-            ts = next;
-            Some(next)
-        });
+        let _ = self
+            .last_timestamp
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+                let next = if now > last || last.saturating_sub(now) >= 5 {
+                    now
+                } else {
+                    last + 1
+                };
+                ts = next;
+                Some(next)
+            });
         let timestamp = ts.to_string();
         let payload = canonical_v1_payload("GET", path_and_query, &timestamp, b"");
-        let signature = compute_signature(&self.signing_secret, &payload)
-            .ok_or(VaultError::Status(reqwest::StatusCode::INTERNAL_SERVER_ERROR))?;
+        let signature = compute_signature(&self.signing_secret, &payload).ok_or(
+            VaultError::Status(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+        )?;
 
         let url = format!("{}{}", self.base_url, path_and_query);
         let response = self
@@ -539,7 +574,9 @@ fn urlencode(raw: &str) -> String {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b',' => {
                 out.push(byte as char);
             }
-            _ => out.push_str(&format!("%{byte:02X}")),
+            _ => {
+                let _ = write!(out, "%{byte:02X}");
+            }
         }
     }
     out
@@ -590,10 +627,14 @@ mod tests {
     /// what it returned.
     async fn spawn_paginating_mock_vault(
         total: usize,
-    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
         use axum::{Router, extract::RawQuery, routing::get};
 
-        let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
         let seen_for_handler = std::sync::Arc::clone(&seen);
 
         let app = Router::new().route(
@@ -613,8 +654,9 @@ mod tests {
                             .and_then(|v| v.parse().ok())
                     };
                     // The real default, and the whole point of this mock.
-                    let limit = param("limit").unwrap_or(50) as usize;
-                    let offset = param("offset").unwrap_or(0) as usize;
+                    let limit = usize::try_from(param("limit").unwrap_or(50)).unwrap_or(usize::MAX);
+                    let offset =
+                        usize::try_from(param("offset").unwrap_or(0)).unwrap_or(usize::MAX);
 
                     let page: Vec<serde_json::Value> = (offset..total.min(offset + limit))
                         .map(|i| {
@@ -630,9 +672,12 @@ mod tests {
             }),
         );
 
-        let listener =
-            tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback bind always succeeds");
-        let addr = listener.local_addr().expect("a bound listener has a local address");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind always succeeds");
+        let addr = listener
+            .local_addr()
+            .expect("a bound listener has a local address");
         let handle = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
@@ -647,9 +692,16 @@ mod tests {
         let (url, seen, _server) = spawn_paginating_mock_vault(250).await;
         let client = client_at(url).with_page_size(50);
 
-        let records = client.fetch_ips("g1", None).await.expect("pagination succeeds");
+        let records = client
+            .fetch_ips("g1", None)
+            .await
+            .expect("pagination succeeds");
 
-        assert_eq!(records.len(), 250, "every record must survive the walk, not just the first page");
+        assert_eq!(
+            records.len(),
+            250,
+            "every record must survive the walk, not just the first page"
+        );
         let distinct: std::collections::HashSet<_> =
             records.iter().map(|r| r.target_address.clone()).collect();
         assert_eq!(distinct.len(), 250, "pages must not overlap or repeat");
@@ -681,7 +733,11 @@ mod tests {
         let records = client.fetch_ips("g1", None).await.expect("fetch succeeds");
 
         assert_eq!(records.len(), 100);
-        assert_eq!(seen.lock().expect("not poisoned").len(), 3, "50, 50, then the empty page");
+        assert_eq!(
+            seen.lock().expect("not poisoned").len(),
+            3,
+            "50, 50, then the empty page"
+        );
     }
 
     /// A differential sync is paginated too — and Vault applies `since`/`include_deleted` per
@@ -695,15 +751,27 @@ mod tests {
             .expect("a valid timestamp")
             .naive_utc();
 
-        let records = client.fetch_ips("g1", Some(since)).await.expect("fetch succeeds");
+        let records = client
+            .fetch_ips("g1", Some(since))
+            .await
+            .expect("fetch succeeds");
         assert_eq!(records.len(), 120);
 
         let queries = seen.lock().expect("not poisoned").clone();
         assert_eq!(queries.len(), 3);
         for query in &queries {
-            assert!(query.contains("since=1700000000"), "every page must keep the cutoff: {query}");
-            assert!(query.contains("include_deleted=true"), "every page must keep the flag: {query}");
-            assert!(query.contains("groups=g1"), "every page must keep the group scope: {query}");
+            assert!(
+                query.contains("since=1700000000"),
+                "every page must keep the cutoff: {query}"
+            );
+            assert!(
+                query.contains("include_deleted=true"),
+                "every page must keep the flag: {query}"
+            );
+            assert!(
+                query.contains("groups=g1"),
+                "every page must keep the group scope: {query}"
+            );
         }
         // And each page must actually advance, rather than re-requesting offset 0 forever.
         assert!(queries[0].contains("offset=0"));
@@ -740,12 +808,16 @@ mod tests {
     async fn spawn_flavoured_mock_vault(
         total: usize,
         flavour: VaultFlavour,
-    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
         use axum::{
             Router, extract::RawQuery, http::StatusCode, response::IntoResponse, routing::get,
         };
 
-        let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
         let seen_for_handler = std::sync::Arc::clone(&seen);
 
         let app = Router::new().route(
@@ -783,14 +855,14 @@ mod tests {
                             .into_response();
                     }
 
-                    let limit = param("limit").unwrap_or(50) as usize;
+                    let limit = usize::try_from(param("limit").unwrap_or(50)).unwrap_or(usize::MAX);
                     let cursor_token = str_param("cursor");
                     let start = match (&cursor_token, flavour) {
                         (Some(tok), VaultFlavour::Cursor) if !tok.is_empty() => {
                             tok.strip_prefix("cur-").and_then(|v| v.parse().ok()).unwrap_or(0)
                         }
                         (Some(_), VaultFlavour::Cursor) => 0,
-                        _ => param("offset").unwrap_or(0) as usize,
+                        _ => usize::try_from(param("offset").unwrap_or(0)).unwrap_or(usize::MAX),
                     };
                     let end = total.min(start + limit);
                     let page: Vec<serde_json::Value> = (start..end)
@@ -836,9 +908,12 @@ mod tests {
             }),
         );
 
-        let listener =
-            tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback bind always succeeds");
-        let addr = listener.local_addr().expect("a bound listener has a local address");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind always succeeds");
+        let addr = listener
+            .local_addr()
+            .expect("a bound listener has a local address");
         let handle = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
@@ -882,8 +957,8 @@ mod tests {
                         .find_map(|kv| kv.strip_prefix(&format!("{name}=")))
                         .and_then(|v| v.parse().ok())
                 };
-                let limit = param("limit").unwrap_or(50) as usize;
-                let offset = param("offset").unwrap_or(0) as usize;
+                let limit = usize::try_from(param("limit").unwrap_or(50)).unwrap_or(usize::MAX);
+                let offset = usize::try_from(param("offset").unwrap_or(0)).unwrap_or(usize::MAX);
                 let page: Vec<serde_json::Value> = (offset..total.min(offset + limit))
                     .map(|i| {
                         serde_json::json!({
@@ -905,9 +980,12 @@ mod tests {
             }),
         );
 
-        let listener =
-            tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback bind always succeeds");
-        let addr = listener.local_addr().expect("a bound listener has a local address");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind always succeeds");
+        let addr = listener
+            .local_addr()
+            .expect("a bound listener has a local address");
         let handle = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
@@ -923,13 +1001,24 @@ mod tests {
         let (url, _server) = spawn_mixed_protocol_mock_vault(3_500).await;
         let client = client_at(url).with_page_size(1_000); // → 4 pages
 
-        let records = client.fetch_ips("g1", None).await.expect("a mixed-family fetch succeeds");
+        let records = client
+            .fetch_ips("g1", None)
+            .await
+            .expect("a mixed-family fetch succeeds");
 
-        assert_eq!(records.len(), 3_500, "no record of either family may be dropped");
+        assert_eq!(
+            records.len(),
+            3_500,
+            "no record of either family may be dropped"
+        );
 
         let addresses: std::collections::HashSet<String> =
             records.iter().map(|r| r.target_address.clone()).collect();
-        assert_eq!(addresses.len(), 3_500, "no duplicates across concurrently-merged pages");
+        assert_eq!(
+            addresses.len(),
+            3_500,
+            "no duplicates across concurrently-merged pages"
+        );
 
         let (v6, v4): (Vec<&String>, Vec<&String>) =
             addresses.iter().partition(|a| a.contains(':'));
@@ -941,21 +1030,32 @@ mod tests {
         for address in &v6 {
             let parsed = crate::cache::parse_target_address(address)
                 .unwrap_or_else(|| panic!("IPv6 fixture {address:?} must parse as a network"));
-            assert!(parsed.addr().is_ipv6(), "{address:?} must round-trip as IPv6, got {parsed}");
+            assert!(
+                parsed.addr().is_ipv6(),
+                "{address:?} must round-trip as IPv6, got {parsed}"
+            );
         }
 
         // Spot-check the boundaries of the IPv6 sequence: the first (record 0) and the last
         // (record 3493, the 500th multiple of 7 below 3500) both land on different pages, so their
         // presence proves IPv6 crossed page seams rather than clustering in page one.
-        assert!(addresses.contains("2a01:4f8:1::1"), "the first IPv6 record, from page 1");
-        assert!(addresses.contains("2a01:4f8:1f4::1"), "the 500th IPv6 record, from the final page");
+        assert!(
+            addresses.contains("2a01:4f8:1::1"),
+            "the first IPv6 record, from page 1"
+        );
+        assert!(
+            addresses.contains("2a01:4f8:1f4::1"),
+            "the 500th IPv6 record, from the final page"
+        );
     }
 
     fn offsets_requested(queries: &[String]) -> Vec<u64> {
         let mut offsets: Vec<u64> = queries
             .iter()
             .filter_map(|q| {
-                q.split('&').find_map(|kv| kv.strip_prefix("offset=")).and_then(|v| v.parse().ok())
+                q.split('&')
+                    .find_map(|kv| kv.strip_prefix("offset="))
+                    .and_then(|v| v.parse().ok())
             })
             .collect();
         offsets.sort_unstable();
@@ -967,19 +1067,33 @@ mod tests {
     /// all 3,214 distinct records arrive with no duplicates and nothing lost at a page boundary.
     #[tokio::test]
     async fn an_envelope_fetch_pulls_3214_records_across_four_pages_in_parallel() {
-        let (url, seen, _server) =
-            spawn_flavoured_mock_vault(3_214, VaultFlavour::Envelope).await;
+        let (url, seen, _server) = spawn_flavoured_mock_vault(3_214, VaultFlavour::Envelope).await;
         let client = client_at(url).with_page_size(1_000);
 
-        let records = client.fetch_ips("g1", None).await.expect("the parallel fetch succeeds");
+        let records = client
+            .fetch_ips("g1", None)
+            .await
+            .expect("the parallel fetch succeeds");
 
-        assert_eq!(records.len(), 3_214, "every record across all four pages must arrive");
+        assert_eq!(
+            records.len(),
+            3_214,
+            "every record across all four pages must arrive"
+        );
         let distinct: std::collections::HashSet<_> =
             records.iter().map(|r| r.target_address.clone()).collect();
-        assert_eq!(distinct.len(), 3_214, "pages must not overlap, duplicate, or drop a boundary row");
+        assert_eq!(
+            distinct.len(),
+            3_214,
+            "pages must not overlap, duplicate, or drop a boundary row"
+        );
 
         let queries = seen.lock().expect("not poisoned").clone();
-        assert_eq!(queries.len(), 4, "exactly four requests: one probe plus three follow-up pages");
+        assert_eq!(
+            queries.len(),
+            4,
+            "exactly four requests: one probe plus three follow-up pages"
+        );
         assert_eq!(
             offsets_requested(&queries),
             vec![0, 1_000, 2_000, 3_000],
@@ -988,7 +1102,10 @@ mod tests {
 
         // Only the probe pays for Vault's COUNT(*); re-requesting it per page would compute the
         // same total four times for no benefit.
-        let with_total = queries.iter().filter(|q| q.contains("include_total=true")).count();
+        let with_total = queries
+            .iter()
+            .filter(|q| q.contains("include_total=true"))
+            .count();
         assert_eq!(with_total, 1, "include_total belongs on the probe alone");
     }
 
@@ -1016,7 +1133,11 @@ mod tests {
         let records = client.fetch_ips("g1", None).await.expect("fetch succeeds");
 
         assert!(records.is_empty());
-        assert_eq!(seen.lock().expect("not poisoned").len(), 1, "nothing to follow up on");
+        assert_eq!(
+            seen.lock().expect("not poisoned").len(),
+            1,
+            "nothing to follow up on"
+        );
     }
 
     /// Concurrency must stay bounded: with 12 pages outstanding, no more than
@@ -1028,15 +1149,19 @@ mod tests {
 
         let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (in_flight_h, peak_h) =
-            (std::sync::Arc::clone(&in_flight), std::sync::Arc::clone(&peak));
+        let (in_flight_h, peak_h) = (
+            std::sync::Arc::clone(&in_flight),
+            std::sync::Arc::clone(&peak),
+        );
 
         let total = 12_000usize; // 12 pages at a page size of 1000
         let app = Router::new().route(
             "/api/ips",
             get(move |RawQuery(query): RawQuery| {
-                let (in_flight, peak) =
-                    (std::sync::Arc::clone(&in_flight_h), std::sync::Arc::clone(&peak_h));
+                let (in_flight, peak) = (
+                    std::sync::Arc::clone(&in_flight_h),
+                    std::sync::Arc::clone(&peak_h),
+                );
                 async move {
                     let now = in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                     peak.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
@@ -1052,8 +1177,9 @@ mod tests {
                             .find_map(|kv| kv.strip_prefix(&format!("{name}=")))
                             .and_then(|v| v.parse().ok())
                     };
-                    let limit = param("limit").unwrap_or(50) as usize;
-                    let offset = param("offset").unwrap_or(0) as usize;
+                    let limit = usize::try_from(param("limit").unwrap_or(50)).unwrap_or(usize::MAX);
+                    let offset =
+                        usize::try_from(param("offset").unwrap_or(0)).unwrap_or(usize::MAX);
                     let page: Vec<serde_json::Value> = (offset..total.min(offset + limit))
                         .map(|i| {
                             serde_json::json!({
@@ -1075,9 +1201,12 @@ mod tests {
                 }
             }),
         );
-        let listener =
-            tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback bind always succeeds");
-        let addr = listener.local_addr().expect("a bound listener has a local address");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind always succeeds");
+        let addr = listener
+            .local_addr()
+            .expect("a bound listener has a local address");
         let _server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
@@ -1103,22 +1232,34 @@ mod tests {
     /// separate risk worth pinning.
     #[tokio::test]
     async fn parallel_pages_each_carry_since_include_deleted_and_groups() {
-        let (url, seen, _server) =
-            spawn_flavoured_mock_vault(2_500, VaultFlavour::Envelope).await;
+        let (url, seen, _server) = spawn_flavoured_mock_vault(2_500, VaultFlavour::Envelope).await;
         let client = client_at(url).with_page_size(1_000);
         let since = chrono::DateTime::from_timestamp(1_700_000_000, 0)
             .expect("a valid timestamp")
             .naive_utc();
 
-        let records = client.fetch_ips("g1,g2", Some(since)).await.expect("fetch succeeds");
+        let records = client
+            .fetch_ips("g1,g2", Some(since))
+            .await
+            .expect("fetch succeeds");
         // The mock ignores `groups`, so each of the two per-group walks returns all 2,500.
         assert_eq!(records.len(), 5_000);
 
         let queries = seen.lock().expect("not poisoned").clone();
-        assert_eq!(queries.len(), 6, "per group: one probe plus two follow-up pages");
+        assert_eq!(
+            queries.len(),
+            6,
+            "per group: one probe plus two follow-up pages"
+        );
         for query in &queries {
-            assert!(query.contains("since=1700000000"), "every page keeps the cutoff: {query}");
-            assert!(query.contains("include_deleted=true"), "every page keeps the flag: {query}");
+            assert!(
+                query.contains("since=1700000000"),
+                "every page keeps the cutoff: {query}"
+            );
+            assert!(
+                query.contains("include_deleted=true"),
+                "every page keeps the flag: {query}"
+            );
             assert!(
                 query.contains("groups=g1&") || query.contains("groups=g2&"),
                 "every page is scoped to exactly one group: {query}"
@@ -1131,34 +1272,45 @@ mod tests {
     /// gets its own complete walk, duplicates in the list are collapsed, and blanks are ignored.
     #[tokio::test]
     async fn a_multi_group_scope_is_fetched_as_one_walk_per_group() {
-        let (url, seen, _server) =
-            spawn_flavoured_mock_vault(2_500, VaultFlavour::Envelope).await;
+        let (url, seen, _server) = spawn_flavoured_mock_vault(2_500, VaultFlavour::Envelope).await;
         let client = client_at(url).with_page_size(1_000);
 
-        let records = client.fetch_ips("g1, g2,,g1,g3", None).await.expect("fetch succeeds");
+        let records = client
+            .fetch_ips("g1, g2,,g1,g3", None)
+            .await
+            .expect("fetch succeeds");
         assert_eq!(records.len(), 7_500, "three distinct groups × 2,500");
 
         let queries = seen.lock().expect("not poisoned").clone();
         assert_eq!(queries.len(), 9, "three groups × three pages");
         for group in ["g1", "g2", "g3"] {
-            let scoped: Vec<&String> =
-                queries.iter().filter(|q| q.contains(&format!("groups={group}&"))).collect();
+            let scoped: Vec<&String> = queries
+                .iter()
+                .filter(|q| q.contains(&format!("groups={group}&")))
+                .collect();
             assert_eq!(scoped.len(), 3, "{group} gets its own complete walk");
         }
-        assert!(queries.iter().all(|q| !q.contains("%2C") && !q.contains("g1,")));
+        assert!(
+            queries
+                .iter()
+                .all(|q| !q.contains("%2C") && !q.contains("g1,"))
+        );
     }
 
     /// No page ceiling: a dataset Vault reports as more than 1,000 pages is fetched in full. The
     /// former `MAX_PAGES = 1_000` cap silently truncated exactly this case in production.
     #[tokio::test]
     async fn an_envelope_beyond_a_thousand_pages_is_fetched_without_truncation() {
-        let (url, seen, _server) =
-            spawn_flavoured_mock_vault(1_203, VaultFlavour::Envelope).await;
+        let (url, seen, _server) = spawn_flavoured_mock_vault(1_203, VaultFlavour::Envelope).await;
         let client = client_at(url).with_page_size(1);
 
         let records = client.fetch_ips("g1", None).await.expect("fetch succeeds");
 
-        assert_eq!(records.len(), 1_203, "every page beyond the old ceiling must arrive");
+        assert_eq!(
+            records.len(),
+            1_203,
+            "every page beyond the old ceiling must arrive"
+        );
         assert_eq!(seen.lock().expect("not poisoned").len(), 1_203);
     }
 
@@ -1184,18 +1336,31 @@ mod tests {
                 }
             }),
         );
-        let listener =
-            tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback bind always succeeds");
-        let addr = listener.local_addr().expect("a bound listener has a local address");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind always succeeds");
+        let addr = listener
+            .local_addr()
+            .expect("a bound listener has a local address");
         let _server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
 
         let client = client_at(format!("http://{addr}")).with_page_size(2);
-        let err = client.fetch_ips("g1", None).await.expect_err("a stalled walk must not be Ok");
+        let err = client
+            .fetch_ips("g1", None)
+            .await
+            .expect_err("a stalled walk must not be Ok");
 
-        assert!(matches!(err, VaultError::PaginationStalled(_)), "got {err:?}");
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2, "detected on the first repeat");
+        assert!(
+            matches!(err, VaultError::PaginationStalled(_)),
+            "got {err:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "detected on the first repeat"
+        );
     }
 
     // ── Keyset cursor & format=minimal (`simply_ip_vault` `eda0f41`+) ─────────
@@ -1205,16 +1370,22 @@ mod tests {
     /// follow-up page so Vault never runs a second `COUNT(*)` or an `OFFSET` scan.
     #[tokio::test]
     async fn a_cursor_vault_walks_pages_via_next_cursor_with_minimal_format() {
-        let (url, seen, _server) =
-            spawn_flavoured_mock_vault(3_214, VaultFlavour::Cursor).await;
+        let (url, seen, _server) = spawn_flavoured_mock_vault(3_214, VaultFlavour::Cursor).await;
         let client = client_at(url).with_page_size(1_000);
 
-        let records = client.fetch_ips("g1", None).await.expect("cursor fetch succeeds");
+        let records = client
+            .fetch_ips("g1", None)
+            .await
+            .expect("cursor fetch succeeds");
 
         assert_eq!(records.len(), 3_214);
         let distinct: std::collections::HashSet<_> =
             records.iter().map(|r| r.target_address.clone()).collect();
-        assert_eq!(distinct.len(), 3_214, "no duplicates or boundary losses across cursor pages");
+        assert_eq!(
+            distinct.len(),
+            3_214,
+            "no duplicates or boundary losses across cursor pages"
+        );
 
         let queries = seen.lock().expect("not poisoned").clone();
         assert_eq!(queries.len(), 4, "one probe plus three cursor pages");
@@ -1224,10 +1395,23 @@ mod tests {
 
         for (idx, expected_cursor) in [(1, "cur-1000"), (2, "cur-2000"), (3, "cur-3000")] {
             let q = &queries[idx];
-            assert!(q.contains(&format!("cursor={expected_cursor}")), "page {}: {q}", idx + 1);
-            assert!(q.contains("format=minimal"), "every cursor page asks for minimal rows: {q}");
-            assert!(!q.contains("include_total"), "follow-up cursor pages skip COUNT(*): {q}");
-            assert!(!q.contains("offset="), "cursor and offset are mutually exclusive: {q}");
+            assert!(
+                q.contains(&format!("cursor={expected_cursor}")),
+                "page {}: {q}",
+                idx + 1
+            );
+            assert!(
+                q.contains("format=minimal"),
+                "every cursor page asks for minimal rows: {q}"
+            );
+            assert!(
+                !q.contains("include_total"),
+                "follow-up cursor pages skip COUNT(*): {q}"
+            );
+            assert!(
+                !q.contains("offset="),
+                "cursor and offset are mutually exclusive: {q}"
+            );
         }
     }
 
@@ -1235,36 +1419,57 @@ mod tests {
     /// final page, so 2,000 records at `limit=1000` cost 2 requests, not 3.
     #[tokio::test]
     async fn a_cursor_walk_whose_total_is_an_exact_multiple_stops_without_an_extra_request() {
-        let (url, seen, _server) =
-            spawn_flavoured_mock_vault(2_000, VaultFlavour::Cursor).await;
+        let (url, seen, _server) = spawn_flavoured_mock_vault(2_000, VaultFlavour::Cursor).await;
         let client = client_at(url).with_page_size(1_000);
 
-        let records = client.fetch_ips("g1", None).await.expect("cursor fetch succeeds");
+        let records = client
+            .fetch_ips("g1", None)
+            .await
+            .expect("cursor fetch succeeds");
 
         assert_eq!(records.len(), 2_000);
-        assert_eq!(seen.lock().expect("not poisoned").len(), 2, "no empty trailing page needed");
+        assert_eq!(
+            seen.lock().expect("not poisoned").len(),
+            2,
+            "no empty trailing page needed"
+        );
     }
 
     /// Differential sync filters (`since` + `include_deleted=true`) and `format=minimal` must
     /// ride along onto every cursor follow-up page across every group in a multi-group scope.
     #[tokio::test]
     async fn cursor_pages_each_carry_since_include_deleted_format_minimal_and_group() {
-        let (url, seen, _server) =
-            spawn_flavoured_mock_vault(2_500, VaultFlavour::Cursor).await;
+        let (url, seen, _server) = spawn_flavoured_mock_vault(2_500, VaultFlavour::Cursor).await;
         let client = client_at(url).with_page_size(1_000);
         let since = chrono::DateTime::from_timestamp(1_700_000_000, 0)
             .expect("a valid timestamp")
             .naive_utc();
 
-        let records = client.fetch_ips("g1,g2", Some(since)).await.expect("cursor fetch succeeds");
+        let records = client
+            .fetch_ips("g1,g2", Some(since))
+            .await
+            .expect("cursor fetch succeeds");
         assert_eq!(records.len(), 5_000);
 
         let queries = seen.lock().expect("not poisoned").clone();
-        assert_eq!(queries.len(), 6, "two groups × (one probe + two cursor follow-ups)");
+        assert_eq!(
+            queries.len(),
+            6,
+            "two groups × (one probe + two cursor follow-ups)"
+        );
         for query in &queries {
-            assert!(query.contains("since=1700000000"), "every page keeps the cutoff: {query}");
-            assert!(query.contains("include_deleted=true"), "every page keeps the flag: {query}");
-            assert!(query.contains("format=minimal"), "every page asks for minimal rows: {query}");
+            assert!(
+                query.contains("since=1700000000"),
+                "every page keeps the cutoff: {query}"
+            );
+            assert!(
+                query.contains("include_deleted=true"),
+                "every page keeps the flag: {query}"
+            );
+            assert!(
+                query.contains("format=minimal"),
+                "every page asks for minimal rows: {query}"
+            );
             assert!(
                 query.contains("groups=g1&") || query.contains("groups=g2&"),
                 "every page is scoped to a single group: {query}"
@@ -1294,18 +1499,31 @@ mod tests {
                 }
             }),
         );
-        let listener =
-            tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback bind always succeeds");
-        let addr = listener.local_addr().expect("a bound listener has a local address");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind always succeeds");
+        let addr = listener
+            .local_addr()
+            .expect("a bound listener has a local address");
         let _server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
 
         let client = client_at(format!("http://{addr}")).with_page_size(1);
-        let err = client.fetch_ips("g1", None).await.expect_err("a repeated cursor must fail");
+        let err = client
+            .fetch_ips("g1", None)
+            .await
+            .expect_err("a repeated cursor must fail");
 
-        assert!(matches!(err, VaultError::PaginationStalled(_)), "got {err:?}");
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2, "detected on first repeat");
+        assert!(
+            matches!(err, VaultError::PaginationStalled(_)),
+            "got {err:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "detected on first repeat"
+        );
     }
 
     // ── Legacy tolerance: two distinct shapes of "older Vault" ────────────────
@@ -1320,13 +1538,23 @@ mod tests {
             spawn_flavoured_mock_vault(120, VaultFlavour::RejectsIncludeTotal).await;
         let client = client_at(url).with_page_size(50);
 
-        let records = client.fetch_ips("g1", None).await.expect("the fallback must succeed");
+        let records = client
+            .fetch_ips("g1", None)
+            .await
+            .expect("the fallback must succeed");
 
-        assert_eq!(records.len(), 120, "a 400 on the probe must not lose any data");
+        assert_eq!(
+            records.len(),
+            120,
+            "a 400 on the probe must not lose any data"
+        );
         let queries = seen.lock().expect("not poisoned").clone();
         // The refused probe, then a clean sequential walk: 50, 50, 20.
         assert_eq!(queries.len(), 4);
-        assert!(queries[0].contains("include_total=true"), "the probe is attempted once");
+        assert!(
+            queries[0].contains("include_total=true"),
+            "the probe is attempted once"
+        );
         assert!(
             queries[1..].iter().all(|q| !q.contains("include_total")),
             "and never repeated after it was refused"
@@ -1343,7 +1571,10 @@ mod tests {
             spawn_flavoured_mock_vault(120, VaultFlavour::IgnoresIncludeTotal).await;
         let client = client_at(url).with_page_size(50);
 
-        let records = client.fetch_ips("g1", None).await.expect("the fallback must succeed");
+        let records = client
+            .fetch_ips("g1", None)
+            .await
+            .expect("the fallback must succeed");
 
         assert_eq!(records.len(), 120);
         let distinct: std::collections::HashSet<_> =
@@ -1407,9 +1638,12 @@ mod tests {
                     async move { (status, axum::Json(body)) }
                 }),
             );
-        let listener =
-            tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback bind always succeeds");
-        let addr = listener.local_addr().expect("a bound listener has a local address");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind always succeeds");
+        let addr = listener
+            .local_addr()
+            .expect("a bound listener has a local address");
         let handle = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
@@ -1418,11 +1652,16 @@ mod tests {
 
     #[tokio::test]
     async fn a_401_from_vault_is_reported_as_a_status_error_naming_401() {
-        let (url, _server) =
-            spawn_mock_vault(axum::http::StatusCode::UNAUTHORIZED, serde_json::json!({"error": "bad key"}))
-                .await;
+        let (url, _server) = spawn_mock_vault(
+            axum::http::StatusCode::UNAUTHORIZED,
+            serde_json::json!({"error": "bad key"}),
+        )
+        .await;
         let client = client_at(url);
-        let err = client.fetch_ips("g1", None).await.expect_err("401 must not be Ok");
+        let err = client
+            .fetch_ips("g1", None)
+            .await
+            .expect_err("401 must not be Ok");
         assert!(matches!(err, VaultError::Status(s) if s == reqwest::StatusCode::UNAUTHORIZED));
     }
 
@@ -1434,7 +1673,10 @@ mod tests {
         )
         .await;
         let client = client_at(url);
-        let err = client.fetch_ips("g1", None).await.expect_err("403 must not be Ok");
+        let err = client
+            .fetch_ips("g1", None)
+            .await
+            .expect_err("403 must not be Ok");
         assert!(matches!(err, VaultError::Status(s) if s == reqwest::StatusCode::FORBIDDEN));
     }
 
@@ -1446,18 +1688,29 @@ mod tests {
         )
         .await;
         let client = client_at(url);
-        let err = client.fetch_ips("g1", None).await.expect_err("500 must not be Ok");
-        assert!(matches!(err, VaultError::Status(s) if s == reqwest::StatusCode::INTERNAL_SERVER_ERROR));
+        let err = client
+            .fetch_ips("g1", None)
+            .await
+            .expect_err("500 must not be Ok");
+        assert!(
+            matches!(err, VaultError::Status(s) if s == reqwest::StatusCode::INTERNAL_SERVER_ERROR)
+        );
     }
 
     #[tokio::test]
     async fn a_malformed_json_body_on_an_otherwise_successful_response_is_a_request_error() {
         // Valid 200, but a body shaped nothing like `Vec<VaultApiRecord>` — the deserialization
         // failure surfaces as VaultError::Request via the `#[from] reqwest::Error` conversion.
-        let (url, _server) =
-            spawn_mock_vault(axum::http::StatusCode::OK, serde_json::json!({"not": "a list"})).await;
+        let (url, _server) = spawn_mock_vault(
+            axum::http::StatusCode::OK,
+            serde_json::json!({"not": "a list"}),
+        )
+        .await;
         let client = client_at(url);
-        let err = client.fetch_ips("g1", None).await.expect_err("malformed body must not be Ok");
+        let err = client
+            .fetch_ips("g1", None)
+            .await
+            .expect_err("malformed body must not be Ok");
         assert!(matches!(err, VaultError::Request(_)));
     }
 
@@ -1471,7 +1724,10 @@ mod tests {
         )
         .await;
         let client = client_at(url);
-        let records = client.fetch_ips("g1", None).await.expect("a valid 200 body must parse");
+        let records = client
+            .fetch_ips("g1", None)
+            .await
+            .expect("a valid 200 body must parse");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].target_address, "8.8.8.8/32");
     }
@@ -1487,7 +1743,10 @@ mod tests {
         )
         .await;
         let client = client_at(url);
-        let groups = client.list_groups().await.expect("a valid 200 body must parse");
+        let groups = client
+            .list_groups()
+            .await
+            .expect("a valid 200 body must parse");
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].id, group_id);
         assert_eq!(groups[0].name, "pfBlocker_Blacklist");
@@ -1503,13 +1762,22 @@ mod tests {
         // Bind to grab a genuinely free loopback port, then drop the listener immediately so nothing
         // is listening on it by the time the client connects — a fast, deterministic way to
         // reproduce ECONNREFUSED without depending on any specific unused port staying unused.
-        let listener =
-            tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("loopback bind always succeeds");
-        let addr = listener.local_addr().expect("a bound listener has a local address");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind always succeeds");
+        let addr = listener
+            .local_addr()
+            .expect("a bound listener has a local address");
         drop(listener);
 
         let client = client_at(format!("http://{addr}"));
-        let err = client.fetch_ips("g1", None).await.expect_err("a refused connection must not be Ok");
-        assert!(matches!(err, VaultError::Request(_)), "expected a request-level error, got {err:?}");
+        let err = client
+            .fetch_ips("g1", None)
+            .await
+            .expect_err("a refused connection must not be Ok");
+        assert!(
+            matches!(err, VaultError::Request(_)),
+            "expected a request-level error, got {err:?}"
+        );
     }
 }

@@ -30,6 +30,9 @@ pub enum BoundIpEntry {
 /// Returns the first bad entry rather than collecting every one — unlike `TRUSTED_PROXIES` (a
 /// once-at-boot setting worth reporting exhaustively), this runs on every key/endpoint write and a
 /// single clear message is enough to fix a form field.
+///
+/// # Errors
+/// Returns an error string naming the first invalid IP, CIDR, or hostname entry.
 pub fn parse_bound_ips(raw: &str) -> Result<Vec<BoundIpEntry>, String> {
     let mut entries = Vec::new();
     for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -54,6 +57,9 @@ pub fn parse_bound_ips(raw: &str) -> Result<Vec<BoundIpEntry>, String> {
 
 /// Validates a `bound_ips` value without keeping the parsed result — the write-time check used by
 /// `api::keys` and `api::endpoints`.
+///
+/// # Errors
+/// Returns an error string if any entry fails validation.
 pub fn validate_bound_ips(raw: &str) -> Result<(), String> {
     parse_bound_ips(raw).map(|_| ())
 }
@@ -72,7 +78,12 @@ pub async fn is_allowed(entries: &[BoundIpEntry], client_ip: IpAddr, dns: &DnsRe
                 }
             }
             BoundIpEntry::Hostname(name) => {
-                if dns.resolve(name).await.iter().any(|net| net.contains(&client_ip)) {
+                if dns
+                    .resolve(name)
+                    .await
+                    .iter()
+                    .any(|net| net.contains(&client_ip))
+                {
                     return true;
                 }
             }
@@ -129,7 +140,10 @@ mod tests {
         let entries = parse_bound_ips("localhost").unwrap();
         let dns = DnsResolver::new();
         let loopback_v4: IpAddr = "127.0.0.1".parse().unwrap();
-        assert!(is_allowed(&entries, loopback_v4, &dns).await, "localhost should resolve to a loopback address");
+        assert!(
+            is_allowed(&entries, loopback_v4, &dns).await,
+            "localhost should resolve to a loopback address"
+        );
         assert!(!is_allowed(&entries, "203.0.113.5".parse().unwrap(), &dns).await);
     }
 

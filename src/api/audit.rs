@@ -34,6 +34,9 @@ pub struct AuditLogQuery {
 }
 
 /// `GET /api/audit-logs` — lists audit trail entries, most recent first.
+///
+/// # Errors
+/// Returns [`AppError`] if the caller is not the Master key, query timestamps are invalid, or the database query fails.
 pub async fn list_audit_logs(
     State(state): State<AppState>,
     Extension(caller): Extension<api_key::Model>,

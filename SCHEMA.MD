@@ -59,7 +59,7 @@ Stores administrative authentication keys, global scopes, and CIDR network restr
 | `prefix` | String | NOT NULL, INDEXED | Public identifier prefix (e.g., `sie_exp1`) for display/logs. |
 | `key_hash` | String | NOT NULL, UNIQUE, INDEXED | SHA-256 hash of the plaintext secret key. |
 | `signing_secret` | Text | NULLABLE | HMAC-SHA256 signing secret encrypted with XChaCha20-Poly1305 when `EXPORTER_ENCRYPTION_KEY` is set (`v1.xchacha20poly1305.<nonce>.<ct>`), or plain fallback (`v1.plain.<hex>`). Never returned by any read endpoint. |
-| `bound_ips` | String / Text | NULLABLE | Comma-separated CIDR ranges permitted to use this key. |
+| `bound_ips` | Text | NULLABLE | Comma-separated CIDR ranges permitted to use this key. |
 | `is_master` | Boolean | NOT NULL, DEFAULT `false` | Bypasses all local RBAC checks. Bootstrap-only, not settable through request payloads. |
 | `master_marker` | Integer | **GENERATED**, NULLABLE, UNIQUE (`idx_api_keys_master_marker`) | `1` when `is_master`, `NULL` otherwise — database-level guarantee that at most one Master key exists (`RBAC_MODEL.md` §5). |
 | `can_manage_keys` | Boolean | NOT NULL, DEFAULT `false` | Global right to manage **other** local API keys. Master-granted only. |
@@ -213,11 +213,16 @@ exist" and deleting every grant.
 SQLite permits a single concurrent writer. To ensure DDL migrations and configuration writes succeed reliably without locking contention, `SQLITE_MAX_CONNECTIONS = 1` MUST be explicitly enforced on the connection pool.
 
 ### Session Pragmas
-The following pragmas are initialized on every SQLite connection via `SqliteConnectOptions`:
+The following pragmas are initialized on every SQLite connection via `SqliteConnectOptions` (zero raw `PRAGMA` SQL):
 
 | Pragma | Value | Scope | Description |
 | :--- | :--- | :--- | :--- |
 | `foreign_keys` | `ON` | per-connection | Hardens relational integrity enforcement. |
 | `journal_mode` | `WAL` | persistent (file header) | Enables concurrent readers alongside a writer. |
 | `synchronous` | `NORMAL` | per-connection | Balances durability with high-throughput performance. |
-| `busy_timeout` | `5000` ms | per-connection | Prevents instant `SQLITE_BUSY` errors on write lock waits. |
+| `busy_timeout` | `10000` ms | per-connection | Prevents instant `SQLITE_BUSY` errors on write lock waits. |
+| `temp_store` | `MEMORY` | per-connection | Keeps temporary tables and indices in memory. |
+| `mmap_size` | `268435456` | per-connection | 256 MiB memory-mapped I/O window. |
+| `cache_size` | `-64000` | per-connection | 64 MiB page cache per connection. |
+| `analysis_limit` | `1000` | per-connection | Caps rows sampled per index by `ANALYZE`/`optimize`. |
+| `optimize_on_close` | `enabled (1000)` | connection close | Runs SQLite `PRAGMA optimize` automatically on pool close. |

@@ -32,6 +32,9 @@ pub struct SettingsResponse {
 }
 
 /// Handles `GET /api/settings`. Master-only.
+///
+/// # Errors
+/// Returns [`AppError`] if the caller is not the Master key or database counts fail.
 pub async fn get_settings(
     State(state): State<AppState>,
     Extension(caller): Extension<api_key::Model>,

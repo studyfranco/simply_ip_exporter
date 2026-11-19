@@ -28,6 +28,7 @@ pub struct Model {
     /// The resource the action targeted, e.g. `api_key:<id> (<name>)` or `endpoint:<id> (<name>)`.
     pub target_resource: Option<String>,
     /// Additional context: which fields changed, or other short human-readable detail.
+    #[sea_orm(column_type = "Text", nullable)]
     pub details: Option<String>,
     /// Log entry creation timestamp (UTC).
     pub timestamp: DateTime,
