@@ -8,7 +8,6 @@
 //! existence in `vault_group_permissions` **is** the right — no separate boolean column.
 
 use axum::{Extension, Json, extract::State, response::IntoResponse};
-use chrono::Utc;
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -82,7 +81,8 @@ pub struct GroupGrantResponse {
     api_key_id: Uuid,
     vault_group_id: Uuid,
     vault_group_name: String,
-    created_at: chrono::NaiveDateTime,
+    #[serde(with = "crate::timestamps")]
+    created_at: time::PrimitiveDateTime,
 }
 
 impl From<vault_group_permission::Model> for GroupGrantResponse {
@@ -185,7 +185,7 @@ pub async fn grant_key_group(
         return Ok(Json(GroupGrantResponse::from(existing)));
     }
 
-    let now = Utc::now().naive_utc();
+    let now = crate::timestamps::now_utc();
     let model = vault_group_permission::ActiveModel {
         id: Set(Uuid::new_v4()),
         api_key_id: Set(id),

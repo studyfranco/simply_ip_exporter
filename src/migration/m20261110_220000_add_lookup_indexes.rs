@@ -5,9 +5,13 @@
 //! - API keys: fast lookup of Master key by `is_master` during startup / authentication.
 //! - Endpoints & API keys: fast newest-first ordering by `created_at DESC`.
 
-use sea_orm_migration::prelude::*;
+use sea_orm::{
+    ConnectionTrait, DbErr, DeriveIden,
+    sea_query::{Index, IndexOrder},
+};
 
-#[derive(DeriveMigrationName)]
+use super::runner::{Migration as MigrationStep, SchemaManager};
+
 pub struct Migration;
 
 #[derive(DeriveIden)]
@@ -30,11 +34,12 @@ enum Endpoints {
 }
 
 #[async_trait::async_trait]
-impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+impl<C: ConnectionTrait> MigrationStep<C> for Migration {
+    async fn up(&self, manager: &SchemaManager<'_, C>) -> Result<(), DbErr> {
         // Vault group permissions: lookups by group ID
         manager
             .create_index(
+                "vault_group_permissions",
                 Index::create()
                     .name("idx_vault_group_permissions_vault_group_id")
                     .table(VaultGroupPermissions::Table)
@@ -46,6 +51,7 @@ impl MigrationTrait for Migration {
         // API keys: filter by master status
         manager
             .create_index(
+                "api_keys",
                 Index::create()
                     .name("idx_api_keys_is_master")
                     .table(ApiKeys::Table)
@@ -57,6 +63,7 @@ impl MigrationTrait for Migration {
         // Endpoints: newest-first ordering across all endpoints
         manager
             .create_index(
+                "endpoints",
                 Index::create()
                     .name("idx_endpoints_created_at_desc")
                     .table(Endpoints::Table)
@@ -68,6 +75,7 @@ impl MigrationTrait for Migration {
         // API keys: newest-first ordering
         manager
             .create_index(
+                "api_keys",
                 Index::create()
                     .name("idx_api_keys_created_at_desc")
                     .table(ApiKeys::Table)
@@ -77,43 +85,5 @@ impl MigrationTrait for Migration {
             .await?;
 
         Ok(())
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .drop_index(
-                Index::drop()
-                    .name("idx_api_keys_created_at_desc")
-                    .table(ApiKeys::Table)
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .drop_index(
-                Index::drop()
-                    .name("idx_endpoints_created_at_desc")
-                    .table(Endpoints::Table)
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .drop_index(
-                Index::drop()
-                    .name("idx_api_keys_is_master")
-                    .table(ApiKeys::Table)
-                    .to_owned(),
-            )
-            .await?;
-
-        manager
-            .drop_index(
-                Index::drop()
-                    .name("idx_vault_group_permissions_vault_group_id")
-                    .table(VaultGroupPermissions::Table)
-                    .to_owned(),
-            )
-            .await
     }
 }

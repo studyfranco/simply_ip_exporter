@@ -40,6 +40,7 @@ pub mod ratelimit;
 pub mod replay;
 pub mod state;
 pub mod sync;
+pub mod timestamps;
 pub mod vault_client;
 
 use state::AppState;

@@ -7,7 +7,12 @@
 //! module doc comment and `groups::spawn_group_permission_cleanup_worker`, the only place a stale
 //! grant is ever removed, and only conservatively).
 
-use sea_orm_migration::prelude::*;
+use sea_orm::{
+    ConnectionTrait, DbErr, DeriveIden,
+    sea_query::{ColumnDef, ForeignKey, ForeignKeyAction, Index, Table},
+};
+
+use super::runner::{Migration as MigrationStep, SchemaManager};
 
 #[derive(DeriveIden)]
 enum ApiKeys {
@@ -25,14 +30,13 @@ enum VaultGroupPermissions {
     CreatedAt,
 }
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
 
 #[async_trait::async_trait]
-impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+impl<C: ConnectionTrait> MigrationStep<C> for Migration {
+    async fn up(&self, manager: &SchemaManager<'_, C>) -> Result<(), DbErr> {
         manager
-            .create_table(
+            .execute(
                 Table::create()
                     .table(VaultGroupPermissions::Table)
                     .if_not_exists()
@@ -80,6 +84,7 @@ impl MigrationTrait for Migration {
         // One grant per (key, group) — a repeat grant is a no-op, not a duplicate row.
         manager
             .create_index(
+                "vault_group_permissions",
                 Index::create()
                     .name("idx_vault_group_permissions_key_group")
                     .table(VaultGroupPermissions::Table)
@@ -88,12 +93,6 @@ impl MigrationTrait for Migration {
                     .unique()
                     .to_owned(),
             )
-            .await
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .drop_table(Table::drop().table(VaultGroupPermissions::Table).to_owned())
             .await
     }
 }

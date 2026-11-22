@@ -9,10 +9,15 @@
 //! Written with `SeaORM`'s vendor-agnostic builder (`ColumnDef::big_integer`), not raw SQL, so the
 //! same migration applies on SQLite, PostgreSQL and MariaDB alike — `AGENT.MD`'s multi-database
 //! rule. `big_integer` (i64) rather than `integer` so a window can exceed the ~68-year i32 second
-//! ceiling without overflow arithmetic, and so it lines up with `chrono::Duration::seconds`, which
+//! ceiling without overflow arithmetic, and so it lines up with `time::Duration::seconds`, which
 //! takes an `i64` — the value is handed straight to it at feed time.
 
-use sea_orm_migration::prelude::*;
+use sea_orm::{
+    ConnectionTrait, DbErr, DeriveIden,
+    sea_query::{ColumnDef, Table},
+};
+
+use super::runner::{Migration as MigrationStep, SchemaManager};
 
 #[derive(DeriveIden)]
 enum Endpoints {
@@ -20,14 +25,16 @@ enum Endpoints {
     MaxAgeSeconds,
 }
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
 
 #[async_trait::async_trait]
-impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+impl<C: ConnectionTrait> MigrationStep<C> for Migration {
+    async fn up(&self, manager: &SchemaManager<'_, C>) -> Result<(), DbErr> {
+        if manager.has_column("endpoints", "max_age_seconds").await? {
+            return Ok(());
+        }
         manager
-            .alter_table(
+            .execute(
                 Table::alter()
                     .table(Endpoints::Table)
                     .add_column(
@@ -36,17 +43,6 @@ impl MigrationTrait for Migration {
                             .not_null()
                             .default(0),
                     )
-                    .to_owned(),
-            )
-            .await
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .alter_table(
-                Table::alter()
-                    .table(Endpoints::Table)
-                    .drop_column(Endpoints::MaxAgeSeconds)
                     .to_owned(),
             )
             .await

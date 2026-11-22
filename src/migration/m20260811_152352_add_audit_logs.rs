@@ -5,7 +5,12 @@
 //! snapshots for the same reason: they are the only attribution that survives the key being
 //! deleted, so unlike `api_key_id` they are never nulled out by the cascade.
 
-use sea_orm_migration::prelude::*;
+use sea_orm::{
+    ConnectionTrait, DbErr, DeriveIden,
+    sea_query::{ColumnDef, ForeignKey, ForeignKeyAction, Index, Table},
+};
+
+use super::runner::{Migration as MigrationStep, SchemaManager};
 
 #[derive(DeriveIden)]
 enum ApiKeys {
@@ -27,14 +32,13 @@ enum AuditLogs {
     Timestamp,
 }
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
 
 #[async_trait::async_trait]
-impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+impl<C: ConnectionTrait> MigrationStep<C> for Migration {
+    async fn up(&self, manager: &SchemaManager<'_, C>) -> Result<(), DbErr> {
         manager
-            .create_table(
+            .execute(
                 Table::create()
                     .table(AuditLogs::Table)
                     .if_not_exists()
@@ -66,6 +70,7 @@ impl MigrationTrait for Migration {
 
         manager
             .create_index(
+                "audit_logs",
                 Index::create()
                     .name("idx_audit_logs_action")
                     .table(AuditLogs::Table)
@@ -75,6 +80,7 @@ impl MigrationTrait for Migration {
             .await?;
         manager
             .create_index(
+                "audit_logs",
                 Index::create()
                     .name("idx_audit_logs_timestamp")
                     .table(AuditLogs::Table)
@@ -84,18 +90,13 @@ impl MigrationTrait for Migration {
             .await?;
         manager
             .create_index(
+                "audit_logs",
                 Index::create()
                     .name("idx_audit_logs_api_key_id")
                     .table(AuditLogs::Table)
                     .col(AuditLogs::ApiKeyId)
                     .to_owned(),
             )
-            .await
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .drop_table(Table::drop().table(AuditLogs::Table).to_owned())
             .await
     }
 }

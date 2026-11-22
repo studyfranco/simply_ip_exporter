@@ -4,7 +4,6 @@
 //! explicitly on the connection pool, per `SCHEMA.MD`.
 
 use sea_orm::{ConnectOptions, Database, DatabaseConnection, DbErr, SqlxSqliteConnector};
-use sea_orm_migration::{MigratorTrait, SchemaManager};
 
 /// How long SQLite waits on a locked database before returning `SQLITE_BUSY`, in milliseconds.
 pub const SQLITE_BUSY_TIMEOUT_MS: u32 = 10_000;
@@ -61,16 +60,16 @@ pub async fn connect(db_url: &str) -> Result<DatabaseConnection, DbErr> {
 /// Returns [`DbErr`] if applying migrations fails.
 pub async fn run_migrations(db: &DatabaseConnection) -> Result<(), DbErr> {
     tracing::info!("Running database migrations...");
-    crate::migration::Migrator::up(db, None).await
+    crate::migration::run(db).await
 }
 
-/// Whether an index named `index` exists on `table`, inspected via `SeaORM`'s
-/// [`SchemaManager::has_index`] (zero raw SQL).
+/// Whether an index named `index` exists on `table`, inspected via `SeaSchema`
+/// probes (zero raw SQL).
 ///
 /// # Errors
 /// Returns [`DbErr`] if the backend is unsupported or the schema inspection fails.
 pub async fn has_index(db: &DatabaseConnection, table: &str, index: &str) -> Result<bool, DbErr> {
-    SchemaManager::new(db).has_index(table, index).await
+    crate::migration::has_index(db, table, index).await
 }
 
 #[cfg(test)]
@@ -155,8 +154,8 @@ mod tests {
             filter_bogons: Set(false),
             filter_loopback: Set(false),
             last_synced_at: Set(None),
-            created_at: Set(chrono::Utc::now().naive_utc()),
-            updated_at: Set(chrono::Utc::now().naive_utc()),
+            created_at: Set(crate::timestamps::now_utc()),
+            updated_at: Set(crate::timestamps::now_utc()),
         };
         assert!(
             crate::entities::prelude::Endpoint::insert(orphan)

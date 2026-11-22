@@ -32,7 +32,7 @@ fn validate_timestamp(raw: &str, max_age_seconds: i64) -> Result<(), AppError> {
         AppError::Unauthorized(format!("{TIMESTAMP_HEADER} must be a Unix timestamp"))
     })?;
 
-    let skew = (chrono::Utc::now().timestamp() - presented).abs();
+    let skew = (time::OffsetDateTime::now_utc().unix_timestamp() - presented).abs();
     if skew > max_age_seconds {
         return Err(AppError::Unauthorized(format!(
             "Request timestamp is outside the permitted {max_age_seconds}s window (off by {skew}s)"
@@ -233,7 +233,7 @@ mod tests {
 
     #[test]
     fn timestamps_inside_the_window_are_accepted() {
-        let now = chrono::Utc::now().timestamp();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
         assert!(validate_timestamp(&now.to_string(), 300).is_ok());
         assert!(validate_timestamp(&(now - 299).to_string(), 300).is_ok());
         assert!(validate_timestamp(&(now + 299).to_string(), 300).is_ok());
@@ -241,7 +241,7 @@ mod tests {
 
     #[test]
     fn timestamps_outside_the_window_are_rejected() {
-        let now = chrono::Utc::now().timestamp();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
         assert!(validate_timestamp(&(now - 301).to_string(), 300).is_err());
         assert!(validate_timestamp(&(now + 301).to_string(), 300).is_err());
         assert!(validate_timestamp("not-a-number", 300).is_err());

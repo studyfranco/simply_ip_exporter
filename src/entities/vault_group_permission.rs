@@ -31,7 +31,8 @@ pub struct Model {
     /// Vault call on every use.
     pub vault_group_name: String,
     /// Grant timestamp.
-    pub created_at: DateTime,
+    #[serde(with = "crate::timestamps")]
+    pub created_at: time::PrimitiveDateTime,
 }
 
 /// Relations from `vault_group_permissions` to the entities it references.

@@ -35,9 +35,11 @@ pub struct Model {
     /// The key answerable for this key record.
     pub owner_key_id: Option<Uuid>,
     /// Creation timestamp (UTC).
-    pub created_at: DateTime,
+    #[serde(with = "crate::timestamps")]
+    pub created_at: time::PrimitiveDateTime,
     /// Last modification timestamp (UTC).
-    pub updated_at: DateTime,
+    #[serde(with = "crate::timestamps")]
+    pub updated_at: time::PrimitiveDateTime,
 }
 
 /// Relations from `api_keys` to other entities.

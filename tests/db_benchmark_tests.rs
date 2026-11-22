@@ -11,21 +11,19 @@ use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, Database, EntityTrait, QueryFilter,
     QueryOrder, QuerySelect,
 };
-use sea_orm_migration::{MigratorTrait, SchemaManager, prelude::Index};
+use sea_orm::{ConnectionTrait, sea_query::Index};
 use uuid::Uuid;
 
 use simply_ip_exporter::db::has_index;
 use simply_ip_exporter::entities::{api_key, endpoint, prelude::*, vault_group_permission};
-use simply_ip_exporter::migration::Migrator;
+use simply_ip_exporter::migration;
 
 #[tokio::test]
 async fn verify_all_performance_indexes_are_applied() {
     let db = Database::connect("sqlite::memory:")
         .await
         .expect("in-memory database opens");
-    Migrator::up(&db, None)
-        .await
-        .expect("migrations apply cleanly");
+    migration::run(&db).await.expect("migrations apply cleanly");
 
     let required_indexes = [
         (
@@ -62,13 +60,11 @@ async fn benchmark_vault_group_id_lookup_performance() {
     let db = Database::connect("sqlite::memory:")
         .await
         .expect("in-memory database opens");
-    Migrator::up(&db, None)
-        .await
-        .expect("migrations apply cleanly");
+    migration::run(&db).await.expect("migrations apply cleanly");
 
     // Seed 1 master key + 200 daughter keys
     let master_id = Uuid::new_v4();
-    let now = chrono::Utc::now().naive_utc();
+    let now = simply_ip_exporter::timestamps::now_utc();
     api_key::ActiveModel {
         id: Set(master_id),
         name: Set("Master Key".to_owned()),
@@ -137,15 +133,14 @@ async fn benchmark_vault_group_id_lookup_performance() {
     let duration_indexed = start_indexed.elapsed();
 
     // 2. Drop index and measure without index (simulating sequential table scan)
-    SchemaManager::new(&db)
-        .drop_index(
-            Index::drop()
-                .name("idx_vault_group_permissions_vault_group_id")
-                .table("vault_group_permissions")
-                .to_owned(),
-        )
-        .await
-        .expect("drop index succeeds");
+    db.execute(
+        &Index::drop()
+            .name("idx_vault_group_permissions_vault_group_id")
+            .table("vault_group_permissions")
+            .to_owned(),
+    )
+    .await
+    .expect("drop index succeeds");
 
     let start_unindexed = Instant::now();
     for _ in 0..200 {
@@ -175,11 +170,9 @@ async fn benchmark_api_keys_is_master_lookup_performance() {
     let db = Database::connect("sqlite::memory:")
         .await
         .expect("in-memory database opens");
-    Migrator::up(&db, None)
-        .await
-        .expect("migrations apply cleanly");
+    migration::run(&db).await.expect("migrations apply cleanly");
 
-    let now = chrono::Utc::now().naive_utc();
+    let now = simply_ip_exporter::timestamps::now_utc();
 
     // Insert 1,500 non-master keys
     for i in 0..1500 {
@@ -234,15 +227,14 @@ async fn benchmark_api_keys_is_master_lookup_performance() {
     let duration_indexed = start_indexed.elapsed();
 
     // 2. Drop index and measure without index
-    SchemaManager::new(&db)
-        .drop_index(
-            Index::drop()
-                .name("idx_api_keys_is_master")
-                .table("api_keys")
-                .to_owned(),
-        )
-        .await
-        .expect("drop index succeeds");
+    db.execute(
+        &Index::drop()
+            .name("idx_api_keys_is_master")
+            .table("api_keys")
+            .to_owned(),
+    )
+    .await
+    .expect("drop index succeeds");
 
     let start_unindexed = Instant::now();
     for _ in 0..300 {
@@ -273,11 +265,9 @@ async fn benchmark_endpoints_created_at_ordering_performance() {
     let db = Database::connect("sqlite::memory:")
         .await
         .expect("in-memory database opens");
-    Migrator::up(&db, None)
-        .await
-        .expect("migrations apply cleanly");
+    migration::run(&db).await.expect("migrations apply cleanly");
 
-    let base_time = chrono::Utc::now().naive_utc();
+    let base_time = simply_ip_exporter::timestamps::now_utc();
 
     // Insert 1,500 endpoints with varying timestamps
     for i in 0..1500 {
@@ -295,7 +285,7 @@ async fn benchmark_endpoints_created_at_ordering_performance() {
             filter_bogons: Set(false),
             filter_loopback: Set(false),
             last_synced_at: Set(None),
-            created_at: Set(base_time - chrono::Duration::seconds(i64::from(i) * 10)),
+            created_at: Set(base_time - time::Duration::seconds(i64::from(i) * 10)),
             updated_at: Set(base_time),
         }
         .insert(&db)
@@ -317,15 +307,14 @@ async fn benchmark_endpoints_created_at_ordering_performance() {
     let duration_indexed = start_indexed.elapsed();
 
     // 2. Drop index and measure without index (forces sorting in memory/filesort)
-    SchemaManager::new(&db)
-        .drop_index(
-            Index::drop()
-                .name("idx_endpoints_created_at_desc")
-                .table("endpoints")
-                .to_owned(),
-        )
-        .await
-        .expect("drop index succeeds");
+    db.execute(
+        &Index::drop()
+            .name("idx_endpoints_created_at_desc")
+            .table("endpoints")
+            .to_owned(),
+    )
+    .await
+    .expect("drop index succeeds");
 
     let start_unindexed = Instant::now();
     for _ in 0..100 {

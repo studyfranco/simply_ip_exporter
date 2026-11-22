@@ -161,17 +161,13 @@ async fn cleanup_stale_group_permissions(state: &AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
     use sea_orm::{ActiveModelTrait, ActiveValue::Set, Database, DatabaseConnection};
-    use sea_orm_migration::MigratorTrait;
 
     async fn test_db() -> DatabaseConnection {
         let db = Database::connect("sqlite::memory:")
             .await
             .expect("in-memory sqlite always opens");
-        crate::migration::Migrator::up(&db, None)
-            .await
-            .expect("migrations apply");
+        crate::migration::run(&db).await.expect("migrations apply");
         db
     }
 
@@ -195,7 +191,7 @@ mod tests {
             api_key_id: Set(insert_key(db).await),
             vault_group_id: Set(vault_group_id),
             vault_group_name: Set(name.to_owned()),
-            created_at: Set(Utc::now().naive_utc()),
+            created_at: Set(crate::timestamps::now_utc()),
         };
         model.insert(db).await.expect("insert succeeds");
     }
@@ -204,7 +200,7 @@ mod tests {
     /// `api_keys` row to point at.
     async fn insert_key(db: &DatabaseConnection) -> Uuid {
         let id = Uuid::new_v4();
-        let now = Utc::now().naive_utc();
+        let now = crate::timestamps::now_utc();
         let model = crate::entities::api_key::ActiveModel {
             id: Set(id),
             name: Set("Cleanup Test Key".to_owned()),

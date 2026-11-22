@@ -24,7 +24,7 @@ jobs:
         run: cargo update
 
       - name: Cargo audit
-        run: cargo audit --ignore RUSTSEC-2026-0459
+        run: cargo audit --deny warnings
 
       - name: Run tests
         run: cargo test --workspace --verbose

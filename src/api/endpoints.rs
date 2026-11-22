@@ -3,7 +3,6 @@
 //! `AGENT.MD`'s Master/Daughter RBAC.
 
 use axum::{Extension, Json, extract::State, response::IntoResponse};
-use chrono::Utc;
 use rand::RngExt;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QueryOrder,
@@ -44,9 +43,12 @@ pub struct EndpointResponse {
     filter_rfc1918: bool,
     filter_bogons: bool,
     filter_loopback: bool,
-    last_synced_at: Option<chrono::NaiveDateTime>,
-    created_at: chrono::NaiveDateTime,
-    updated_at: chrono::NaiveDateTime,
+    #[serde(with = "crate::timestamps::option")]
+    last_synced_at: Option<time::PrimitiveDateTime>,
+    #[serde(with = "crate::timestamps")]
+    created_at: time::PrimitiveDateTime,
+    #[serde(with = "crate::timestamps")]
+    updated_at: time::PrimitiveDateTime,
 }
 
 impl From<endpoint::Model> for EndpointResponse {
@@ -169,7 +171,7 @@ pub async fn create_endpoint(
     let max_age_seconds = payload.max_age_seconds.unwrap_or(0);
     validate_max_age(max_age_seconds)?;
 
-    let now = Utc::now().naive_utc();
+    let now = crate::timestamps::now_utc();
     let model = endpoint::ActiveModel {
         id: Set(Uuid::new_v4()),
         owner_key_id: Set(Some(caller.id)),
@@ -330,7 +332,7 @@ pub async fn update_endpoint(
         active.filter_loopback = Set(v);
         changed.push("filter_loopback");
     }
-    active.updated_at = Set(Utc::now().naive_utc());
+    active.updated_at = Set(crate::timestamps::now_utc());
 
     let updated = active.update(&state.db).await?;
 
@@ -439,7 +441,7 @@ pub async fn reassign_endpoint_owner(
 
     let mut active: endpoint::ActiveModel = existing.into();
     active.owner_key_id = Set(Some(new_owner_id));
-    active.updated_at = Set(Utc::now().naive_utc());
+    active.updated_at = Set(crate::timestamps::now_utc());
     let updated = active.update(&state.db).await?;
 
     create_audit_log(

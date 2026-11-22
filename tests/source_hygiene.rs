@@ -715,18 +715,35 @@ fn check_manifest(source: &str) -> Vec<String> {
             violations.push(format!("{path} may not be allow"));
         }
     }
-    let sqlx_features = |dependency: &str| -> HashSet<&str> {
+    let features = |dependency: &str| -> HashSet<&str> {
         field(&format!("dependencies.{dependency}.features"))
             .into_iter()
             .flatten()
             .filter_map(literal)
-            .filter(|feature| feature.starts_with("sqlx-"))
             .collect()
     };
-    let orm = sqlx_features("sea-orm");
-    let migration = sqlx_features("sea-orm-migration");
-    for feature in orm.difference(&migration) {
-        violations.push(format!("sea-orm-migration is missing {feature:?}"));
+    for (name, required) in [
+        ("sea-orm", ["with-time", "schema-sync"]),
+        ("sea-schema", ["discovery", "probe"]),
+    ] {
+        if field(&format!("dependencies.{name}.default-features")).as_deref() != Some(&["false"]) {
+            violations.push(format!("{name} must disable default features"));
+        }
+        let features = features(name);
+        let backends = HashSet::from(["sqlx-sqlite", "sqlx-postgres", "sqlx-mysql"]);
+        for feature in required.into_iter().chain(backends.iter().copied()) {
+            if !features.contains(feature) {
+                violations.push(format!("{name} is missing {feature:?}"));
+            }
+        }
+        for feature in features {
+            if feature.starts_with("sqlx-") && !backends.contains(feature) {
+                violations.push(format!("{name} has unexpected backend feature {feature:?}"));
+            }
+        }
+    }
+    if features("time").contains("local-offset") {
+        violations.push("time must not enable local-offset".to_owned());
     }
     violations.sort();
     violations
@@ -752,9 +769,11 @@ fn the_manifest_check_rejects_policy_regressions() {
         all = { priority = -2, level = "warn" }
         pedantic = "warn"
         [dependencies]
-        sea-orm = {features = ["sqlx-sqlite", "sqlx-postgres"]}
-        [dependencies.sea-orm-migration]
+        sea-orm = {default-features = false, features = ["with-time", "schema-sync", "sqlx-sqlite", "sqlx-postgres", "sqlx-mysql"]}
+        [dependencies.sea-schema]
+        default-features = false
         features = [
+            "discovery", "probe", "sqlx-mysql",
             "sqlx-postgres", # another backend
             'sqlx-sqlite',
         ]
@@ -1773,4 +1792,149 @@ fn the_offline_asset_check_rejects_external_resources_and_svg_data_uris() {
     ] {
         assert!(asset_violations(path, input).is_empty(), "flagged {input}");
     }
+}
+
+#[test]
+fn rust_tests_have_no_ignore_attributes() {
+    let ignored = ["i", "gnore"].concat();
+    for path in src_files().into_iter().chain(files("tests", &["rs"], true)) {
+        let source = read(&path);
+        let tokens = rust_tokens(&source);
+        let code = words(&tokens);
+        for (index, window) in code.windows(3).enumerate() {
+            if !window.starts_with(&["#", "["]) {
+                continue;
+            }
+            let end = closing_token(&code, index + 1, "[", "]").unwrap_or(index + 2);
+            let is_ignored = window[2] == ignored
+                || (window[2] == "cfg_attr" && code[index + 3..end].contains(&ignored.as_str()));
+            assert!(
+                !is_ignored,
+                "{path}:{} ignores a test",
+                line_at(&source, tokens[index].offset)
+            );
+        }
+    }
+}
+
+#[test]
+fn retired_dependencies_are_absent() {
+    let removed = [
+        concat!("chro", "no"),
+        concat!("chro", "no-tz"),
+        concat!("sea-orm-", "migration"),
+    ];
+    let paths = src_files()
+        .into_iter()
+        .chain(files("tests", &["rs"], true))
+        .chain(["Cargo.toml".to_owned(), "Cargo.lock".to_owned()]);
+    for path in paths {
+        let contents = read(&path);
+        let normalized = contents.replace('_', "-");
+        for dependency in removed {
+            assert!(
+                !normalized
+                    .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-')
+                    .any(|token| token == dependency
+                        || token.strip_prefix("with-") == Some(dependency)),
+                "{path} references retired dependency {dependency}"
+            );
+        }
+    }
+}
+
+#[test]
+fn cargo_audit_has_no_advisory_exceptions() {
+    let hooks = std::fs::read_dir(repo_path(".githooks"))
+        .unwrap()
+        .map(|entry| format!(".githooks/{}", entry.unwrap().file_name().to_str().unwrap()));
+    let paths = files(".github/workflows", &["yml", "yaml"], false)
+        .into_iter()
+        .chain(files("scripts", &["sh"], false))
+        .chain(hooks)
+        .chain([".cargo/audit.toml".to_owned()]);
+    for path in paths {
+        let source = read(&path);
+        assert!(
+            !source.contains("--ignore RUSTSEC-"),
+            "{path} suppresses an advisory"
+        );
+        for line in source.lines() {
+            let compact: String = line.chars().filter(|ch| !ch.is_whitespace()).collect();
+            assert!(
+                !compact.starts_with("ignore=") && !compact.starts_with("ignore:"),
+                "{path} contains an audit exception"
+            );
+        }
+    }
+}
+
+fn reserved_onboarding_address(address: std::net::IpAddr) -> bool {
+    match address {
+        std::net::IpAddr::V4(ip) => ip.is_documentation() || ip.is_private() || ip.is_loopback(),
+        std::net::IpAddr::V6(ip) => ip.is_loopback() || ip.segments()[..2] == [0x2001, 0x0db8],
+    }
+}
+
+fn onboarding_host_leaks(source: &str) -> Vec<&str> {
+    source
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '-' | '.' | ':')))
+        .map(|token| token.trim_matches('.'))
+        .filter(|token| {
+            if let Ok(ip) = token.parse() {
+                return !reserved_onboarding_address(ip);
+            }
+            let host = token.split(':').next().unwrap_or_default();
+            if let Ok(ip) = host.parse() {
+                return !reserved_onboarding_address(ip);
+            }
+            let Some((_, tld)) = host.rsplit_once('.') else {
+                return false;
+            };
+            if tld.len() < 2 || !tld.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+                return false;
+            }
+            let host = host.to_ascii_lowercase();
+            let reserved = [".test", ".example", ".invalid", ".localhost"];
+            let examples = ["example.com", "example.net", "example.org"];
+            !reserved.iter().any(|suffix| host.ends_with(suffix))
+                && !examples.iter().any(|domain| {
+                    host == *domain
+                        || host
+                            .strip_suffix(domain)
+                            .is_some_and(|prefix| prefix.ends_with('.'))
+                })
+        })
+        .collect()
+}
+
+#[test]
+fn onboarding_goals_are_linked_and_use_reserved_addresses() {
+    for path in ["AGENT.MD", "README.md"] {
+        assert!(
+            read(path)
+                .lines()
+                .take(10)
+                .any(|line| line.contains("](GOALS.md)")),
+            "{path} must link to GOALS.md near the top"
+        );
+    }
+    let goals = read("GOALS.md");
+    let leaks = onboarding_host_leaks(&goals);
+    assert!(
+        leaks.is_empty(),
+        "GOALS.md contains non-placeholder hosts: {leaks:?}"
+    );
+    assert!(
+        onboarding_host_leaks("https://vault.example.test:3000 192.0.2.1/24 [2001:db8::1]:443")
+            .is_empty()
+    );
+    assert_eq!(
+        onboarding_host_leaks("9.0.0.1:443 [2001:db9::1]:443 vault.example.com.some-domain.net"),
+        [
+            "9.0.0.1:443",
+            "2001:db9::1",
+            "vault.example.com.some-domain.net"
+        ]
+    );
 }

@@ -1,6 +1,5 @@
 //! Shared helpers for minting and hashing local API keys, and for writing audit trail entries.
 
-use chrono::Utc;
 use rand::RngExt;
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, ConnectionTrait};
 use sha2::{Digest, Sha256};
@@ -67,7 +66,7 @@ pub async fn create_audit_log<C: ConnectionTrait>(
         action: Set(action.to_owned()),
         target_resource: Set(target_resource),
         details: Set(details),
-        timestamp: Set(Utc::now().naive_utc()),
+        timestamp: Set(crate::timestamps::now_utc()),
     };
     log.insert(db).await?;
     Ok(())

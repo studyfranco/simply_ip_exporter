@@ -69,7 +69,6 @@ pub(crate) fn guard_master_update(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
     use uuid::Uuid;
 
     fn key(is_master: bool) -> api_key::Model {
@@ -84,8 +83,8 @@ mod tests {
             can_manage_keys: is_master,
             parent_key_id: None,
             owner_key_id: None,
-            created_at: Utc::now().naive_utc(),
-            updated_at: Utc::now().naive_utc(),
+            created_at: crate::timestamps::now_utc(),
+            updated_at: crate::timestamps::now_utc(),
         }
     }
 

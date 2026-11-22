@@ -3,7 +3,6 @@
 
 use std::time::Duration;
 
-use chrono::Utc;
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait};
 
 use crate::cache::VaultRecord;
@@ -200,8 +199,8 @@ async fn sync_endpoint(
     let due = match ep.last_synced_at {
         None => true,
         Some(last) => {
-            Utc::now().naive_utc() - last
-                >= chrono::Duration::seconds(i64::from(ep.ttl_seconds.max(1)))
+            crate::timestamps::now_utc() - last
+                >= time::Duration::seconds(i64::from(ep.ttl_seconds.max(1)))
         }
     };
     if !due {
@@ -229,7 +228,7 @@ async fn sync_endpoint(
 async fn mark_synced(state: &AppState, ep: endpoint::Model) {
     let id = ep.id;
     let mut active: endpoint::ActiveModel = ep.into();
-    active.last_synced_at = Set(Some(Utc::now().naive_utc()));
+    active.last_synced_at = Set(Some(crate::timestamps::now_utc()));
     if let Err(e) = active.update(&state.db).await {
         tracing::warn!(endpoint = %id, "Could not persist last_synced_at: {e}");
     }
@@ -243,7 +242,7 @@ mod tests {
     fn map_records_preserves_deletion_state() {
         let raw = vec![VaultApiRecord {
             target_address: "10.0.0.1/32".to_owned(),
-            last_seen_at: Utc::now().naive_utc(),
+            last_seen_at: crate::timestamps::now_utc(),
             is_deleted: true,
         }];
         let mapped = map_records(raw);
@@ -260,7 +259,6 @@ mod tests {
     // it was, with no panic, and does not falsely advance `last_synced_at`.
 
     use sea_orm::{ActiveModelTrait, ActiveValue::Set, Database, DatabaseConnection};
-    use sea_orm_migration::MigratorTrait;
     use uuid::Uuid;
 
     use crate::config::RuntimeConfig;
@@ -270,9 +268,7 @@ mod tests {
         let db = Database::connect("sqlite::memory:")
             .await
             .expect("in-memory sqlite always opens");
-        crate::migration::Migrator::up(&db, None)
-            .await
-            .expect("migrations apply");
+        crate::migration::run(&db).await.expect("migrations apply");
         db
     }
 
@@ -302,7 +298,7 @@ mod tests {
             return existing.id;
         }
         let id = Uuid::new_v4();
-        let now = Utc::now().naive_utc();
+        let now = crate::timestamps::now_utc();
         crate::entities::api_key::ActiveModel {
             id: Set(id),
             name: Set("Test Master".to_owned()),
@@ -327,10 +323,10 @@ mod tests {
     /// returns the model `sync_endpoint` expects.
     async fn insert_test_endpoint(
         db: &DatabaseConnection,
-        last_synced_at: Option<chrono::NaiveDateTime>,
+        last_synced_at: Option<time::PrimitiveDateTime>,
     ) -> endpoint::Model {
         let master_id = ensure_test_master_id(db).await;
-        let now = Utc::now().naive_utc();
+        let now = crate::timestamps::now_utc();
         let model = endpoint::ActiveModel {
             id: Set(Uuid::new_v4()),
             owner_key_id: Set(Some(master_id)),
@@ -379,7 +375,7 @@ mod tests {
     fn seed_record(addr: &str) -> crate::cache::VaultRecord {
         crate::cache::VaultRecord {
             target_address: addr.to_owned(),
-            last_seen_at: Utc::now().naive_utc(),
+            last_seen_at: crate::timestamps::now_utc(),
             is_deleted: false,
         }
     }
@@ -653,7 +649,7 @@ mod tests {
         // call takes the differential branch below rather than attempting another full sync.
         let ep = insert_test_endpoint(
             &db,
-            Some(Utc::now().naive_utc() - chrono::Duration::hours(1)),
+            Some(crate::timestamps::now_utc() - time::Duration::hours(1)),
         )
         .await;
         state
@@ -739,7 +735,7 @@ mod tests {
 
         let ep = insert_test_endpoint(
             &db,
-            Some(Utc::now().naive_utc() - chrono::Duration::hours(1)),
+            Some(crate::timestamps::now_utc() - time::Duration::hours(1)),
         )
         .await;
         state
@@ -777,7 +773,7 @@ mod tests {
         let db = test_db().await;
         let _master_id = ensure_test_master_id(&db).await;
         let daughter_id = Uuid::new_v4();
-        let now = Utc::now().naive_utc();
+        let now = crate::timestamps::now_utc();
         crate::entities::api_key::ActiveModel {
             id: Set(daughter_id),
             name: Set("Scoped Daughter".to_owned()),

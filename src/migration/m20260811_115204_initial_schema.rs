@@ -5,8 +5,12 @@
 //! application-maintained column, and never present on [`crate::entities::api_key::Model`], since
 //! every supported engine rejects a write that targets a generated column.
 
-use sea_orm_migration::prelude::*;
-use sea_orm_migration::sea_orm::DatabaseBackend;
+use sea_orm::{
+    ConnectionTrait, DatabaseBackend, DbErr, DeriveIden,
+    sea_query::{Alias, ColumnDef, ForeignKey, ForeignKeyAction, Index, Table},
+};
+
+use super::runner::{Migration as MigrationStep, SchemaManager};
 
 /// The derived master-uniqueness marker column.
 const MARKER_COLUMN: &str = "master_marker";
@@ -49,7 +53,6 @@ enum Endpoints {
     UpdatedAt,
 }
 
-#[derive(DeriveMigrationName)]
 pub struct Migration;
 
 impl Migration {
@@ -68,9 +71,11 @@ impl Migration {
     }
 }
 
-async fn create_api_keys_table_and_indexes(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+async fn create_api_keys_table_and_indexes<C: ConnectionTrait>(
+    manager: &SchemaManager<'_, C>,
+) -> Result<(), DbErr> {
     manager
-        .create_table(
+        .execute(
             Table::create()
                 .table(ApiKeys::Table)
                 .if_not_exists()
@@ -112,6 +117,7 @@ async fn create_api_keys_table_and_indexes(manager: &SchemaManager<'_>) -> Resul
     ] {
         manager
             .create_index(
+                "api_keys",
                 Index::create()
                     .name(name)
                     .table(ApiKeys::Table)
@@ -122,20 +128,23 @@ async fn create_api_keys_table_and_indexes(manager: &SchemaManager<'_>) -> Resul
     }
 
     let backend = manager.get_database_backend();
-    manager
-        .alter_table(
-            Table::alter()
-                .table(ApiKeys::Table)
-                .add_column(
-                    ColumnDef::new(Alias::new(MARKER_COLUMN))
-                        .integer()
-                        .extra(Migration::marker_column_extra(backend)),
-                )
-                .to_owned(),
-        )
-        .await?;
+    if backend == DatabaseBackend::Sqlite || !manager.has_column("api_keys", MARKER_COLUMN).await? {
+        manager
+            .execute(
+                Table::alter()
+                    .table(ApiKeys::Table)
+                    .add_column(
+                        ColumnDef::new(Alias::new(MARKER_COLUMN))
+                            .integer()
+                            .extra(Migration::marker_column_extra(backend)),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+    }
     manager
         .create_index(
+            "api_keys",
             Index::create()
                 .name(MARKER_INDEX)
                 .table(ApiKeys::Table)
@@ -146,9 +155,11 @@ async fn create_api_keys_table_and_indexes(manager: &SchemaManager<'_>) -> Resul
         .await
 }
 
-async fn create_endpoints_table_and_indexes(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+async fn create_endpoints_table_and_indexes<C: ConnectionTrait>(
+    manager: &SchemaManager<'_, C>,
+) -> Result<(), DbErr> {
     manager
-        .create_table(
+        .execute(
             Table::create()
                 .table(Endpoints::Table)
                 .if_not_exists()
@@ -209,6 +220,7 @@ async fn create_endpoints_table_and_indexes(manager: &SchemaManager<'_>) -> Resu
 
     manager
         .create_index(
+            "endpoints",
             Index::create()
                 .name("idx_endpoints_owner_key_id")
                 .table(Endpoints::Table)
@@ -218,6 +230,7 @@ async fn create_endpoints_table_and_indexes(manager: &SchemaManager<'_>) -> Resu
         .await?;
     manager
         .create_index(
+            "endpoints",
             Index::create()
                 .name("idx_endpoints_token_secret")
                 .table(Endpoints::Table)
@@ -229,25 +242,17 @@ async fn create_endpoints_table_and_indexes(manager: &SchemaManager<'_>) -> Resu
 }
 
 #[async_trait::async_trait]
-impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+impl<C: ConnectionTrait> MigrationStep<C> for Migration {
+    async fn up(&self, manager: &SchemaManager<'_, C>) -> Result<(), DbErr> {
         create_api_keys_table_and_indexes(manager).await?;
         create_endpoints_table_and_indexes(manager).await
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .drop_table(Table::drop().table(Endpoints::Table).to_owned())
-            .await?;
-        manager
-            .drop_table(Table::drop().table(ApiKeys::Table).to_owned())
-            .await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sea_orm::sea_query::SqliteQueryBuilder;
 
     #[test]
     fn sqlite_generated_column_uses_virtual_storage() {

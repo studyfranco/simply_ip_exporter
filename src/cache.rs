@@ -4,8 +4,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use chrono::NaiveDateTime;
 use ipnet::IpNet;
+use time::PrimitiveDateTime;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -25,7 +25,7 @@ struct CachedRecord {
     /// Vault's own contract — see `VaultRecord`) — retained so an endpoint's `max_age_seconds`
     /// retention window can be evaluated at feed-generation time. See
     /// [`IpCache::snapshot_within`] for why the age cutoff is applied there rather than at sync.
-    last_seen_at: NaiveDateTime,
+    last_seen_at: PrimitiveDateTime,
 }
 
 /// The in-memory state for a single endpoint's feed.
@@ -34,7 +34,7 @@ struct EndpointCache {
     records: HashMap<String, CachedRecord>,
     /// The most recent `last_seen_at` seen from Vault, used as the next differential sync's
     /// `since`.
-    last_synced_at: Option<NaiveDateTime>,
+    last_synced_at: Option<PrimitiveDateTime>,
     /// When the last full (unconstrained) sync completed, in-process monotonic time.
     last_full_sync_at: Option<tokio::time::Instant>,
 }
@@ -47,7 +47,7 @@ pub struct VaultRecord {
     /// The latest observation of this address in this group, UTC naive (2026-10-12, renamed from
     /// `last_seen_at` to track Vault's own `last_seen_at` field — see `vault_client::VaultApiRecord`
     /// for why Vault dropped `last_seen_at` entirely).
-    pub last_seen_at: NaiveDateTime,
+    pub last_seen_at: PrimitiveDateTime,
     /// Whether this record is a soft-deleted tombstone.
     pub is_deleted: bool,
 }
@@ -133,7 +133,7 @@ impl IpCache {
 
     /// The networks currently cached for an endpoint, unaggregated and unfiltered.
     pub async fn snapshot(&self, endpoint_id: Uuid) -> Vec<IpNet> {
-        self.snapshot_within(endpoint_id, 0, chrono::Utc::now().naive_utc())
+        self.snapshot_within(endpoint_id, 0, crate::timestamps::now_utc())
             .await
     }
 
@@ -166,7 +166,7 @@ impl IpCache {
         &self,
         endpoint_id: Uuid,
         max_age_seconds: i64,
-        now: NaiveDateTime,
+        now: PrimitiveDateTime,
     ) -> Vec<IpNet> {
         let guard = self.inner.read().await;
         let Some(entry) = guard.get(&endpoint_id) else {
@@ -177,7 +177,7 @@ impl IpCache {
             return entry.records.values().map(|r| r.network).collect();
         }
 
-        let cutoff = now - chrono::Duration::seconds(max_age_seconds);
+        let cutoff = now.saturating_sub(time::Duration::seconds(max_age_seconds));
         entry
             .records
             .values()
@@ -187,7 +187,7 @@ impl IpCache {
     }
 
     /// The `since` cursor for the next differential sync.
-    pub async fn last_synced_at(&self, endpoint_id: Uuid) -> Option<NaiveDateTime> {
+    pub async fn last_synced_at(&self, endpoint_id: Uuid) -> Option<PrimitiveDateTime> {
         self.inner
             .read()
             .await
@@ -217,8 +217,7 @@ mod tests {
     fn record(addr: &str, deleted: bool) -> VaultRecord {
         VaultRecord {
             target_address: addr.to_owned(),
-            last_seen_at: NaiveDateTime::parse_from_str("2026-08-11T10:00:00", "%Y-%m-%dT%H:%M:%S")
-                .unwrap(),
+            last_seen_at: time::macros::datetime!(2026-08-11 10:00:00),
             is_deleted: deleted,
         }
     }
@@ -295,7 +294,7 @@ mod tests {
 
     /// A record with an explicit `last_seen_at`, so a test can place it precisely relative to a
     /// pinned "now" rather than depending on wall-clock timing.
-    fn record_at(addr: &str, last_seen_at: NaiveDateTime) -> VaultRecord {
+    fn record_at(addr: &str, last_seen_at: PrimitiveDateTime) -> VaultRecord {
         VaultRecord {
             target_address: addr.to_owned(),
             last_seen_at,
@@ -303,8 +302,12 @@ mod tests {
         }
     }
 
-    fn at(s: &str) -> NaiveDateTime {
-        NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").expect("a valid fixture timestamp")
+    fn at(s: &str) -> PrimitiveDateTime {
+        PrimitiveDateTime::parse(
+            s,
+            time::macros::format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]"),
+        )
+        .expect("a valid fixture timestamp")
     }
 
     /// `0` is the documented spelling of "unlimited", and the default every pre-existing endpoint
@@ -462,9 +465,8 @@ mod tests {
     fn record_with_last_seen_at(addr: &str, minute: u32) -> VaultRecord {
         VaultRecord {
             target_address: addr.to_owned(),
-            last_seen_at: NaiveDateTime::parse_from_str("2026-08-11T10:00:00", "%Y-%m-%dT%H:%M:%S")
-                .unwrap()
-                + chrono::Duration::minutes(i64::from(minute)),
+            last_seen_at: time::macros::datetime!(2026-08-11 10:00:00)
+                + time::Duration::minutes(i64::from(minute)),
             is_deleted: false,
         }
     }
@@ -560,7 +562,7 @@ mod tests {
                             id,
                             &[VaultRecord {
                                 target_address: addr.clone(),
-                                last_seen_at: chrono::Utc::now().naive_utc(),
+                                last_seen_at: crate::timestamps::now_utc(),
                                 is_deleted: false,
                             }],
                         )

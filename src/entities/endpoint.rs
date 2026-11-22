@@ -45,11 +45,14 @@ pub struct Model {
     /// Strip loopback blocks (`127.0.0.0/8`, `::1`).
     pub filter_loopback: bool,
     /// Timestamp of the last successful synchronization with `simply_ip_vault`.
-    pub last_synced_at: Option<DateTime>,
+    #[serde(default, with = "crate::timestamps::option")]
+    pub last_synced_at: Option<time::PrimitiveDateTime>,
     /// Endpoint creation timestamp (UTC).
-    pub created_at: DateTime,
+    #[serde(with = "crate::timestamps")]
+    pub created_at: time::PrimitiveDateTime,
     /// Last modification timestamp (UTC).
-    pub updated_at: DateTime,
+    #[serde(with = "crate::timestamps")]
+    pub updated_at: time::PrimitiveDateTime,
 }
 
 /// Relations from `endpoints` to other entities.

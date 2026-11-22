@@ -6,10 +6,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
-use chrono::NaiveDateTime;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use time::PrimitiveDateTime;
 use uuid::Uuid;
 
 use crate::crypto::{canonical_v1_payload, compute_signature};
@@ -43,7 +43,8 @@ pub struct VaultApiRecord {
     /// The IP address or CIDR range, exactly as Vault stored it.
     pub target_address: String,
     /// The latest observation of this address in this group, UTC naive ISO-8601.
-    pub last_seen_at: NaiveDateTime,
+    #[serde(with = "crate::timestamps")]
+    pub last_seen_at: PrimitiveDateTime,
     /// Whether this is a soft-deleted tombstone (only present with `include_deleted=true`).
     #[serde(default)]
     pub is_deleted: bool,
@@ -255,7 +256,7 @@ impl VaultClient {
     pub async fn fetch_ips(
         &self,
         groups: &str,
-        since: Option<NaiveDateTime>,
+        since: Option<PrimitiveDateTime>,
     ) -> Result<Vec<VaultApiRecord>, VaultError> {
         let mut scopes: Vec<&str> = Vec::new();
         for group in groups.split(',').map(str::trim).filter(|g| !g.is_empty()) {
@@ -279,14 +280,14 @@ impl VaultClient {
     async fn fetch_ips_for_scope(
         &self,
         groups: &str,
-        since: Option<NaiveDateTime>,
+        since: Option<PrimitiveDateTime>,
     ) -> Result<Vec<VaultApiRecord>, VaultError> {
         let mut base = format!("/api/ips?groups={}", urlencode(groups));
         if let Some(since) = since {
             let _ = write!(
                 base,
                 "&since={}&include_deleted=true",
-                urlencode(&since.and_utc().timestamp().to_string())
+                urlencode(&since.assume_utc().unix_timestamp().to_string())
             );
         }
 
@@ -528,7 +529,7 @@ impl VaultClient {
     /// and response shape, not in how a request gets signed or a non-2xx/malformed body is turned
     /// into a [`VaultError`].
     async fn signed_get<T: DeserializeOwned>(&self, path_and_query: &str) -> Result<T, VaultError> {
-        let now = chrono::Utc::now().timestamp();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
         let mut ts = now;
         let _ = self
             .last_timestamp
@@ -747,9 +748,7 @@ mod tests {
     async fn a_differential_fetch_carries_since_and_include_deleted_onto_every_page() {
         let (url, seen, _server) = spawn_paginating_mock_vault(120).await;
         let client = client_at(url).with_page_size(50);
-        let since = chrono::DateTime::from_timestamp(1_700_000_000, 0)
-            .expect("a valid timestamp")
-            .naive_utc();
+        let since = time::macros::datetime!(2023-11-14 22:13:20);
 
         let records = client
             .fetch_ips("g1", Some(since))
@@ -1234,9 +1233,7 @@ mod tests {
     async fn parallel_pages_each_carry_since_include_deleted_and_groups() {
         let (url, seen, _server) = spawn_flavoured_mock_vault(2_500, VaultFlavour::Envelope).await;
         let client = client_at(url).with_page_size(1_000);
-        let since = chrono::DateTime::from_timestamp(1_700_000_000, 0)
-            .expect("a valid timestamp")
-            .naive_utc();
+        let since = time::macros::datetime!(2023-11-14 22:13:20);
 
         let records = client
             .fetch_ips("g1,g2", Some(since))
@@ -1441,9 +1438,7 @@ mod tests {
     async fn cursor_pages_each_carry_since_include_deleted_format_minimal_and_group() {
         let (url, seen, _server) = spawn_flavoured_mock_vault(2_500, VaultFlavour::Cursor).await;
         let client = client_at(url).with_page_size(1_000);
-        let since = chrono::DateTime::from_timestamp(1_700_000_000, 0)
-            .expect("a valid timestamp")
-            .naive_utc();
+        let since = time::macros::datetime!(2023-11-14 22:13:20);
 
         let records = client
             .fetch_ips("g1,g2", Some(since))

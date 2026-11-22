@@ -141,7 +141,7 @@ async fn readiness_is_503_when_the_database_itself_is_broken_even_with_master_pi
     let db = sea_orm::Database::connect("sqlite::memory:")
         .await
         .expect("in-memory sqlite is always available");
-    // Deliberately no `migration::Migrator::up(&db, ...)`: every table-touching query on this
+    // Deliberately no `migration::run(&db)`: every table-touching query on this
     // connection fails, which is exactly the dependency this test needs severed.
     let state = test_state(&db).with_pinned_master(uuid::Uuid::new_v4());
     let app = create_app(state);
@@ -201,7 +201,7 @@ async fn a_replayed_signature_is_rejected_on_second_use() {
     let state = test_state(&db).with_pinned_master(key.model.id);
     let app = create_app(state);
 
-    let timestamp = chrono::Utc::now().timestamp();
+    let timestamp = time::OffsetDateTime::now_utc().unix_timestamp();
     let first = signed_request_at("GET", "/api/auth/me", &key, "", timestamp);
     let second = signed_request_at("GET", "/api/auth/me", &key, "", timestamp);
 
@@ -222,7 +222,7 @@ async fn a_stale_timestamp_is_rejected() {
     let state = test_state(&db).with_pinned_master(key.model.id);
     let app = create_app(state);
 
-    let expired_ts = chrono::Utc::now().timestamp() - 3600;
+    let expired_ts = time::OffsetDateTime::now_utc().unix_timestamp() - 3600;
     let response = app
         .oneshot(signed_request_at(
             "GET",
@@ -333,12 +333,12 @@ async fn feed_aggregates_filters_etags_and_rate_limits() {
             &[
                 simply_ip_exporter::cache::VaultRecord {
                     target_address: "203.0.113.5/32".to_owned(),
-                    last_seen_at: chrono::Utc::now().naive_utc(),
+                    last_seen_at: simply_ip_exporter::timestamps::now_utc(),
                     is_deleted: false,
                 },
                 simply_ip_exporter::cache::VaultRecord {
                     target_address: "10.0.0.5/32".to_owned(),
-                    last_seen_at: chrono::Utc::now().naive_utc(),
+                    last_seen_at: simply_ip_exporter::timestamps::now_utc(),
                     is_deleted: false,
                 },
             ],
@@ -1126,7 +1126,7 @@ async fn granting_and_revoking_group_access_round_trips_through_a_live_vault() {
         &groups_path,
         &master,
         &grant_payload,
-        chrono::Utc::now().timestamp() + 1,
+        time::OffsetDateTime::now_utc().unix_timestamp() + 1,
     );
     let regrant = app.clone().oneshot(regrant_req).await.unwrap();
     assert_eq!(regrant.status(), StatusCode::OK);
@@ -1299,6 +1299,65 @@ async fn audit_log_action_filter_narrows_results() {
 }
 
 #[tokio::test]
+async fn audit_timestamp_bounds_include_legacy_and_current_sqlite_encodings() {
+    use sea_orm::{ConnectionTrait, sea_query::Query};
+
+    let db = setup_test_db().await;
+    let master = insert_key(&db, true, true).await;
+    let app = create_app(test_state(&db).with_pinned_master(master.model.id));
+
+    for timestamp in [
+        "2026-08-11 10:26:46.099999999",
+        "2026-08-11 10:26:46.1",
+        "2026-08-11 10:26:46.100",
+        "2026-08-11 10:26:46.100000001",
+    ] {
+        db.execute(
+            Query::insert()
+                .into_table("audit_logs")
+                .columns([
+                    "id",
+                    "api_key_name",
+                    "api_key_prefix",
+                    "client_ip",
+                    "action",
+                    "timestamp",
+                ])
+                .values([
+                    uuid::Uuid::new_v4().into(),
+                    "fixture".into(),
+                    "fixture".into(),
+                    "192.0.2.10".into(),
+                    "FIXTURE".into(),
+                    timestamp.into(),
+                ])
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+
+    let response = app
+        .oneshot(signed_request(
+            "GET",
+            "/api/audit-logs?since=2026-08-11T10:26:46.1Z&until=2026-08-11T10:26:46.100%2B00:00",
+            &master,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    let entries = body.as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry["timestamp"] == "2026-08-11T10:26:46.100")
+    );
+}
+
+#[tokio::test]
 async fn settings_endpoint_requires_master_and_reports_config() {
     let db = setup_test_db().await;
     let master = insert_key(&db, true, true).await;
@@ -1453,7 +1512,7 @@ async fn two_concurrent_identical_signed_requests_only_one_succeeds() {
     let state = test_state(&db).with_pinned_master(master.model.id);
     let app = create_app(state);
 
-    let timestamp = chrono::Utc::now().timestamp();
+    let timestamp = time::OffsetDateTime::now_utc().unix_timestamp();
     let first = signed_request_at("GET", "/api/auth/me", &master, "", timestamp);
     let second = signed_request_at("GET", "/api/auth/me", &master, "", timestamp);
 
@@ -1501,7 +1560,7 @@ async fn two_concurrent_deletes_of_the_same_endpoint_do_not_both_succeed() {
 
     // Distinct timestamps (and therefore distinct signatures) so this races the DELETE handler's
     // own find-then-delete logic, not the replay guard from the test above.
-    let now = chrono::Utc::now().timestamp();
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
     let first = signed_request_at("DELETE", &format!("/api/endpoints/{id}"), &master, "", now);
     let second = signed_request_at(
         "DELETE",
@@ -2415,11 +2474,7 @@ async fn public_feed_reads_stay_fast_and_non_empty_while_a_full_resync_runs() {
     let warm: Vec<simply_ip_exporter::cache::VaultRecord> = (0..RECORDS)
         .map(|i| simply_ip_exporter::cache::VaultRecord {
             target_address: format!("51.{}.{}.1/32", i / 256, i % 256),
-            last_seen_at: chrono::NaiveDateTime::parse_from_str(
-                "2026-08-11T10:00:00",
-                "%Y-%m-%dT%H:%M:%S",
-            )
-            .expect("a valid fixture timestamp"),
+            last_seen_at: time::macros::datetime!(2026-08-11 10:00:00),
             is_deleted: false,
         })
         .collect();
@@ -2568,7 +2623,7 @@ async fn revoking_daughter_vault_group_permission_immediately_blocks_feed_servin
             ep_id,
             &[simply_ip_exporter::cache::VaultRecord {
                 target_address: "203.0.113.88/32".to_owned(),
-                last_seen_at: chrono::Utc::now().naive_utc(),
+                last_seen_at: simply_ip_exporter::timestamps::now_utc(),
                 is_deleted: false,
             }],
         )

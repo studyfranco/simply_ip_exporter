@@ -31,7 +31,8 @@ pub struct Model {
     #[sea_orm(column_type = "Text", nullable)]
     pub details: Option<String>,
     /// Log entry creation timestamp (UTC).
-    pub timestamp: DateTime,
+    #[serde(with = "crate::timestamps")]
+    pub timestamp: time::PrimitiveDateTime,
 }
 
 /// Relations from `audit_logs` to other entities.

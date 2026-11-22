@@ -1,5 +1,7 @@
 # simply_ip_exporter
 
+See [GOALS.md](GOALS.md) for the mission, security invariants and deployment network boundary.
+
 A high-performance DMZ proxy and public feed exporter. It periodically pulls IP records from a
 central [`simply_ip_vault`](../simply_ip_vault) instance, aggregates and sanitizes them entirely
 in memory, and exposes plain-text lists formatted for pfSense (`pfBlockerNG`) and other firewall
@@ -20,6 +22,10 @@ For an exhaustive per-endpoint catalogue — every route, parameter, DTO and res
 [`API_REFERENCE.md`](API_REFERENCE.md).
 
 ## Architecture
+
+In production, attach the exporter only to the internal Docker `isolate` bridge.
+Expose feeds through an ingress path on the host or LAN, or a reverse proxy joined
+to both `ext` and `isolate`. The exporter requires no outbound Internet route.
 
 ```
                      HMAC-signed, outbound                 unauthenticated, URL-secret
@@ -97,8 +103,8 @@ cargo run
 docker compose up --build
 ```
 
-`docker-compose.yml` builds the image, binds port `3002`, and persists the SQLite configuration
-database (not IP data — there is none on disk) under `./data`. Set `VAULT_BASE_URL` /
+The local development `docker-compose.yml` builds the image, binds port `3002`, and persists
+the SQLite configuration database under `./data`. Set `VAULT_BASE_URL` /
 `VAULT_API_KEY` / `VAULT_SIGNING_SECRET` in the compose file's `environment:` block (or an
 `.env` file) to enable syncing.
 
@@ -145,10 +151,10 @@ All configuration is environment-variable driven; nothing security-relevant has 
 | `PORT` | `3002` | Listen port. |
 | `DATABASE_URL` | `sqlite://simply_ip_exporter.db?mode=rwc` | SQLite connection string for **configuration only** (`api_keys`, `endpoints`). |
 | `EXPORTER_ENCRYPTION_KEY` | *(unset)* | 64 hex characters (32 bytes). Encrypts `api_keys.signing_secret` at rest with XChaCha20-Poly1305. Unset means secrets are stored hex-encoded but unencrypted — fine for local dev, not for production. Generate with `openssl rand -hex 32`. |
-| `VAULT_BASE_URL` | *(unset)* | Base URL of the `simply_ip_vault` instance to sync from, e.g. `http://vault:3000`. Sync stays idle (feeds remain empty) until this and the two variables below are all set. |
+| `VAULT_BASE_URL` | *(unset)* | Base URL of the `simply_ip_vault` instance to sync from, e.g. `http://vault.example.test:3000`. Sync stays idle (feeds remain empty) until this and the two variables below are all set. |
 | `VAULT_API_KEY` | *(unset)* | The `X-API-Key` used to authenticate outbound requests to Vault. Should belong to a Vault key scoped `can_read`-only on the groups this exporter needs. |
 | `VAULT_SIGNING_SECRET` | *(unset)* | The HMAC-SHA256 signing secret paired with `VAULT_API_KEY`. |
-| `TRUSTED_PROXIES` | *(unset)* | Comma-separated CIDR ranges, bare IPs, or hostnames/Docker container names (e.g. `traefik_tomidejetsu`), resolved via DNS and re-checked periodically. `X-Forwarded-For`/`X-Real-IP` are honored **only** from these peers; everything else is matched against the raw TCP connection. A malformed entry is fatal at startup; a well-formed hostname that doesn't currently resolve is not — it's simply untrusted until it does, retried automatically. Leave unset for a directly-exposed deployment. |
+| `TRUSTED_PROXIES` | *(unset)* | Comma-separated CIDR ranges, bare IPs, or hostnames/Docker container names (e.g. `proxy.example.test`), resolved via DNS and re-checked periodically. `X-Forwarded-For`/`X-Real-IP` are honored **only** from these peers; everything else is matched against the raw TCP connection. A malformed entry is fatal at startup; a well-formed hostname that doesn't currently resolve is not — it's simply untrusted until it does, retried automatically. Leave unset for a directly-exposed deployment. |
 | `SIGNATURE_MAX_AGE_SECONDS` | `300` | Symmetric freshness window (±) for `X-Timestamp` on signed `/api/*` requests. |
 | `INITIAL_MASTER_KEY` / `INITIAL_MASTER_SIGNING_SECRET` | *(unset)* | Deterministic bootstrap credentials for test/CI (see `scripts/test_e2e.sh`). Each must be exactly 64 hex characters if set. **Do not set these in a real deployment** — let the daemon generate a random Master key. |
 | `BOOTSTRAP_SUBNET` | `0.0.0.0/0,::/0` | `bound_ips` assigned to the auto-generated Master key. |
@@ -235,7 +241,7 @@ GET /feed/v1/<token_secret>/list.txt
 2. In pfBlockerNG: **Firewall → pfBlockerNG → IP → IPv4 (or IPv6)**, add a new alias:
    - **Action**: Alias Native (or Deny/Permit, per your policy)
    - **List Type**: `URL Table` (or `URL Table (IPs)` depending on pfBlockerNG version)
-   - **Source**: `http://<exporter-host>:3002/feed/v1/<token_secret>/list.txt`
+   - **Source**: `http://exporter.example.test:3002/feed/v1/<token_secret>/list.txt`
    - **Update Frequency**: at least as long as the endpoint's `ttl_seconds` — polling faster than
      the cache refreshes buys nothing but risks the 2-minute per-source-IP throttle.
 3. Force an update and confirm the alias populates. pfBlockerNG's own downloader sends
@@ -246,7 +252,7 @@ GET /feed/v1/<token_secret>/list.txt
    to that proxy's address so `bound_ips` (if configured on the endpoint) evaluates the real
    client address rather than the proxy's.
 5. The admin web UI (`static/`) works unmodified when mounted under a subpath (e.g.
-   `https://host/ip_exporter/`) — it derives its own API base path from the page's URL, no
+   `https://exporter.example.test/ip_exporter/`) — it derives its own API base path from the page's URL, no
    configuration needed, as long as the proxy strips its prefix before forwarding to this service
    (the common case). If it does *not* strip the prefix, set the "API base path override" field on
    the login screen to that prefix so client-side request signing matches what this process
@@ -264,10 +270,14 @@ orchestrators, load balancers) cannot compute an HMAC signature.
 
 ## Testing
 
+Enable the pre-push hook with `git config core.hooksPath .githooks`, or run
+`./scripts/pre_push.sh` directly to check formatting, Clippy, tests, the strict
+dependency audit and live E2E script syntax.
+
 ```sh
 cargo check --all-targets
 cargo clippy --all-targets -- -D warnings
-cargo test                     # 143 unit + 4 main.rs unit + 45 integration + 13 source-hygiene tests
+cargo test
 ./scripts/verify_convergence.sh  # source hygiene (raw SQL, unwrap/expect, frontend syntax/DOM refs) + clippy -D warnings + cargo test, one gate
 ./scripts/test_e2e.sh          # full live E2E against a real simply_ip_vault + simply_ip_exporter pair
 ```

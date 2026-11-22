@@ -4,10 +4,8 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::Request;
-use chrono::Utc;
 use hmac::{Hmac, KeyInit, Mac};
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, Database, DatabaseConnection};
-use sea_orm_migration::MigratorTrait;
 use sha2::Sha256;
 use simply_ip_exporter::{
     api::support::hash_key,
@@ -24,7 +22,7 @@ pub async fn setup_test_db() -> DatabaseConnection {
     let db = Database::connect("sqlite::memory:")
         .await
         .expect("in-memory sqlite is always available");
-    migration::Migrator::up(&db, None)
+    migration::run(&db)
         .await
         .expect("migrations apply to a fresh database");
     db
@@ -71,7 +69,7 @@ pub async fn insert_key(
 ) -> SeededKey {
     let plaintext_key = "k".repeat(32) + &Uuid::new_v4().simple().to_string();
     let signing_secret = "s".repeat(32) + &Uuid::new_v4().simple().to_string();
-    let now = Utc::now().naive_utc();
+    let now = simply_ip_exporter::timestamps::now_utc();
 
     let model = api_key::ActiveModel {
         id: Set(Uuid::new_v4()),
@@ -122,7 +120,7 @@ pub async fn grant_group(db: &DatabaseConnection, api_key_id: Uuid, group_name: 
         api_key_id: Set(api_key_id),
         vault_group_id: Set(vault_group_id),
         vault_group_name: Set(group_name.to_owned()),
-        created_at: Set(Utc::now().naive_utc()),
+        created_at: Set(simply_ip_exporter::timestamps::now_utc()),
     };
     model.insert(db).await.expect("insert succeeds");
     vault_group_id
@@ -150,7 +148,13 @@ pub fn with_connect_info(builder: axum::http::request::Builder) -> axum::http::r
 
 /// Builds a `CANONICAL_V1`-signed request, stamped at the current time.
 pub fn signed_request(method: &str, uri: &str, key: &SeededKey, body: &str) -> Request<Body> {
-    signed_request_at(method, uri, key, body, Utc::now().timestamp())
+    signed_request_at(
+        method,
+        uri,
+        key,
+        body,
+        time::OffsetDateTime::now_utc().unix_timestamp(),
+    )
 }
 
 /// As [`signed_request`], with an explicit timestamp so replay/window behaviour is testable.

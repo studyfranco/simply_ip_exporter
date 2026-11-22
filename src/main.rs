@@ -78,7 +78,7 @@ async fn bootstrap_master_key(
     let bound_ip =
         std::env::var("BOOTSTRAP_SUBNET").unwrap_or_else(|_| "0.0.0.0/0,::/0".to_owned());
     let prefix: String = plaintext_key.chars().take(8).collect();
-    let now = chrono::Utc::now().naive_utc();
+    let now = simply_ip_exporter::timestamps::now_utc();
 
     // As with INITIAL_MASTER_KEY above: deterministic test/CI bootstrap only, so a script never
     // has to scrape the signing secret back out of stdout.

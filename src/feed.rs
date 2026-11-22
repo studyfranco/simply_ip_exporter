@@ -81,7 +81,7 @@ pub async fn serve_feed(
     // `cache::IpCache::snapshot_within` for the full rationale.
     let raw = state
         .ip_cache
-        .snapshot_within(ep.id, ep.max_age_seconds, chrono::Utc::now().naive_utc())
+        .snapshot_within(ep.id, ep.max_age_seconds, crate::timestamps::now_utc())
         .await;
     let aggregated = filter_and_aggregate(
         &raw,

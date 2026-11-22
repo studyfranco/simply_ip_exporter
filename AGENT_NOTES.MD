@@ -1,5 +1,13 @@
 # Agent Worklog — `simply_ip_exporter`
 
+## 2026-11-22 — Chantiers 7 and 8
+
+- Shared `time` adapters preserve the API's naive ISO-8601 strings, accept Vault's RFC 3339 input, and keep Vault's `since` cursor in Unix seconds. SQLite audit bounds cover both persisted timestamp encodings.
+- The SeaORM runner retains the existing migration versions and history table, with transactional DDL on SQLite and PostgreSQL and object checks for MySQL restarts. The SQLite compatibility test resumes from an existing history row.
+- The SeaORM 2.0.4 manifest patch removes a weak Arrow feature link that otherwise adds an unused, unmaintained dependency to the lockfile. See `vendor/sea-orm/PATCH.md` for the patch scope.
+- The strict audit runs in CI, the container workflow and the E2E harness. The pre-push gate checks format, Clippy, test outcomes, advisories and E2E syntax, and the live E2E suite (`./scripts/test_e2e.sh`) passed (`352/352`).
+- `GOALS.md` documents the isolate-only network boundary, read-only Vault access and reserved examples.
+
 ## 2026-10-12 (session 29) — Peer sync: Vault dropped `updated_at` from `GET /api/ips` entirely
 
 Pulled `example/simply_ip_vault` from `b2115a1` to `e49d062`, and — because `verify_convergence.sh`'s

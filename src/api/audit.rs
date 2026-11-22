@@ -3,8 +3,11 @@
 //! regardless of what it owns.
 
 use axum::{Extension, Json, extract::State, response::IntoResponse};
-use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
+use sea_orm::{
+    ColumnTrait, Condition, DbBackend, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Value,
+};
 use serde::Deserialize;
+use time::{PrimitiveDateTime, macros::format_description};
 
 use crate::entities::{api_key, audit_log, prelude::AuditLog};
 use crate::error::AppError;
@@ -79,27 +82,22 @@ pub async fn list_audit_logs(
         }
         q = q.filter(cond);
     }
-    if let Some(since_raw) = query
-        .since
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        let since_dt = chrono::DateTime::parse_from_rfc3339(since_raw)
-            .map_err(|_| AppError::InvalidInput("Malformed 'since' RFC 3339 timestamp".to_owned()))?
-            .naive_utc();
-        q = q.filter(audit_log::Column::Timestamp.gte(since_dt));
-    }
-    if let Some(until_raw) = query
-        .until
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        let until_dt = chrono::DateTime::parse_from_rfc3339(until_raw)
-            .map_err(|_| AppError::InvalidInput("Malformed 'until' RFC 3339 timestamp".to_owned()))?
-            .naive_utc();
-        q = q.filter(audit_log::Column::Timestamp.lte(until_dt));
+    let backend = state.db.get_database_backend();
+    for (name, input, is_upper_bound) in [
+        ("since", query.since.as_deref(), false),
+        ("until", query.until.as_deref(), true),
+    ] {
+        if let Some(input) = input.map(str::trim).filter(|s| !s.is_empty()) {
+            let timestamp = crate::timestamps::parse_rfc3339(input).ok_or_else(|| {
+                AppError::InvalidInput(format!("Malformed '{name}' RFC 3339 timestamp"))
+            })?;
+            let bound = timestamp_bound(backend, timestamp, is_upper_bound)?;
+            q = q.filter(if is_upper_bound {
+                audit_log::Column::Timestamp.lte(bound)
+            } else {
+                audit_log::Column::Timestamp.gte(bound)
+            });
+        }
     }
 
     let limit = query.limit.unwrap_or(50).min(500);
@@ -107,4 +105,28 @@ pub async fn list_audit_logs(
     let logs = q.limit(limit).offset(offset).all(&state.db).await?;
 
     Ok(Json(logs))
+}
+
+// SQLite compares DATETIME text lexically. The shortest and longest spellings
+// of the same instant cover both legacy and current SQLx fractional widths
+// while retaining an indexable range on the timestamp column.
+fn timestamp_bound(
+    backend: DbBackend,
+    value: PrimitiveDateTime,
+    is_upper_bound: bool,
+) -> Result<Value, AppError> {
+    if backend != DbBackend::Sqlite {
+        return Ok(value.into());
+    }
+    let format = if is_upper_bound {
+        format_description!("[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:9]")
+    } else if value.nanosecond() == 0 {
+        format_description!("[year]-[month]-[day] [hour]:[minute]:[second]")
+    } else {
+        format_description!("[year]-[month]-[day] [hour]:[minute]:[second].[subsecond]")
+    };
+    value
+        .format(format)
+        .map(Value::from)
+        .map_err(|_| AppError::Internal)
 }

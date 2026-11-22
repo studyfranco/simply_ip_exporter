@@ -2,7 +2,6 @@
 //! only the Master key may create, list, update, delete, or rotate local API keys.
 
 use axum::{Extension, Json, extract::State, response::IntoResponse};
-use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QueryOrder,
     TransactionTrait,
@@ -32,8 +31,10 @@ pub struct KeyResponse {
     can_manage_keys: bool,
     parent_key_id: Option<Uuid>,
     owner_key_id: Option<Uuid>,
-    created_at: chrono::NaiveDateTime,
-    updated_at: chrono::NaiveDateTime,
+    #[serde(with = "crate::timestamps")]
+    created_at: time::PrimitiveDateTime,
+    #[serde(with = "crate::timestamps")]
+    updated_at: time::PrimitiveDateTime,
 }
 
 impl From<api_key::Model> for KeyResponse {
@@ -102,7 +103,7 @@ pub async fn create_api_key(
 
     let plaintext_key = generate_random_key();
     let signing_secret = generate_signing_secret();
-    let now = Utc::now().naive_utc();
+    let now = crate::timestamps::now_utc();
     let id = Uuid::new_v4();
 
     let model = api_key::ActiveModel {
@@ -218,7 +219,7 @@ pub async fn update_api_key(
         active.can_manage_keys = Set(can_manage_keys);
         changed.push("can_manage_keys");
     }
-    active.updated_at = Set(Utc::now().naive_utc());
+    active.updated_at = Set(crate::timestamps::now_utc());
 
     let updated = active.update(&state.db).await?;
 
@@ -286,7 +287,7 @@ pub async fn delete_api_key(
 
     // Captured before the row is gone, since the audit entry must describe what was deleted.
     let target_resource = describe_resource("api_key", existing.id, &existing.name);
-    let now = Utc::now().naive_utc();
+    let now = crate::timestamps::now_utc();
 
     // Explicit `begin()`/`commit()` (rather than the `db.transaction(|txn| ...)` closure helper)
     // for control over the early-return branches below: a `409` on the no-`reassign_to` path and a
@@ -403,7 +404,7 @@ pub async fn rotate_api_key(
         tracing::error!("Failed to seal signing secret: {e}");
         AppError::Internal
     })?));
-    active.updated_at = Set(Utc::now().naive_utc());
+    active.updated_at = Set(crate::timestamps::now_utc());
     let updated = active.update(&state.db).await?;
 
     create_audit_log(
@@ -477,7 +478,7 @@ pub async fn rotate_signing_secret(
         tracing::error!("Failed to seal signing secret: {e}");
         AppError::Internal
     })?));
-    active.updated_at = Set(Utc::now().naive_utc());
+    active.updated_at = Set(crate::timestamps::now_utc());
     let updated = active.update(&state.db).await?;
 
     create_audit_log(
