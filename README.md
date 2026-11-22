@@ -1,6 +1,6 @@
 # simply_ip_exporter
 
-See [GOALS.md](GOALS.md) for the mission, security invariants and deployment network boundary.
+See [GOALS.md](GOALS.md) for the mission, security invariants and deployment network boundary. See [use-ip-exporter](.agents/skills/use-ip-exporter/SKILL.md) for the operational agent skill.
 
 A high-performance DMZ proxy and public feed exporter. It periodically pulls IP records from a
 central [`simply_ip_vault`](../simply_ip_vault) instance, aggregates and sanitizes them entirely

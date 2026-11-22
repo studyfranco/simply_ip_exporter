@@ -628,7 +628,7 @@ async fn creating_an_api_key_writes_an_audit_log_entry() {
     );
     assert_eq!(entry["api_key_name"], master.model.name);
     assert_eq!(entry["api_key_prefix"], master.model.prefix);
-    assert!(!entry["client_ip"].as_str().unwrap().is_empty());
+    assert_ne!(entry["client_ip"].as_str().unwrap(), "");
 }
 
 #[tokio::test]
@@ -1294,7 +1294,7 @@ async fn audit_log_action_filter_narrows_results() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let logs = body_json(response).await.as_array().unwrap().clone();
-    assert!(!logs.is_empty());
+    assert_ne!(logs, [] as [serde_json::Value; 0]);
     assert!(logs.iter().all(|l| l["action"] == "KEY_CREATE"));
 }
 
@@ -2085,8 +2085,8 @@ async fn the_startup_sync_populates_endpoints_before_the_first_feed_request_is_s
     let cold_body = axum::body::to_bytes(cold.into_body(), usize::MAX)
         .await
         .unwrap();
-    assert!(
-        cold_body.is_empty(),
+    assert_eq!(
+        cold_body, "",
         "precondition: nothing is cached before the startup sync runs"
     );
 

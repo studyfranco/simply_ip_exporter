@@ -732,8 +732,9 @@ mod tests {
     async fn a_resolvable_hostname_becomes_trusted() {
         let proxies = TrustedProxies::new(vec![ProxyMatcher::Hostname("localhost".to_owned())]);
         let resolved = proxies.resolved().await;
-        assert!(
-            !resolved.is_empty(),
+        assert_ne!(
+            *resolved,
+            [] as [IpNet; 0],
             "localhost must resolve to at least one address"
         );
         let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -754,7 +755,7 @@ mod tests {
             "this-name-does-not-exist.invalid".to_owned(),
         )]);
         let resolved = proxies.resolved().await;
-        assert!(resolved.is_empty());
+        assert_eq!(*resolved, [] as [IpNet; 0]);
     }
 
     /// [`TrustedProxies::prime`] names exactly the hostnames that failed to resolve, which is what
@@ -798,8 +799,9 @@ mod tests {
         )])
         .with_ttls(Duration::from_millis(500), Duration::from_millis(20));
 
-        assert!(
-            proxies.resolved().await.is_empty(),
+        assert_eq!(
+            *proxies.resolved().await,
+            [] as [IpNet; 0],
             "first attempt: still unresolvable"
         );
         tokio::time::sleep(Duration::from_millis(40)).await;
@@ -807,8 +809,9 @@ mod tests {
         // cached failure forever. The hostname is still bogus, so the observable outcome is the
         // same — what this proves is that the second call didn't just trust an expired cache entry
         // (which `is_fresh` gates and `refresh_locked` re-populates either way).
-        assert!(
-            proxies.resolved().await.is_empty(),
+        assert_eq!(
+            *proxies.resolved().await,
+            [] as [IpNet; 0],
             "second attempt after TTL expiry: still correctly empty"
         );
     }

@@ -478,8 +478,9 @@ mod tests {
         let state = test_state(&db, url);
         let ep = insert_test_endpoint(&db, None).await;
 
-        assert!(
-            state.ip_cache.snapshot(ep.id).await.is_empty(),
+        assert_eq!(
+            state.ip_cache.snapshot(ep.id).await,
+            [] as [ipnet::IpNet; 0],
             "precondition: nothing is cached before the boot sync runs"
         );
 
@@ -514,8 +515,9 @@ mod tests {
 
         run_boot_sync(&state).await;
 
-        assert!(
-            state.ip_cache.snapshot(ep.id).await.is_empty(),
+        assert_eq!(
+            state.ip_cache.snapshot(ep.id).await,
+            [] as [ipnet::IpNet; 0],
             "an unreachable Vault leaves the cache empty rather than failing the boot"
         );
     }
@@ -541,7 +543,10 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "the unconfigured path must return at once"
         );
-        assert!(state.ip_cache.snapshot(ep.id).await.is_empty());
+        assert_eq!(
+            state.ip_cache.snapshot(ep.id).await,
+            [] as [ipnet::IpNet; 0]
+        );
     }
 
     /// The boot sync must not re-fetch what it just fetched: after it runs, the background worker's
@@ -616,7 +621,10 @@ mod tests {
 
         sync_endpoint(&state, &client, ep.clone()).await;
 
-        assert!(state.ip_cache.snapshot(ep.id).await.is_empty());
+        assert_eq!(
+            state.ip_cache.snapshot(ep.id).await,
+            [] as [ipnet::IpNet; 0]
+        );
     }
 
     /// The core resilience property: a cache already holding data from a prior successful sync
@@ -822,6 +830,9 @@ mod tests {
 
         // No grant in vault_group_permissions -> sync must skip & evict cache immediately.
         sync_endpoint(&state, &client, ep.clone()).await;
-        assert!(state.ip_cache.snapshot(ep.id).await.is_empty());
+        assert_eq!(
+            state.ip_cache.snapshot(ep.id).await,
+            [] as [ipnet::IpNet; 0]
+        );
     }
 }

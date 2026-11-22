@@ -1,6 +1,6 @@
 # Simply IP Exporter - AI Agent Context & Directives
 
-See [GOALS.md](GOALS.md) for the mission, security invariants and deployment network boundary.
+See [GOALS.md](GOALS.md) for the mission, security invariants and deployment network boundary. See [use-ip-exporter](.agents/skills/use-ip-exporter/SKILL.md) for the operational agent skill.
 
 Hello AI Agent! You are assisting with the development of `simply_ip_exporter`. Read and strictly adhere to these guidelines before inspecting or writing any code.
 

@@ -301,8 +301,9 @@ mod tests {
     async fn a_resolvable_hostname_is_cached_and_returned() {
         let resolver = DnsResolver::new();
         let addrs = resolver.resolve("localhost").await;
-        assert!(
-            !addrs.is_empty(),
+        assert_ne!(
+            addrs,
+            [] as [IpNet; 0],
             "localhost must resolve to at least one address"
         );
     }
@@ -311,28 +312,24 @@ mod tests {
     async fn an_unresolvable_hostname_yields_no_addresses_and_does_not_error() {
         let resolver = DnsResolver::new();
         let addrs = resolver.resolve("this-name-does-not-exist.invalid").await;
-        assert!(addrs.is_empty());
+        assert_eq!(addrs, [] as [IpNet; 0]);
     }
 
     #[tokio::test]
     async fn a_negative_cache_entry_expires_and_is_retried() {
         let resolver =
             DnsResolver::with_ttls(Duration::from_millis(500), Duration::from_millis(20));
-        assert!(
-            resolver
-                .resolve("this-name-does-not-exist.invalid")
-                .await
-                .is_empty()
+        assert_eq!(
+            resolver.resolve("this-name-does-not-exist.invalid").await,
+            [] as [IpNet; 0]
         );
         tokio::time::sleep(Duration::from_millis(40)).await;
         // Past the (shortened) negative TTL: this must re-attempt rather than serve the stale
         // cached failure forever — the same property `config::TrustedProxies` relied on before
         // this cache was extracted out from under it.
-        assert!(
-            resolver
-                .resolve("this-name-does-not-exist.invalid")
-                .await
-                .is_empty()
+        assert_eq!(
+            resolver.resolve("this-name-does-not-exist.invalid").await,
+            [] as [IpNet; 0]
         );
     }
 
@@ -343,6 +340,6 @@ mod tests {
         // Would normally be served from the (very long-lived) cache; force_resolve must still do a
         // real lookup rather than trusting it.
         let addrs = resolver.force_resolve("localhost").await;
-        assert!(!addrs.is_empty());
+        assert_ne!(addrs, [] as [IpNet; 0]);
     }
 }

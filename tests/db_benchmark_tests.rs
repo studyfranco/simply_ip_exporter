@@ -15,7 +15,11 @@ use sea_orm::{ConnectionTrait, sea_query::Index};
 use uuid::Uuid;
 
 use simply_ip_exporter::db::has_index;
-use simply_ip_exporter::entities::{api_key, endpoint, prelude::*, vault_group_permission};
+use simply_ip_exporter::entities::{
+    api_key, endpoint,
+    prelude::{ApiKey, Endpoint, VaultGroupPermission},
+    vault_group_permission,
+};
 use simply_ip_exporter::migration;
 
 #[tokio::test]

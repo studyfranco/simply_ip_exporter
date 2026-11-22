@@ -324,8 +324,9 @@ fn no_unwrap_or_expect_in_production_code() {
             .into_iter()
             .map(|offset| line_at(&source, offset))
             .collect();
-        assert!(
-            lines.is_empty(),
+        assert_eq!(
+            lines,
+            [] as [usize; 0],
             "{path} uses forbidden production constructs on lines {lines:?}"
         );
     }
@@ -473,8 +474,9 @@ fn raw_sql_lines(source: &str) -> Vec<usize> {
 fn no_raw_sql_in_src_or_migrations_except_select_1_in_db() {
     for path in src_files() {
         let lines = raw_sql_lines_for_path(&path, &read(&path));
-        assert!(
-            lines.is_empty(),
+        assert_eq!(
+            lines,
+            [] as [usize; 0],
             "{path} contains forbidden raw SQL on lines {lines:?}"
         );
     }
@@ -495,22 +497,22 @@ fn the_raw_sql_scanner_detects_what_it_is_looking_for() {
         r#"let sql = format!("DELETE FROM api_keys WHERE id = {id}");"#,
         r#"let sql = "update api_keys set is_master = 1";"#,
     ] {
-        assert!(!raw_sql_lines(raw_sql).is_empty(), "missed {raw_sql}");
+        assert_ne!(raw_sql_lines(raw_sql), [] as [usize; 0], "missed {raw_sql}");
     }
-    assert!(
+    assert_eq!(
         raw_sql_lines_for_path(
             SELECT_1_HEALTHCHECK_PATH,
             r#"db.query_one_raw(Statement::from_string(backend, "SELECT 1")).await?;"#,
-        )
-        .is_empty(),
+        ),
+        [] as [usize; 0],
         "\"SELECT 1\" healthcheck in src/db.rs is the sole permitted exception"
     );
-    assert!(
-        !raw_sql_lines_for_path(
+    assert_ne!(
+        raw_sql_lines_for_path(
             "src/api/health.rs",
             r#"db.query_one_raw(Statement::from_string(backend, "SELECT 1")).await?;"#,
-        )
-        .is_empty(),
+        ),
+        [] as [usize; 0],
         "\"SELECT 1\" is not permitted outside src/db.rs"
     );
     for prose in [
@@ -519,7 +521,7 @@ fn the_raw_sql_scanner_detects_what_it_is_looking_for() {
         r#"let msg = "Deleted the endpoint";"#,
         r#"// db.execute_unprepared("DELETE FROM api_keys");"#,
     ] {
-        assert!(raw_sql_lines(prose).is_empty(), "flagged {prose}");
+        assert_eq!(raw_sql_lines(prose), [] as [usize; 0], "flagged {prose}");
     }
 }
 
@@ -546,8 +548,9 @@ fn js_syntax_errors(relative: &str, source: &str) -> Vec<String> {
 #[test]
 fn app_js_has_no_syntax_errors() {
     let errors = js_syntax_errors("static/app.js", &read("static/app.js"));
-    assert!(
-        errors.is_empty(),
+    assert_eq!(
+        errors,
+        [] as [String; 0],
         "static/app.js has {} syntax error(s) and will not load in a browser:\n  {}",
         errors.len(),
         errors.join("\n  ")
@@ -566,7 +569,7 @@ fn the_syntax_check_rejects_broken_javascript() {
         }
         const x = ;
     "#;
-    assert!(!js_syntax_errors("broken.js", broken).is_empty());
+    assert_ne!(js_syntax_errors("broken.js", broken), [] as [String; 0]);
 }
 
 fn literal(token: &str) -> Option<&str> {
@@ -752,8 +755,9 @@ fn check_manifest(source: &str) -> Vec<String> {
 #[test]
 fn cargo_manifest_follows_the_lint_and_database_feature_policy() {
     let violations = check_manifest(&read("Cargo.toml"));
-    assert!(
-        violations.is_empty(),
+    assert_eq!(
+        violations,
+        [] as [String; 0],
         "Cargo.toml policy violations: {violations:#?}"
     );
 }
@@ -778,7 +782,7 @@ fn the_manifest_check_rejects_policy_regressions() {
             'sqlx-sqlite',
         ]
     "#;
-    assert!(check_manifest(good).is_empty());
+    assert_eq!(check_manifest(good), [] as [String; 0]);
     let bad = good
         .replace("'2024'", "\"2021\"\nrust-version = '1.85'")
         .replace("\"forbid\"", "\"warn\"")
@@ -922,8 +926,9 @@ fn rust_files_only_suppress_clippy_for_derived_models_with_many_bools() {
             .into_iter()
             .map(|offset| line_at(&source, offset))
             .collect();
-        assert!(
-            lines.is_empty(),
+        assert_eq!(
+            lines,
+            [] as [usize; 0],
             "{path} suppresses Clippy on lines {lines:?}"
         );
     }
@@ -1155,18 +1160,21 @@ fn dashboard_assets_exist() {
 fn every_dom_id_referenced_in_app_js_exists_in_index_html() {
     let js = read("static/app.js");
     let html = read("static/index.html");
-    assert!(
-        !extract_el_ids(&js).is_empty(),
+    assert_ne!(
+        extract_el_ids(&js),
+        [] as [&str; 0],
         "expected dashboard DOM lookups"
     );
     let missing = missing_dom_ids(&js, &html);
-    assert!(
-        missing.is_empty(),
+    assert_eq!(
+        missing,
+        [] as [&str; 0],
         "DOM lookups reference missing IDs: {missing:?}"
     );
     let missing = missing_tab_panels(&html);
-    assert!(
-        missing.is_empty(),
+    assert_eq!(
+        missing,
+        [] as [&str; 0],
         "data-tab values without a matching tab panel: {missing:?}"
     );
 }
@@ -1211,8 +1219,9 @@ fn hardcoded_absolute_fetch_calls(source: &str) -> Vec<usize> {
 #[test]
 fn no_hardcoded_absolute_path_bypasses_the_subpath_request_base() {
     let violations = hardcoded_absolute_fetch_calls(&read("static/app.js"));
-    assert!(
-        violations.is_empty(),
+    assert_eq!(
+        violations,
+        [] as [usize; 0],
         "hardcoded absolute fetch paths on lines {violations:?}"
     );
 }
@@ -1353,7 +1362,7 @@ fn dashboard_routes_requests_and_signs_with_independent_bases() {
     let js = read("static/app.js");
     let html = read("static/index.html");
     let violations = subpath_policy_violations(&js, &html);
-    assert!(violations.is_empty(), "{violations:#?}");
+    assert_eq!(violations, [] as [&str; 0], "{violations:#?}");
 }
 
 #[test]
@@ -1373,7 +1382,7 @@ fn the_subpath_check_rejects_a_shared_signing_base_and_a_required_override() {
         }
     "#;
     let html = r#"<input id="login-api-base">"#;
-    assert!(subpath_policy_violations(js, html).is_empty());
+    assert_eq!(subpath_policy_violations(js, html), [] as [&str; 0]);
     let shared = js.replace("${signingBase}", "${requestBase}");
     let required = html.replace("<input", "<input REQUIRED");
     assert_eq!(subpath_policy_violations(&shared, &required).len(), 2);
@@ -1517,8 +1526,9 @@ fn key_payloads_with_master(source: &str) -> Vec<usize> {
 #[test]
 fn the_dashboard_never_sends_is_master_in_a_key_payload() {
     let violations = key_payloads_with_master(&read("static/app.js"));
-    assert!(
-        violations.is_empty(),
+    assert_eq!(
+        violations,
+        [] as [usize; 0],
         "key payloads send is_master on lines {violations:?}"
     );
 }
@@ -1719,8 +1729,9 @@ fn asset_violations(path: &str, source: &str) -> Vec<&'static str> {
 fn frontend_has_no_external_assets_or_svg_data_uris() {
     for path in files("static", &["html", "css", "js"], false) {
         let violations = asset_violations(&path, &read(&path));
-        assert!(
-            violations.is_empty(),
+        assert_eq!(
+            violations,
+            [] as [&str; 0],
             "{path} contains forbidden assets: {violations:?}"
         );
     }
@@ -1767,10 +1778,14 @@ fn the_offline_asset_check_rejects_external_resources_and_svg_data_uris() {
         ),
         ("bad.js", "const image = 'data:image/svg+xml,<svg></svg>';"),
     ] {
-        assert!(!asset_violations(path, input).is_empty(), "missed {input}");
+        assert_ne!(
+            asset_violations(path, input),
+            [] as [&str; 0],
+            "missed {input}"
+        );
     }
     for marker in FORBIDDEN_ASSET_MARKERS {
-        assert!(!asset_violations("bad.css", marker).is_empty());
+        assert_ne!(asset_violations("bad.css", marker), [] as [&str; 0]);
     }
     for (path, input) in [
         (
@@ -1790,7 +1805,11 @@ fn the_offline_asset_check_rejects_external_resources_and_svg_data_uris() {
             "const prose = 'Open over https:// for a secure context';",
         ),
     ] {
-        assert!(asset_violations(path, input).is_empty(), "flagged {input}");
+        assert_eq!(
+            asset_violations(path, input),
+            [] as [&str; 0],
+            "flagged {input}"
+        );
     }
 }
 
@@ -1920,14 +1939,18 @@ fn onboarding_goals_are_linked_and_use_reserved_addresses() {
         );
     }
     let goals = read("GOALS.md");
-    let leaks = onboarding_host_leaks(&goals);
-    assert!(
-        leaks.is_empty(),
+    let leaks: Vec<_> = onboarding_host_leaks(&goals)
+        .into_iter()
+        .filter(|&token| token != "SKILL.md")
+        .collect();
+    assert_eq!(
+        leaks,
+        [] as [&str; 0],
         "GOALS.md contains non-placeholder hosts: {leaks:?}"
     );
-    assert!(
-        onboarding_host_leaks("https://vault.example.test:3000 192.0.2.1/24 [2001:db8::1]:443")
-            .is_empty()
+    assert_eq!(
+        onboarding_host_leaks("https://vault.example.test:3000 192.0.2.1/24 [2001:db8::1]:443"),
+        [] as [&str; 0]
     );
     assert_eq!(
         onboarding_host_leaks("9.0.0.1:443 [2001:db9::1]:443 vault.example.com.some-domain.net"),
@@ -1936,5 +1959,65 @@ fn onboarding_goals_are_linked_and_use_reserved_addresses() {
             "2001:db9::1",
             "vault.example.com.some-domain.net"
         ]
+    );
+}
+
+#[test]
+fn agent_skill_exists_with_valid_frontmatter_links_and_no_prod_leaks() {
+    let skill_path = ".agents/skills/use-ip-exporter/SKILL.md";
+    assert!(repo_path(skill_path).is_file(), "{skill_path} must exist");
+
+    let skill = read(skill_path);
+    let mut lines = skill.lines();
+    assert_eq!(
+        lines.next(),
+        Some("---"),
+        "{skill_path} must start with YAML frontmatter"
+    );
+    let mut frontmatter = Vec::new();
+    let mut closed = false;
+    for line in lines {
+        if line == "---" {
+            closed = true;
+            break;
+        }
+        frontmatter.push(line);
+    }
+    assert!(closed, "{skill_path} frontmatter must be closed with ---");
+    assert!(
+        frontmatter
+            .iter()
+            .any(|line| line.trim() == "name: use-ip-exporter"),
+        "{skill_path} frontmatter must declare name: use-ip-exporter"
+    );
+    assert!(
+        frontmatter.iter().any(|line| {
+            line.trim()
+                .strip_prefix("description:")
+                .is_some_and(|desc| !desc.trim().is_empty())
+        }),
+        "{skill_path} frontmatter must declare a non-empty description"
+    );
+
+    for doc in ["AGENT.MD", "README.md", "GOALS.md"] {
+        assert!(
+            read(doc).contains(skill_path),
+            "{doc} must link to {skill_path}"
+        );
+    }
+
+    let file_extensions = ["txt", "rs", "inc", "caddy", "conf", "rsc", "md", "sh"];
+    let leaks: Vec<_> = onboarding_host_leaks(&skill)
+        .into_iter()
+        .filter(|token| {
+            token.rsplit_once('.').is_none_or(|(_, ext)| {
+                !file_extensions.contains(&ext.to_ascii_lowercase().as_str())
+            })
+        })
+        .collect();
+    assert_eq!(
+        leaks,
+        [] as [&str; 0],
+        "{skill_path} contains non-placeholder hosts or IPs: {leaks:?}"
     );
 }

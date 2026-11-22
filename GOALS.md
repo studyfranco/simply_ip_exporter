@@ -45,3 +45,5 @@ Use only reserved placeholders in onboarding material. Use RFC 2606 names
 such as `vault.example.test` and `exporter.example.test`, RFC 5737 IPv4 ranges
 `192.0.2.0/24`, `198.51.100.0/24` and `203.0.113.0/24`, or the RFC 3849 IPv6
 range `2001:db8::/32`. RFC 1918 and loopback addresses are also permitted.
+
+See [use-ip-exporter](.agents/skills/use-ip-exporter/SKILL.md) for the operational agent skill.

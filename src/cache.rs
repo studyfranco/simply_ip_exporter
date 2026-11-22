@@ -369,8 +369,9 @@ mod tests {
             1,
             "exactly 60s old, window 60s"
         );
-        assert!(
-            cache.snapshot_within(id, 59, now).await.is_empty(),
+        assert_eq!(
+            cache.snapshot_within(id, 59, now).await,
+            [] as [IpNet; 0],
             "one second past the window, it goes"
         );
     }
@@ -387,8 +388,9 @@ mod tests {
             .apply_full(id, &[record_at("10.0.0.9/32", at("2026-08-26T11:00:00"))])
             .await;
 
-        assert!(
-            cache.snapshot_within(id, 60, now).await.is_empty(),
+        assert_eq!(
+            cache.snapshot_within(id, 60, now).await,
+            [] as [IpNet; 0],
             "an hour old, 60s window"
         );
         assert_eq!(
@@ -423,8 +425,9 @@ mod tests {
         cache
             .apply_full(id, &[record_at("10.0.0.1/32", at("2026-08-26T10:00:00"))])
             .await;
-        assert!(
-            cache.snapshot_within(id, 60, now).await.is_empty(),
+        assert_eq!(
+            cache.snapshot_within(id, 60, now).await,
+            [] as [IpNet; 0],
             "2h old, outside a 60s window"
         );
 

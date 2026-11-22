@@ -290,8 +290,9 @@ mod tests {
         // plenty of address space that is not CGN at all.
         let networks = vec![net("100.0.0.0/8")];
         let out = filter_and_aggregate(&networks, false, true, false);
-        assert!(
-            out.is_empty(),
+        assert_eq!(
+            out,
+            [] as [IpNet; 0],
             "any overlap with a bogon range drops the whole candidate"
         );
     }
@@ -313,7 +314,7 @@ mod tests {
     fn filter_and_aggregate_handles_empty_input() {
         let empty: Vec<IpNet> = Vec::new();
         let out = filter_and_aggregate(&empty, true, true, true);
-        assert!(out.is_empty());
+        assert_eq!(out, [] as [IpNet; 0]);
     }
 
     #[test]
